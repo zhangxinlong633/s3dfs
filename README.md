@@ -14,11 +14,11 @@ The layout is aimed at small objects: there is no per-object directory. Objects 
 
 ## What this repository does
 
-- Objects are appended into large files (1 GiB per block by default). An object that does not fit in the current block is split into extents; the next extent records the previous position, and a new file is opened when a block fills up.
+- Objects are appended into large files (1 GiB per block by default). An object that does not fit in the current block is split into extents; the next extent records the previous extent’s `recId`, and a new file is opened when a block fills up.
 - Each record is a little-endian TLV frame with magic `S3R1`, a CRC-32, and a matching trailer, so the file can be scanned and checked.
 - A 1 MiB write buffer does group commit: many objects share one flush. Flush fsyncs by default.
-- The control plane writes node information plus `(blockId, offset, recLen)` into a dleveldb locator. The block process reads and writes by offset and does not keep a local LevelDB.
-- If the index is lost, locators can be rebuilt by scanning TLV records. Deletes append a tombstone so a rebuild does not resurrect a deleted object. Compaction that rewrites live objects and reclaims holes is **not implemented** in this version.
+- The control plane writes node information plus a stable `recId` into a dleveldb locator (`v: 3`). The block process keeps an in-memory map from `recId` to the file offset, rebuilt by scanning `.blk` files, and does not keep a local LevelDB.
+- If the index is lost, locators can be rebuilt by scanning TLV records. Deletes append a tombstone and issue a cleanup ticket so a rebuild does not resurrect a deleted object. A timer or a manual compact then rewrites live records (keeping the same `recId`) and reclaims holes, without updating the index.
 
 ## Repository layout
 
@@ -29,14 +29,14 @@ s3dfs/
   apps/api            # Nest.js 12 S3-compatible HTTP gateway (default :9000); a client of dleveldb and of block nodes
   apps/web            # Next.js 16 console (default :9001)
   apps/block          # packed-block storage node (default :9100+)
-  packages/engine     # C storage engine + N-API binding (append-only TLV block files, read/write by offset)
+  packages/engine     # C storage engine + N-API binding (append-only TLV block files, recId map)
   packages/control    # index client, locators, compression, node registry, placement, and health checks
   docs/               # architecture, design, and benchmark notes
 ```
 
 Run a sibling [dleveldb](https://github.com/zhangxinlong633/dleveldb) checkout as the object index (`pnpm dev:index` defaults to :9800). The in-tree `packages/dleveldb` directory is a historical pointer only and is not part of the build.
 
-Layering and the read/write path are in [docs/architecture.md](docs/architecture.md). Placement and health checks are in [docs/design-replication.md](docs/design-replication.md). Large objects are in [docs/design-large-object.md](docs/design-large-object.md). Environment variables are in [docs/capabilities.md](docs/capabilities.md). Those design docs are currently in Chinese. Benchmark methodology and the full tables are in [docs/benchmarks.md](docs/benchmarks.md).
+Layering and the read/write path are in [docs/architecture.md](docs/architecture.md). Placement and health checks are in [docs/design-replication.md](docs/design-replication.md). Large objects are in [docs/design-large-object.md](docs/design-large-object.md). Deletion holes and compaction (virtual record IDs, deferred cleanup) are in [docs/design-compaction.md](docs/design-compaction.md). Environment variables are in [docs/capabilities.md](docs/capabilities.md). Those design docs are currently in Chinese. Benchmark methodology and the full tables are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture overview
 
@@ -57,7 +57,7 @@ flowchart TB
   end
 
   App -->|S3 API :9000| API["s3dfs API / control plane"]
-  API -->|compress, then put/get by offset| B1
+  API -->|compress, then put/get by recId| B1
   API --> B2
   API --> B3
   API -->|locator JSON| KV
@@ -67,8 +67,8 @@ A write looks like this:
 
 1. The control plane may compress the body (`S3DFS_COMPRESS`, default `zstd`). If the result is not smaller, it stores the original bytes and sets `compressType` to `none`.
 2. The same stored bytes are written to N live block nodes (`N = min(configured replicas, live block nodes)`, default 3).
-3. Each successful write returns an extent location. The API writes locator JSON into dleveldb as `bucket/key`, `bucket/key:1`, and so on. User-facing `size` and `crc` are the uncompressed values; `storedSize` and `compressType` describe what is on disk.
-4. A read looks up the locators, skips nodes that are down, fetches by offset, and decompresses with the type on that locator.
+3. Each successful write returns an extent `recId`. The API writes locator JSON into dleveldb as `bucket/key`, `bucket/key:1`, and so on. User-facing `size` and `crc` are the uncompressed values; `storedSize` and `compressType` describe what is on disk.
+4. A read looks up the locators, skips nodes that are down, fetches by `recId`, and decompresses with the type on that locator.
 
 ## Quick start
 
@@ -106,7 +106,7 @@ bun scripts/test-split.mjs
 
 ## Performance
 
-Numbers below were measured on 16 Nov 2026, 12:33 (Asia/Shanghai) with Bun 1.4.2 (node-compat v26.3.0), on a MacBook Pro (Apple M5 Pro, 15 cores, 48 GB, Apple SSD AP1024Z). They are single-host results, not a multi-machine network test. N is the object-body replica count: N=1 is one dleveldb process plus one block process; N=3 is one index plus three block processes on the same machine. Bandwidth is **logical** MiB/s (uncompressed object size / time, 1 MiB = 1,048,576 bytes). Compression ratio is logical size / stored size. The repeated payload is `0x61` bytes, a best-case pattern; the random payload is cryptographically random and typically does not shrink. When compression does not help, the locator records `compressType=none`. Reproduce with `pnpm bench` or `bun scripts/bench-split.mjs`. Methodology, raw JSON, and the same tables are in [docs/benchmarks.md](docs/benchmarks.md).
+Numbers below were measured on 17 Nov 2026, 00:40 (Asia/Shanghai) with Bun 1.4.2 (node-compat v26.3.0), on a MacBook Pro (Apple M5 Pro, 15 cores, 48 GB, Apple SSD AP1024Z). They describe the current tree, including `recId` locators and idle compaction. Background compact was disabled for this run (`S3DFS_COMPACT_INTERVAL_MS=0`) so cleanup would not mix into the rates. They are single-host results, not a multi-machine network test. N is the object-body replica count: N=1 is one dleveldb process plus one block process; N=3 is one index plus three block processes on the same machine. Bandwidth is **logical** MiB/s (uncompressed object size / time, 1 MiB = 1,048,576 bytes). Compression ratio is logical size / stored size. The repeated payload is `0x61` bytes, a best-case pattern; the random payload is cryptographically random and typically does not shrink. When compression does not help, the locator records `compressType=none`. Reproduce with `pnpm bench` or `bun scripts/bench-split.mjs`. Methodology, raw JSON, and the same tables are in [docs/benchmarks.md](docs/benchmarks.md).
 
 
 ### Guidance for evaluators
@@ -117,37 +117,37 @@ There is no single “average ops/s” across the tables below. The rows mix obj
 
 | Planning case | Write | Read | What it represents |
 | --- | ---: | ---: | --- |
-| 1 KiB, N=1, sequential, `none` | 6,795 ops/s, 6.6 MiB/s | 8,708 ops/s, 8.5 MiB/s | Typical single-copy baseline on this host |
-| 1 KiB, N=1, 32 in flight, `none` | 31,157 ops/s, 30.4 MiB/s | 49,001 ops/s, 47.9 MiB/s | Concurrent small-object peak on this host |
-| 1 KiB, N=3, sequential, `none` | 2,775 ops/s, 2.7 MiB/s | 4,119 ops/s, 4.0 MiB/s | Closer to the default three-copy write |
-| 16 KiB, N=1, sequential, `none` | 4,663 ops/s, 72.9 MiB/s | 6,507 ops/s, 101.7 MiB/s | When bandwidth starts to matter |
-| 1 MiB, N=1, incompressible | 209 ops/s, 208.5 MiB/s | 417 ops/s, 416.9 MiB/s | Large-object rate when compression cannot help |
+| 1 KiB, N=1, sequential, `none` | 6,937 ops/s, 6.8 MiB/s | 8,869 ops/s, 8.7 MiB/s | Typical single-copy baseline on this host |
+| 1 KiB, N=1, 32 in flight, `none` | 31,119 ops/s, 30.4 MiB/s | 51,859 ops/s, 50.6 MiB/s | Concurrent small-object peak on this host |
+| 1 KiB, N=3, sequential, `none` | 2,785 ops/s, 2.7 MiB/s | 4,151 ops/s, 4.1 MiB/s | Closer to the default three-copy write |
+| 16 KiB, N=1, sequential, `none` | 4,664 ops/s, 72.9 MiB/s | 6,349 ops/s, 99.2 MiB/s | When bandwidth starts to matter |
+| 1 MiB, N=1, incompressible | 208 ops/s, 208.2 MiB/s | 409 ops/s, 409.3 MiB/s | Large-object rate when compression cannot help |
 
-On the 1 KiB, N=1 sequential path, put p50 / p99 was 138 µs / 341 µs, and get was 110 µs / 179 µs. Small objects are limited by HTTP and the index, not by disk bandwidth: a 100 B put (6,938 ops/s) is almost the same as a 1 KiB put (6,795 ops/s). Use ops/s when planning for many small objects, and MiB/s when objects are larger.
+On the 1 KiB, N=1 sequential path, put p50 / p99 was 137 µs / 221 µs, and get was 109 µs / 171 µs. Small objects are limited by HTTP and the index, not by disk bandwidth: a 100 B put (6,985 ops/s) is almost the same as a 1 KiB put (6,937 ops/s). Use ops/s when planning for many small objects, and MiB/s when objects are larger.
 
-Default production writes make three object-body copies. In this localhost test, that cut 1 KiB sequential write throughput from 6,795 ops/s to 2,775 ops/s. A multi-machine deployment will add network cost on top, which is not in these numbers. Pipelining helps: 32 in-flight 1 KiB puts reached 11,225 ops/s at N=3.
+Default production writes make three object-body copies. In this localhost test, that cut 1 KiB sequential write throughput from 6,937 ops/s to 2,785 ops/s. A multi-machine deployment will add network cost on top, which is not in these numbers. Pipelining helps: 32 in-flight 1 KiB puts reached 11,196 ops/s at N=3.
 
-Compression is zstd by default and is recorded per object. It helps most on logs and other repetitive text. The repeated `0x61` payload in the tables is a best case; the 1 MiB logical write rate of 2,319 MiB/s is not a disk-bandwidth number. Already-compressed or random data does not shrink; this run stored those objects as `none`, and the 1 KiB / 1 MiB rates stayed close to the uncompressed baseline (6,485 vs 6,716 ops/s at 1 KiB; 209 vs 225 ops/s at 1 MiB). On 1 KiB objects, even a 53.89× shrink barely moves ops/s, because the index and HTTP still dominate.
+Compression is zstd by default and is recorded per object. It helps most on logs and other repetitive text. The repeated `0x61` payload in the tables is a best case; the 1 MiB logical write rate of 2,423 MiB/s is not a disk-bandwidth number. Already-compressed or random data does not shrink; this run stored those objects as `none`, and the 1 KiB / 1 MiB rates stayed close to the uncompressed baseline (6,624 vs 6,750 ops/s at 1 KiB; 208 vs 224 ops/s at 1 MiB). On 1 KiB objects, even a 53.89× shrink barely moves ops/s, because the index and HTTP still dominate.
 
-The layout is meant for a large number of small objects. 5,000 × 1 KiB objects landed in one `.blk` file, with 6 group fsyncs when uncompressed and 1 fsync after zstd shrank the payload. There is no per-object directory and no local LevelDB on the block node. If you need a planning number, start from the table above, then run `pnpm bench` on your hardware with a sample of your own objects. Fuller notes are in [docs/benchmarks.md](docs/benchmarks.md).
+The layout is meant for a large number of small objects. 5,000 × 1 KiB objects landed in one `.blk` file, with 6 group fsyncs when uncompressed and 1 fsync after zstd shrank the payload. Each record now carries a 14-byte `recId` tag, so the uncompressed layout is 5,533,890 bytes (on-disk ratio 0.93x). There is no per-object directory and no local LevelDB on the block node. Compared with the 16 Nov 2026, 12:33 (Asia/Shanghai) TLV run on the same machine, before `recId` and compaction, the 1 KiB cluster hot path stayed within a few percent; this suite did not measure compact throughput. If you need a planning number, start from the table above, then run `pnpm bench` on your hardware with a sample of your own objects. Fuller notes and the earlier tables are in [docs/benchmarks.md](docs/benchmarks.md).
 
 HTTP path, `compress=none` (so these rows are not mixed with the default zstd path):
 
 | Workload | Throughput | Bandwidth | p50 | p99 |
 | --- | ---: | ---: | ---: | ---: |
-| direct block put 1 KiB (no index) | 18,716 ops/s | 18.3 MiB/s | 49 µs | 96 µs |
-| direct block get 1 KiB (no index) | 19,334 ops/s | 18.9 MiB/s | 50 µs | 77 µs |
-| cluster put 100 B, N=1 | 6,938 ops/s | 0.7 MiB/s | 137 µs | 231 µs |
-| cluster get 100 B, N=1 | 8,816 ops/s | 0.8 MiB/s | 109 µs | 194 µs |
-| cluster put 1 KiB, N=1 | 6,795 ops/s | 6.6 MiB/s | 138 µs | 341 µs |
-| cluster get 1 KiB, N=1 | 8,708 ops/s | 8.5 MiB/s | 110 µs | 179 µs |
-| cluster put 16 KiB, N=1 | 4,663 ops/s | 72.9 MiB/s | 199 µs | 566 µs |
-| cluster get 16 KiB, N=1 | 6,507 ops/s | 101.7 MiB/s | 144 µs | 348 µs |
-| cluster put 1 KiB, N=1, 32 in flight | 31,157 ops/s | 30.4 MiB/s | 950 µs | 2,620 µs |
-| cluster get 1 KiB, N=1, 32 in flight | 49,001 ops/s | 47.9 MiB/s | 578 µs | 1,637 µs |
-| cluster put 1 KiB, N=3 | 2,775 ops/s | 2.7 MiB/s | 337 µs | 760 µs |
-| cluster get 1 KiB, N=3 | 4,119 ops/s | 4.0 MiB/s | 232 µs | 545 µs |
-| cluster put 1 KiB, N=3, 32 in flight | 11,225 ops/s | 11.0 MiB/s | 2,742 µs | 4,633 µs |
+| direct block put 1 KiB (no index) | 18,619 ops/s | 18.2 MiB/s | 49 µs | 99 µs |
+| direct block get 1 KiB (no index) | 19,361 ops/s | 18.9 MiB/s | 50 µs | 72 µs |
+| cluster put 100 B, N=1 | 6,985 ops/s | 0.7 MiB/s | 135 µs | 247 µs |
+| cluster get 100 B, N=1 | 8,965 ops/s | 0.9 MiB/s | 107 µs | 178 µs |
+| cluster put 1 KiB, N=1 | 6,937 ops/s | 6.8 MiB/s | 137 µs | 221 µs |
+| cluster get 1 KiB, N=1 | 8,869 ops/s | 8.7 MiB/s | 109 µs | 171 µs |
+| cluster put 16 KiB, N=1 | 4,664 ops/s | 72.9 MiB/s | 198 µs | 618 µs |
+| cluster get 16 KiB, N=1 | 6,349 ops/s | 99.2 MiB/s | 143 µs | 482 µs |
+| cluster put 1 KiB, N=1, 32 in flight | 31,119 ops/s | 30.4 MiB/s | 914 µs | 3,518 µs |
+| cluster get 1 KiB, N=1, 32 in flight | 51,859 ops/s | 50.6 MiB/s | 548 µs | 1,700 µs |
+| cluster put 1 KiB, N=3 | 2,785 ops/s | 2.7 MiB/s | 337 µs | 760 µs |
+| cluster get 1 KiB, N=3 | 4,151 ops/s | 4.1 MiB/s | 232 µs | 396 µs |
+| cluster put 1 KiB, N=3, 32 in flight | 11,196 ops/s | 10.9 MiB/s | 2,730 µs | 4,854 µs |
 
 A cluster put writes the block first, then the locator in dleveldb. At N=3 the put must succeed on three block processes, so it is slower than N=1. These numbers should not be compared with the in-process KV benches in the dleveldb repository: that path is pure KV, this one is HTTP index + block.
 
@@ -155,42 +155,42 @@ End-to-end cluster, N=1, including compression. Logical write rate rises on high
 
 | Workload | Stored type | Stored / logical | Ratio | Write | Read |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 1 KiB repeated, none | none | 1,024 / 1,024 B | 1.00x | 6,716 ops/s, 6.6 MiB/s | 8,823 ops/s, 8.6 MiB/s |
-| 1 KiB repeated, zstd | zstd | 19 / 1,024 B | 53.89x | 6,680 ops/s, 6.5 MiB/s | 8,363 ops/s, 8.2 MiB/s |
-| 1 KiB repeated, gzip | gzip | 30 / 1,024 B | 34.13x | 6,682 ops/s, 6.5 MiB/s | 8,520 ops/s, 8.3 MiB/s |
-| 1 KiB random, zstd | none | 1,024 / 1,024 B | 1.00x | 6,485 ops/s, 6.3 MiB/s | 8,770 ops/s, 8.6 MiB/s |
-| 16 KiB repeated, none | none | 16,384 / 16,384 B | 1.00x | 4,747 ops/s, 74.2 MiB/s | 6,600 ops/s, 103.1 MiB/s |
-| 16 KiB repeated, zstd | zstd | 19 / 16,384 B | 862.32x | 6,777 ops/s, 105.9 MiB/s | 7,691 ops/s, 120.2 MiB/s |
-| 16 KiB random, zstd | none | 16,384 / 16,384 B | 1.00x | 4,423 ops/s, 69.1 MiB/s | 6,678 ops/s, 104.3 MiB/s |
-| 1 MiB repeated, none | none | 1,048,576 / 1,048,576 B | 1.00x | 225 ops/s, 225.2 MiB/s | 419 ops/s, 419.1 MiB/s |
-| 1 MiB repeated, zstd | zstd | 50 / 1,048,576 B | 20,971.52x | 2,319 ops/s, 2,319.4 MiB/s | 2,159 ops/s, 2,159.1 MiB/s |
-| 1 MiB random, zstd | none | 1,048,576 / 1,048,576 B | 1.00x | 209 ops/s, 208.5 MiB/s | 417 ops/s, 416.9 MiB/s |
+| 1 KiB repeated, none | none | 1,024 / 1,024 B | 1.00x | 6,750 ops/s, 6.6 MiB/s | 8,762 ops/s, 8.6 MiB/s |
+| 1 KiB repeated, zstd | zstd | 19 / 1,024 B | 53.89x | 6,611 ops/s, 6.5 MiB/s | 8,416 ops/s, 8.2 MiB/s |
+| 1 KiB repeated, gzip | gzip | 30 / 1,024 B | 34.13x | 6,747 ops/s, 6.6 MiB/s | 8,506 ops/s, 8.3 MiB/s |
+| 1 KiB random, zstd | none | 1,024 / 1,024 B | 1.00x | 6,624 ops/s, 6.5 MiB/s | 8,785 ops/s, 8.6 MiB/s |
+| 16 KiB repeated, none | none | 16,384 / 16,384 B | 1.00x | 4,455 ops/s, 69.6 MiB/s | 6,607 ops/s, 103.2 MiB/s |
+| 16 KiB repeated, zstd | zstd | 19 / 16,384 B | 862.32x | 6,754 ops/s, 105.5 MiB/s | 7,990 ops/s, 124.8 MiB/s |
+| 16 KiB random, zstd | none | 16,384 / 16,384 B | 1.00x | 4,298 ops/s, 67.2 MiB/s | 6,660 ops/s, 104.1 MiB/s |
+| 1 MiB repeated, none | none | 1,048,576 / 1,048,576 B | 1.00x | 224 ops/s, 224.1 MiB/s | 400 ops/s, 400.2 MiB/s |
+| 1 MiB repeated, zstd | zstd | 50 / 1,048,576 B | 20,971.52x | 2,423 ops/s, 2,422.8 MiB/s | 2,202 ops/s, 2,202.4 MiB/s |
+| 1 MiB random, zstd | none | 1,048,576 / 1,048,576 B | 1.00x | 208 ops/s, 208.2 MiB/s | 409 ops/s, 409.3 MiB/s |
 
 In-process codec only (no disk, no HTTP). Decompress is omitted when the type falls back to `none`, because that path is a no-op.
 
 | Workload | Applied | Stored / logical | Ratio | Compress | Decompress |
 | --- | --- | ---: | ---: | ---: | ---: |
-| 1 MiB repeated, zstd | zstd | 50 / 1,048,576 B | 20,971.52x | 8,414 MiB/s | 5,407 MiB/s |
-| 1 MiB repeated, gzip | gzip | 1,052 / 1,048,576 B | 996.75x | 4,100 MiB/s | 4,059 MiB/s |
-| 1 MiB random, zstd | none | 1,048,576 / 1,048,576 B | 1.00x | 3,589 MiB/s | — |
-| 1 MiB random, gzip | none | 1,048,576 / 1,048,576 B | 1.00x | 98 MiB/s | — |
-| 16 KiB repeated, zstd | zstd | 19 / 16,384 B | 862.32x | 3,522 MiB/s | 2,279 MiB/s |
+| 1 MiB repeated, zstd | zstd | 50 / 1,048,576 B | 20,971.52x | 8,863 MiB/s | 5,271 MiB/s |
+| 1 MiB repeated, gzip | gzip | 1,052 / 1,048,576 B | 996.75x | 4,081 MiB/s | 4,032 MiB/s |
+| 1 MiB random, zstd | none | 1,048,576 / 1,048,576 B | 1.00x | 3,662 MiB/s | — |
+| 1 MiB random, gzip | none | 1,048,576 / 1,048,576 B | 1.00x | 101 MiB/s | — |
+| 16 KiB repeated, zstd | zstd | 19 / 16,384 B | 862.32x | 3,567 MiB/s | 2,241 MiB/s |
 
 On-disk layout, 5,000 × 1 KiB objects written directly through the C engine and flushed. There is no `index/` directory.
 
 | Case | Files | On disk | Logical | On-disk ratio | fsyncs |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| raw repeated (no compression) | 1 × `.blk` | 5,463,890 B | 5,120,000 B | 0.94x | 6 |
-| zstd repeated (19 B payload each) | 1 × `.blk` | 438,890 B | 5,120,000 B | 11.67x | 1 |
-| zstd random (fell back to `none`) | 1 × `.blk` | 5,463,890 B | 5,120,000 B | 0.94x | 6 |
+| raw repeated (no compression) | 1 × `.blk` | 5,533,890 B | 5,120,000 B | 0.93x | 6 |
+| zstd repeated (19 B payload each) | 1 × `.blk` | 508,890 B | 5,120,000 B | 10.06x | 1 |
+| zstd random (fell back to `none`) | 1 × `.blk` | 5,533,890 B | 5,120,000 B | 0.93x | 6 |
 
-The zstd on-disk ratio is lower than the payload ratio (53.89x) because each record still carries TLV tags, lengths, and a CRC. Inode and file count follow the block file, not the object count.
+The zstd on-disk ratio is lower than the payload ratio (53.89x) because each record still carries TLV tags, including the 14-byte `recId` tag, lengths, and a CRC. Inode and file count follow the block file, not the object count.
 
 ## Implemented and not yet done
 
-Already working: Put / Get / Head / Delete / List, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, per-object compression, TLV records, locator rebuild by scan, and tombstones on delete.
+Already working: Put / Get / Head / Delete / List, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, per-object compression, TLV records, `recId` locators, locator rebuild by scan, tombstones on delete, and idle or manual compaction that reclaims deleted space without updating the index.
 
-Not done yet: multipart upload, full SigV4, erasure coding, block compaction / GC (deleted space is not reclaimed), automatic repair or migration of object replicas, streaming, and the engine’s uint32 object-size limit. Join catch-up and primary write failover are also still unimplemented in dleveldb: a new index node does not pull historical keys, and if the index primary is unreachable, writes fail.
+Not done yet: multipart upload, full SigV4, erasure coding, automatic repair or migration of object replicas, streaming, and the engine’s uint32 object-size limit. Join catch-up and primary write failover are also still unimplemented in dleveldb: a new index node does not pull historical keys, and if the index primary is unreachable, writes fail.
 
 ## Dependencies
 

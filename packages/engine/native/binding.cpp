@@ -59,9 +59,7 @@ static Napi::Object LocToJs(Napi::Env env, const s3dfs_locator &loc)
     o.Set("size", Napi::Number::New(env, (double)loc.size));
     o.Set("generation", Napi::Number::New(env, (double)loc.generation));
     o.Set("extentCount", Napi::Number::New(env, loc.extent_count));
-    o.Set("blockId", Napi::Number::New(env, (double)loc.block_id));
-    o.Set("offset", Napi::Number::New(env, (double)loc.offset));
-    o.Set("recLen", Napi::Number::New(env, loc.rec_len));
+    o.Set("recId", Napi::Number::New(env, (double)loc.rec_id));
     o.Set("compressType", Napi::String::New(env, CompressName(loc.compress_type)));
     o.Set("origSize", Napi::Number::New(env, (double)loc.orig_size));
     o.Set("origCrc", Napi::Number::New(env, loc.orig_crc));
@@ -96,14 +94,8 @@ static bool LocFromJs(Napi::Value value, s3dfs_locator *out)
     if (o.Has("extentCount") && o.Get("extentCount").IsNumber()) {
         out->extent_count = o.Get("extentCount").As<Napi::Number>().Uint32Value();
     }
-    if (o.Has("blockId") && o.Get("blockId").IsNumber()) {
-        out->block_id = (uint64_t)o.Get("blockId").As<Napi::Number>().Int64Value();
-    }
-    if (o.Has("offset") && o.Get("offset").IsNumber()) {
-        out->offset = (uint64_t)o.Get("offset").As<Napi::Number>().Int64Value();
-    }
-    if (o.Has("recLen") && o.Get("recLen").IsNumber()) {
-        out->rec_len = o.Get("recLen").As<Napi::Number>().Uint32Value();
+    if (o.Has("recId") && o.Get("recId").IsNumber()) {
+        out->rec_id = (uint64_t)o.Get("recId").As<Napi::Number>().Int64Value();
     }
     if (o.Has("compressType") && o.Get("compressType").IsString()) {
         out->compress_type = CompressCode(o.Get("compressType").As<Napi::String>().Utf8Value());
@@ -114,7 +106,7 @@ static bool LocFromJs(Napi::Value value, s3dfs_locator *out)
     if (o.Has("origCrc") && o.Get("origCrc").IsNumber()) {
         out->orig_crc = o.Get("origCrc").As<Napi::Number>().Uint32Value();
     }
-    return out->block_id != 0 || out->tombstone;
+    return out->rec_id != 0 || out->tombstone;
 }
 
 static bool MetaFromJs(Napi::Value value, s3dfs_put_meta *out)
@@ -162,6 +154,7 @@ public:
             InstanceMethod("tombstone", &Store::Tombstone),
             InstanceMethod("scan", &Store::Scan),
             InstanceMethod("flush", &Store::Flush),
+            InstanceMethod("compact", &Store::Compact),
             InstanceMethod("stats", &Store::Stats),
             InstanceMethod("close", &Store::Close),
         });
@@ -409,6 +402,17 @@ private:
         return env.Undefined();
     }
 
+    Napi::Value Compact(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        int rc = s3dfs_compact(store_);
+        if (rc != S3DFS_OK) {
+            ErrFrom(env, rc).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        return Stats(info);
+    }
+
     Napi::Value Stats(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
@@ -427,6 +431,8 @@ private:
         o.Set("flushes", Napi::Number::New(env, (double)st.flushes));
         o.Set("fsyncs", Napi::Number::New(env, (double)st.fsyncs));
         o.Set("indexSlots", Napi::Number::New(env, (double)st.index_slots));
+        o.Set("deadBytes", Napi::Number::New(env, (double)st.dead_bytes));
+        o.Set("tickets", Napi::Number::New(env, (double)st.tickets));
         return o;
     }
 

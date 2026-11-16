@@ -11,6 +11,8 @@ const host = process.env.S3DFS_BLOCK_HOST ?? '0.0.0.0';
 const advertise = process.env.S3DFS_ADVERTISE_ADDR ?? `127.0.0.1:${port}`;
 const flushInterval = Number(process.env.S3DFS_FLUSH_INTERVAL_MS ?? 50);
 const healthInterval = Number(process.env.S3DFS_HEALTH_INTERVAL_MS ?? 5000);
+const compactInterval = Number(process.env.S3DFS_COMPACT_INTERVAL_MS ?? 30_000);
+const compactDeadRatio = Number(process.env.S3DFS_COMPACT_DEAD_RATIO ?? 0.2);
 
 const store = Store.open({
   dataDir,
@@ -188,7 +190,8 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   if (pathname === '/_s3dfs/block/compact' && method === 'POST') {
-    sendJson(res, 501, { error: 'compaction is not implemented without a live locator list from the index' });
+    const stats = store.compact();
+    sendJson(res, 200, stats);
     return;
   }
 
@@ -217,6 +220,26 @@ const healthTimer = setInterval(() => {
 }, healthInterval);
 healthTimer.unref();
 
+function maybeCompact(): void {
+  const st = store.stats();
+  const disk = st.bytesOnDisk ?? 0;
+  if (!st.deadBytes || disk <= 0) {
+    return;
+  }
+  if (st.deadBytes / disk >= compactDeadRatio) {
+    store.compact();
+  }
+}
+
+const compactTimer =
+  compactInterval > 0
+    ? (() => {
+        const timer = setInterval(maybeCompact, compactInterval);
+        timer.unref();
+        return timer;
+      })()
+    : null;
+
 server.listen(port, host, () => {
   console.log(`s3dfs block ${nodeId} listening on ${host}:${port} (advertise ${advertise}, data ${dataDir})`);
   void announce();
@@ -225,6 +248,9 @@ server.listen(port, host, () => {
 const shutdown = () => {
   clearInterval(flushTimer);
   clearInterval(healthTimer);
+  if (compactTimer) {
+    clearInterval(compactTimer);
+  }
   server.close(() => {
     store.flush();
     store.close();

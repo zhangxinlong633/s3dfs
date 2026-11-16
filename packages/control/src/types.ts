@@ -21,6 +21,8 @@ export interface BlockStats {
   flushes: number;
   fsyncs: number;
   indexSlots: number;
+  deadBytes?: number;
+  tickets?: number;
 }
 
 export interface BlockHealth extends BlockNodeInfo {
@@ -34,13 +36,11 @@ export interface ExtentLocator {
   size: number;
   generation: number;
   extentCount: number;
-  blockId: number;
-  offset: number;
-  recLen: number;
+  recId: number;
 }
 
 export interface ObjectLocator extends ExtentLocator {
-  v: 2;
+  v: 3;
   replica: number;
   replicaCount: number;
   nodeId: string;
@@ -66,9 +66,7 @@ export function extentFromLocator(loc: ExtentLocator | ObjectLocator): ExtentLoc
     size: storedSize,
     generation: loc.generation ?? 0,
     extentCount: loc.extentCount ?? 1,
-    blockId: loc.blockId,
-    offset: loc.offset,
-    recLen: loc.recLen,
+    recId: loc.recId,
   };
 }
 

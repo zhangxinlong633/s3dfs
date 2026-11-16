@@ -102,6 +102,14 @@ export async function blockFlush(address: string): Promise<void> {
   }
 }
 
+export async function blockCompact(address: string): Promise<BlockStats> {
+  const res = await fetch(blockUrl(address, '/_s3dfs/block/compact'), { method: 'POST' });
+  if (!res.ok) {
+    throw new ControlError('BLOCK_UNAVAILABLE', `block compact ${address} ${res.status}: ${await res.text()}`);
+  }
+  return (await res.json()) as BlockStats;
+}
+
 export async function blockStats(address: string): Promise<BlockStats> {
   const res = await fetch(blockUrl(address, '/_s3dfs/block/stats'));
   if (!res.ok) {

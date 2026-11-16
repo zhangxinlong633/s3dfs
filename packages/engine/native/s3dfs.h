@@ -45,6 +45,8 @@ typedef struct s3dfs_stats {
     uint64_t flushes;
     uint64_t fsyncs;
     uint64_t index_slots;
+    uint64_t dead_bytes;
+    uint64_t tickets;
 } s3dfs_stats;
 
 /* Optional attributes written as TLV tags so a later index rebuild can
@@ -56,8 +58,9 @@ typedef struct s3dfs_put_meta {
     uint32_t orig_crc;
 } s3dfs_put_meta;
 
-/* Location of the last extent (or the only record). Multi-extent objects
-   walk prev-link tags in the block records; dleveldb stores this locator. */
+/* Location of the last extent (or the only record). The stable identifier
+   is rec_id; block_id/offset/rec_len are the current physical location in
+   the node's map and may change after compaction. dleveldb stores rec_id. */
 typedef struct s3dfs_locator {
     uint8_t chained;
     uint8_t tombstone;
@@ -66,6 +69,7 @@ typedef struct s3dfs_locator {
     uint64_t size;
     uint64_t generation;
     uint32_t extent_count;
+    uint64_t rec_id;
     uint64_t block_id;
     uint64_t offset;
     uint32_t rec_len;
@@ -101,6 +105,7 @@ int s3dfs_head_at(s3dfs_store *store, const char *key, uint32_t key_len,
                   uint64_t *mtime_ms);
 int s3dfs_scan(s3dfs_store *store, s3dfs_scan_cb cb, void *user);
 int s3dfs_flush(s3dfs_store *store);
+int s3dfs_compact(s3dfs_store *store);
 void s3dfs_get_stats(s3dfs_store *store, s3dfs_stats *out);
 
 #ifdef __cplusplus

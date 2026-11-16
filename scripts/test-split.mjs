@@ -101,6 +101,7 @@ const blockEnv = (id, port) => ({
   S3DFS_DATA_DIR: path.join(work, id),
   S3DFS_INDEX_URLS: 'http://127.0.0.1:19800',
   S3DFS_FLUSH_INTERVAL_MS: '20',
+  S3DFS_COMPACT_INTERVAL_MS: '0',
 });
 
 const block1 = run(bun, [blockMain], blockEnv('block1', 19100));
@@ -132,7 +133,7 @@ const locs = await cluster.locators('demo/path/to/obj.txt');
 if (locs.length !== 2) {
   throw new Error(`expected 2 locators (min(3, live)=2), got ${locs.length}`);
 }
-if (locs[0].v !== 2 || locs[0].compressType !== 'none' || typeof locs[0].blockId !== 'number' || typeof locs[0].offset !== 'number') {
+if (locs[0].v !== 3 || locs[0].compressType !== 'none' || typeof locs[0].recId !== 'number' || !(locs[0].recId > 0)) {
   throw new Error(`unexpected short-object locator ${JSON.stringify(locs[0])}`);
 }
 if (!(await kv.get('demo/path/to/obj.txt:1'))) {
@@ -154,6 +155,43 @@ const listed = await cluster.list('demo', 'path/');
 const listedKeys = listed.objects.map((o) => o.key).sort();
 if (listedKeys.join(',') !== 'path/to/comp.bin,path/to/obj.txt') {
   throw new Error(`list should hide replica suffixes and show both objects, got ${JSON.stringify(listed.objects)}`);
+}
+
+
+const extra = Buffer.from('to-be-deleted-for-compact');
+await cluster.put('demo', 'path/to/gone.txt', extra);
+if (!(await cluster.get('demo', 'path/to/gone.txt'))) {
+  throw new Error('missing object that should be deleted before compact');
+}
+await cluster.flush();
+const statsUrl = (port) => `http://127.0.0.1:${port}/_s3dfs/block/stats`;
+const statsBefore = await Promise.all([19100, 19101].map(async (port) => (await fetch(statsUrl(port))).json()));
+const beforeDisk = statsBefore.reduce((sum, st) => sum + st.bytesOnDisk, 0);
+await cluster.delete('demo', 'path/to/gone.txt');
+if (await cluster.get('demo', 'path/to/gone.txt')) {
+  throw new Error('get after delete of gone.txt should be empty');
+}
+await cluster.compact();
+const statsAfter = await Promise.all([19100, 19101].map(async (port) => (await fetch(statsUrl(port))).json()));
+const afterDisk = statsAfter.reduce((sum, st) => sum + st.bytesOnDisk, 0);
+if (statsAfter.some((st) => st.deadBytes !== 0)) {
+  throw new Error(`expected deadBytes 0 after compact, got ${JSON.stringify(statsAfter)}`);
+}
+if (!(afterDisk < beforeDisk)) {
+  throw new Error(`compact should shrink disk ${beforeDisk} -> ${afterDisk}`);
+}
+const stillObj = await cluster.get('demo', 'path/to/obj.txt');
+if (!stillObj || stillObj.value.toString() !== payload.toString()) {
+  throw new Error('obj.txt should still be readable after compact');
+}
+const stillComp = await cluster.get('demo', 'path/to/comp.bin');
+if (!stillComp || !stillComp.value.equals(compressible)) {
+  throw new Error('comp.bin should still be readable after compact');
+}
+const recIdBefore = locs[0].recId;
+const locsAfter = await cluster.locators('demo/path/to/obj.txt');
+if (locsAfter[0].recId !== recIdBefore) {
+  throw new Error(`index recId must stay stable across compact: ${recIdBefore} -> ${locsAfter[0].recId}`);
 }
 
 const downId = locs[0].nodeId;

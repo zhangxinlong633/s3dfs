@@ -1,4 +1,4 @@
-import { blockFlush, blockGet, blockHead, blockPut, blockTombstone } from './block-client.js';
+import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone } from './block-client.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
 import { isVisibleObjectKey, locatorKey } from './keys.js';
 import type { IndexClient } from './kv-client.js';
@@ -44,7 +44,7 @@ export class ObjectCluster {
     const targets = this.registry.pick(objectKey, this.dataReplicas);
     const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
     const writes = await Promise.allSettled(targets.map((n) => blockPut(n.address, objectKey, packed.stored, meta)));
-    const accepted: { nodeId: string; address: string; blockId: number; offset: number; recLen: number; chained: boolean; generation: number; extentCount: number; storedSize: number; mtimeMs: number }[] = [];
+    const accepted: { nodeId: string; address: string; recId: number; chained: boolean; generation: number; extentCount: number; storedSize: number; mtimeMs: number }[] = [];
     for (let i = 0; i < writes.length; i++) {
       const result = writes[i]!;
       const node = targets[i]!;
@@ -53,9 +53,7 @@ export class ObjectCluster {
         accepted.push({
           nodeId: node.nodeId,
           address: node.address,
-          blockId: ev.blockId,
-          offset: ev.offset,
-          recLen: ev.recLen,
+          recId: ev.recId,
           chained: ev.chained,
           generation: ev.generation,
           extentCount: ev.extentCount,
@@ -70,14 +68,12 @@ export class ObjectCluster {
     for (let i = 0; i < accepted.length; i++) {
       const ev = accepted[i]!;
       const loc: ObjectLocator = {
-        v: 2,
+        v: 3,
         replica: i,
         replicaCount: accepted.length,
         nodeId: ev.nodeId,
         address: ev.address,
-        blockId: ev.blockId,
-        offset: ev.offset,
-        recLen: ev.recLen,
+        recId: ev.recId,
         chained: ev.chained,
         generation: ev.generation,
         extentCount: ev.extentCount,
@@ -227,8 +223,7 @@ export class ObjectCluster {
   }
 
   async compact(): Promise<void> {
-    // Block nodes no longer keep a local key index, so they cannot rewrite live
-    // objects on their own. Space left by deletes is not reclaimed yet.
+    await Promise.all(this.registry.live().map((n) => blockCompact(n.address)));
   }
 
   async stats(): Promise<ClusterStats> {

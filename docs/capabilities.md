@@ -8,13 +8,13 @@
 - 默认 1GB 一块；超过当前块剩余空间或大于一块的对象，切成多段并从后向前记下链接，读取时再从前向后拼回
 - 1MB 写缓冲做 group commit，flush 默认 `fsync`
 - 批量 `put_batch`（单个 block 引擎内部），避免每个小对象都从 JS 进 C 一次
-- block 记录是带校验的 TLV 帧；不认识的字段可以跳过。索引丢了时可以扫描 `.blk` 重建 locator（删除会写墓碑，避免把已删对象救回来）
+- block 记录是带校验的 TLV 帧；不认识的字段可以跳过。索引 locator 只记稳定的 `recId`（`v: 3`），物理偏移留在节点内存表里，打开时扫描 `.blk` 重建。索引丢了时可以扫描重建 locator（删除会写墓碑，避免把已删对象救回来）
 - 对象数据默认 3 副本，记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带 block 节点信息；有效副本数是 `min(配置值, 存活的 block 节点数)`
 - 定期对 block 节点做健康检查，Get / Put 会跳过已标记为 down 的节点
 - 对象正文默认用 zstd 压缩（`S3DFS_COMPRESS=none|zstd|gzip`），每个对象自己的 `compressType` 记在 locator 里；压不小就存原值
 - 打开 block 时扫描各文件末尾的完整记录，接着追加；没有本地 LevelDB
 - 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact`
-- 控制台查看统计、桶、block 节点状态，并触发 flush。compact 接口仍在，但还不会回收空间
+- 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
 
 ## 还不做的
 
@@ -23,7 +23,6 @@
 - 纠删码
 - 把对象值放进 dleveldb；索引里只有 locator JSON，正文始终在 block 文件里
 - 对象数据副本的自动修复 / 迁移（节点宕机后不会把缺失的副本补到别的机器）
-- 按存活对象重写 block 以回收删除 / 覆盖留下的空间（compact 目前是空操作）
 - dleveldb 侧：节点加入后的范围迁移 / catch-up repair，以及 primary 不可达时的安全写故障转移（读可以走剩余 KV 副本；写索引会失败，避免脑裂）
 - 单对象超过约 4GB − 1（引擎对外 API 仍是 `uint32` 长度）
 
@@ -48,6 +47,8 @@
 - `S3DFS_BLOCK_SIZE`：单个 block 大小，默认 1GB（`1073741824`）
 - `S3DFS_BUFFER_SIZE`：写缓冲，默认 1MB
 - `S3DFS_FLUSH_INTERVAL_MS`：定期 flush 的间隔，默认 50ms
+- `S3DFS_COMPACT_INTERVAL_MS`：后台 compact 间隔，默认 30000；设为 0 则关闭定时任务，仍可手动触发
+- `S3DFS_COMPACT_DEAD_RATIO`：自动合并的空洞比例阈值，默认 0.2（`deadBytes / bytesOnDisk`）
 - `S3DFS_INDEX_URLS`：可选；设置后 block 会向索引注册 `$node/{nodeId}`
 
 索引进程本身的端口、目录、副本数请看 dleveldb 的 `DLEVELDB_*` 环境变量。本仓库的 `pnpm dev:index` 默认把索引开在 `127.0.0.1:9800`，数据目录是 `s3dfs/data/index`。

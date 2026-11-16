@@ -43,9 +43,7 @@ export interface ExtentLocator {
   size: number;
   generation: number;
   extentCount: number;
-  blockId: number;
-  offset: number;
-  recLen: number;
+  recId: number;
   compressType?: CompressType;
   origSize?: number;
   origCrc?: number;
@@ -78,6 +76,8 @@ export interface StoreStats {
   flushes: number;
   fsyncs: number;
   indexSlots: number;
+  deadBytes: number;
+  tickets: number;
 }
 
 interface NativeStore {
@@ -88,6 +88,7 @@ interface NativeStore {
   tombstone(key: string): void;
   scan(): ScanEntry[];
   flush(): void;
+  compact(): StoreStats;
   stats(): StoreStats;
   close(): void;
 }
@@ -136,6 +137,10 @@ export class Store {
 
   flush(): void {
     this.inner.flush();
+  }
+
+  compact(): StoreStats {
+    return this.inner.compact();
   }
 
   stats(): StoreStats {

@@ -29,7 +29,9 @@ try {
   const bigLoc = store.put('a/big', payload);
   store.flush();
 
+  assert(typeof smallLoc.recId === 'number' && smallLoc.recId > 0, `small recId missing: ${JSON.stringify(smallLoc)}`);
   assert(bigLoc && bigLoc.chained && bigLoc.extentCount >= 3, `expected a chained locator, got ${JSON.stringify(bigLoc)}`);
+  assert(typeof bigLoc.recId === 'number' && bigLoc.recId > 0, `big recId missing: ${JSON.stringify(bigLoc)}`);
   const got = store.get('a/big', bigLoc);
   assert(got && got.value.equals(payload), 'get mismatch before reopen');
   const head = store.head('a/big', bigLoc);
@@ -60,8 +62,25 @@ try {
   const afterDelete = store2.scan();
   assert(!afterDelete.some((e) => e.key === 'a/small'), 'tombstone should drop key from scan');
   assert(afterDelete.some((e) => e.key === 'a/big'), 'big object should survive tombstone of small');
+  const beforeCompact = store2.stats();
+  assert(beforeCompact.deadBytes > 0, `delete should leave dead bytes, got ${JSON.stringify(beforeCompact)}`);
+  const compacted = store2.compact();
+  assert(compacted.deadBytes === 0, `deadBytes after compact: ${JSON.stringify(compacted)}`);
+  assert(compacted.bytesOnDisk < beforeCompact.bytesOnDisk, `compact should shrink disk ${beforeCompact.bytesOnDisk} -> ${compacted.bytesOnDisk}`);
+  const stillBig = store2.get('a/big', bigLoc);
+  assert(stillBig && stillBig.value.equals(payload), 'get by same recId after compact failed');
+  const stillScan = store2.scan();
+  assert(!stillScan.some((e) => e.key === 'a/small'), 'small should stay gone after compact');
+  assert(stillScan.some((e) => e.key === 'a/big') && stillScan.some((e) => e.key === 'a/filler'), 'live keys missing after compact');
   store2.close();
-  console.log('ok', { dir, size: payload.length, blocks: stats.blockFiles, last: bigLoc, scanned: scanned.length });
+
+  const store3 = new addon.Store(dir, { blockSize, bufferSize: 64 * 1024, fsyncOnFlush: true });
+  const afterReopen = store3.get('a/big', bigLoc);
+  assert(afterReopen && afterReopen.value.equals(payload), 'get by same recId after compact+reopen failed');
+  const gone = store3.get('a/small', smallLoc);
+  assert(!gone, 'deleted object should stay gone after compact+reopen');
+  store3.close();
+  console.log('ok', { dir, size: payload.length, blocks: stats.blockFiles, last: bigLoc, scanned: scanned.length, compacted });
 } catch (err) {
   try { store.close(); } catch {}
   console.error(err);

@@ -17,7 +17,7 @@ S3 API / 控制台
         │     ├── locator：bucket/key、bucket/key:1、bucket/key:2
         │     └── 节点注册：$node/{nodeId}
         └── 大量 block 节点（packed-block C 引擎）
-              └── packed block 文件（TLV 记录，按偏移读写）
+              └── packed block 文件（TLV 记录，按 recId 查本地表再读）
 ```
 
 对象正文**不会**写进 dleveldb 的 value。索引里只有很小的 JSON。
@@ -38,14 +38,12 @@ locator JSON 形如：
 
 ```json
 {
-  "v": 2,
+  "v": 3,
   "replica": 0,
   "replicaCount": 3,
   "nodeId": "block1",
   "address": "10.0.0.11:9100",
-  "blockId": 1,
-  "offset": 4096,
-  "recLen": 180,
+  "recId": 42,
   "chained": false,
   "generation": 0,
   "extentCount": 1,
@@ -66,7 +64,7 @@ locator JSON 形如：
 - 因此对象 key 本身不要以 `:数字` 结尾。
 - 桶标记仍是 `bucket/`。
 
-Get / Head 先读这些 locator，跳过健康检查为 down 的节点，按剩余副本依次尝试并按 `compressType` 解压。Head 在副本机器暂时不可达时，可以用索引里记下的 size / crc / mtime。Delete 会先在已知副本的 block 上 best-effort 追加墓碑，再删掉对应的索引 key；盘上空间要等以后的 compaction 才会回收。
+Get / Head 先读这些 locator，跳过健康检查为 down 的节点，按剩余副本依次尝试并按 `compressType` 解压。Head 在副本机器暂时不可达时，可以用索引里记下的 size / crc / mtime。Delete 会先在已知副本的 block 上 best-effort 追加墓碑，再删掉对应的索引 key，并给对应 block 出清理票；对象立刻不可读。盘上空洞由空闲或手动 compact 回收，不必改索引里的 `recId`。说明见 [删除空洞与 compact（虚拟记录 ID）](design-compaction.md)。
 
 ## 节点注册与健康检查
 

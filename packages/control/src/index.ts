@@ -1,5 +1,6 @@
 export { IndexClient, type KvEntry, type KvValue, type ScanResult } from './kv-client.js';
 export {
+  blockCompact,
   blockFlush,
   blockGet,
   blockHead,

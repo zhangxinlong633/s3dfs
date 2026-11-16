@@ -34,6 +34,7 @@
 #define S3DFS_TAG_COMPRESS 0x000B
 #define S3DFS_TAG_ORIG_SIZE 0x000C
 #define S3DFS_TAG_ORIG_CRC 0x000D
+#define S3DFS_TAG_REC_ID 0x000E
 
 #define S3DFS_KIND_OBJECT 1
 #define S3DFS_KIND_EXTENT 2
@@ -49,9 +50,8 @@ typedef struct {
     uint32_t crc;
     uint8_t kind;
     int has_prev;
-    uint64_t prev_block_id;
-    uint64_t prev_offset;
-    uint32_t prev_rec_len;
+    uint64_t rec_id;
+    uint64_t prev_rec_id;
     uint32_t seq;
     uint64_t generation;
     uint64_t total_size;
@@ -63,9 +63,7 @@ typedef struct {
 } s3dfs_rec_view;
 
 typedef struct {
-    uint64_t prev_block_id;
-    uint64_t prev_offset;
-    uint32_t prev_rec_len;
+    uint64_t prev_rec_id;
     uint32_t seq;
     uint64_t generation;
     uint64_t total_size;
@@ -85,10 +83,355 @@ struct s3dfs_store {
     uint8_t *buf;
     uint32_t buf_used;
     uint64_t put_generation;
+    uint64_t next_rec_id;
+    uint64_t dead_bytes;
+    uint64_t tickets;
+
+    struct s3dfs_rec_ent *rec_tab;
+    uint32_t rec_cap;
+    uint32_t rec_count;
+    struct s3dfs_key_ent *key_tab;
+    uint32_t key_cap;
+    uint32_t key_count;
 
     s3dfs_stats stats;
     pthread_mutex_t mu;
 };
+
+#define S3DFS_MAP_EMPTY 0
+#define S3DFS_MAP_DEL 1
+#define S3DFS_MAP_LIVE 2
+
+typedef struct s3dfs_rec_ent {
+    uint8_t state;
+    uint64_t rec_id;
+    uint64_t block_id;
+    uint64_t offset;
+    uint32_t rec_len;
+} s3dfs_rec_ent;
+
+typedef struct s3dfs_key_ent {
+    uint8_t state;
+    uint8_t kind;
+    uint32_t key_len;
+    char *key;
+    uint64_t rec_id;
+} s3dfs_key_ent;
+
+static int load_record(s3dfs_store *s, uint64_t block_id, uint64_t offset, uint32_t rec_len, uint8_t **out,
+                       s3dfs_rec_view *view);
+static void retire_chain_unlocked(s3dfs_store *s, uint64_t rec_id);
+static int rebuild_maps_unlocked(s3dfs_store *s);
+static int maps_init(s3dfs_store *s);
+static void maps_free(s3dfs_store *s);
+
+static uint32_t hash_u64(uint64_t x)
+{
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    x ^= x >> 31;
+    return (uint32_t)x;
+}
+
+static uint32_t hash_key_bytes(const char *k, uint32_t n)
+{
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) {
+        h ^= (uint8_t)k[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static int rec_map_init(s3dfs_store *s, uint32_t cap)
+{
+    if (cap < 8) {
+        cap = 8;
+    }
+    s->rec_tab = (s3dfs_rec_ent *)calloc(cap, sizeof(s3dfs_rec_ent));
+    if (!s->rec_tab) {
+        return -1;
+    }
+    s->rec_cap = cap;
+    s->rec_count = 0;
+    return 0;
+}
+
+static int key_map_init(s3dfs_store *s, uint32_t cap)
+{
+    if (cap < 8) {
+        cap = 8;
+    }
+    s->key_tab = (s3dfs_key_ent *)calloc(cap, sizeof(s3dfs_key_ent));
+    if (!s->key_tab) {
+        return -1;
+    }
+    s->key_cap = cap;
+    s->key_count = 0;
+    return 0;
+}
+
+static int maps_init(s3dfs_store *s)
+{
+    s->next_rec_id = 1;
+    s->dead_bytes = 0;
+    s->tickets = 0;
+    if (rec_map_init(s, 64) != 0 || key_map_init(s, 64) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void rec_map_free(s3dfs_store *s)
+{
+    free(s->rec_tab);
+    s->rec_tab = NULL;
+    s->rec_cap = 0;
+    s->rec_count = 0;
+}
+
+static void key_map_free(s3dfs_store *s)
+{
+    if (s->key_tab) {
+        for (uint32_t i = 0; i < s->key_cap; i++) {
+            if (s->key_tab[i].state == S3DFS_MAP_LIVE) {
+                free(s->key_tab[i].key);
+            }
+        }
+    }
+    free(s->key_tab);
+    s->key_tab = NULL;
+    s->key_cap = 0;
+    s->key_count = 0;
+}
+
+static void maps_free(s3dfs_store *s)
+{
+    rec_map_free(s);
+    key_map_free(s);
+}
+
+static int rec_map_grow(s3dfs_store *s);
+
+static int rec_map_put(s3dfs_store *s, uint64_t rec_id, uint64_t block, uint64_t off, uint32_t rec_len)
+{
+    if (!s->rec_tab || rec_id == 0) {
+        return -1;
+    }
+    if (s->rec_count * 2 >= s->rec_cap) {
+        if (rec_map_grow(s) != 0) {
+            return -1;
+        }
+    }
+    uint32_t mask = s->rec_cap - 1;
+    uint32_t i = hash_u64(rec_id) & mask;
+    int slot = -1;
+    for (uint32_t n = 0; n < s->rec_cap; n++) {
+        s3dfs_rec_ent *e = &s->rec_tab[i];
+        if (e->state == S3DFS_MAP_LIVE && e->rec_id == rec_id) {
+            e->block_id = block;
+            e->offset = off;
+            e->rec_len = rec_len;
+            return 0;
+        }
+        if (e->state != S3DFS_MAP_LIVE && slot < 0) {
+            slot = (int)i;
+            if (e->state == S3DFS_MAP_EMPTY) {
+                break;
+            }
+        }
+        i = (i + 1) & mask;
+    }
+    if (slot < 0) {
+        return -1;
+    }
+    s3dfs_rec_ent *e = &s->rec_tab[slot];
+    e->state = S3DFS_MAP_LIVE;
+    e->rec_id = rec_id;
+    e->block_id = block;
+    e->offset = off;
+    e->rec_len = rec_len;
+    s->rec_count++;
+    return 0;
+}
+
+static int rec_map_grow(s3dfs_store *s)
+{
+    uint32_t old_cap = s->rec_cap;
+    s3dfs_rec_ent *old = s->rec_tab;
+    s->rec_tab = NULL;
+    s->rec_cap = 0;
+    s->rec_count = 0;
+    if (rec_map_init(s, old_cap * 2) != 0) {
+        s->rec_tab = old;
+        s->rec_cap = old_cap;
+        return -1;
+    }
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (old[i].state == S3DFS_MAP_LIVE) {
+            if (rec_map_put(s, old[i].rec_id, old[i].block_id, old[i].offset, old[i].rec_len) != 0) {
+                rec_map_free(s);
+                s->rec_tab = old;
+                s->rec_cap = old_cap;
+                return -1;
+            }
+        }
+    }
+    free(old);
+    return 0;
+}
+
+static int rec_map_get(const s3dfs_store *s, uint64_t rec_id, s3dfs_rec_ent *out)
+{
+    if (!s->rec_tab || rec_id == 0) {
+        return -1;
+    }
+    uint32_t mask = s->rec_cap - 1;
+    uint32_t i = hash_u64(rec_id) & mask;
+    for (uint32_t n = 0; n < s->rec_cap; n++) {
+        const s3dfs_rec_ent *e = &s->rec_tab[i];
+        if (e->state == S3DFS_MAP_EMPTY) {
+            return -1;
+        }
+        if (e->state == S3DFS_MAP_LIVE && e->rec_id == rec_id) {
+            if (out) {
+                *out = *e;
+            }
+            return 0;
+        }
+        i = (i + 1) & mask;
+    }
+    return -1;
+}
+
+static void rec_map_del(s3dfs_store *s, uint64_t rec_id)
+{
+    if (!s->rec_tab || rec_id == 0) {
+        return;
+    }
+    uint32_t mask = s->rec_cap - 1;
+    uint32_t i = hash_u64(rec_id) & mask;
+    for (uint32_t n = 0; n < s->rec_cap; n++) {
+        s3dfs_rec_ent *e = &s->rec_tab[i];
+        if (e->state == S3DFS_MAP_EMPTY) {
+            return;
+        }
+        if (e->state == S3DFS_MAP_LIVE && e->rec_id == rec_id) {
+            e->state = S3DFS_MAP_DEL;
+            s->rec_count--;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static int key_map_grow(s3dfs_store *s);
+
+static int key_map_put(s3dfs_store *s, const char *key, uint32_t key_len, uint64_t rec_id, uint8_t kind)
+{
+    if (!s->key_tab || !key || key_len == 0) {
+        return -1;
+    }
+    if (s->key_count * 2 >= s->key_cap) {
+        if (key_map_grow(s) != 0) {
+            return -1;
+        }
+    }
+    uint32_t mask = s->key_cap - 1;
+    uint32_t i = hash_key_bytes(key, key_len) & mask;
+    int slot = -1;
+    for (uint32_t n = 0; n < s->key_cap; n++) {
+        s3dfs_key_ent *e = &s->key_tab[i];
+        if (e->state == S3DFS_MAP_LIVE && e->key_len == key_len && memcmp(e->key, key, key_len) == 0) {
+            e->rec_id = rec_id;
+            e->kind = kind;
+            return 0;
+        }
+        if (e->state != S3DFS_MAP_LIVE && slot < 0) {
+            slot = (int)i;
+            if (e->state == S3DFS_MAP_EMPTY) {
+                break;
+            }
+        }
+        i = (i + 1) & mask;
+    }
+    if (slot < 0) {
+        return -1;
+    }
+    char *copy = (char *)malloc(key_len);
+    if (!copy) {
+        return -1;
+    }
+    memcpy(copy, key, key_len);
+    s3dfs_key_ent *e = &s->key_tab[slot];
+    if (e->state == S3DFS_MAP_LIVE) {
+        free(e->key);
+    }
+    e->state = S3DFS_MAP_LIVE;
+    e->kind = kind;
+    e->key_len = key_len;
+    e->key = copy;
+    e->rec_id = rec_id;
+    s->key_count++;
+    return 0;
+}
+
+static int key_map_grow(s3dfs_store *s)
+{
+    uint32_t old_cap = s->key_cap;
+    s3dfs_key_ent *old = s->key_tab;
+    s->key_tab = NULL;
+    s->key_cap = 0;
+    s->key_count = 0;
+    if (key_map_init(s, old_cap * 2) != 0) {
+        s->key_tab = old;
+        s->key_cap = old_cap;
+        return -1;
+    }
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (old[i].state == S3DFS_MAP_LIVE) {
+            if (key_map_put(s, old[i].key, old[i].key_len, old[i].rec_id, old[i].kind) != 0) {
+                key_map_free(s);
+                s->key_tab = old;
+                s->key_cap = old_cap;
+                return -1;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < old_cap; i++) {
+        if (old[i].state == S3DFS_MAP_LIVE) {
+            free(old[i].key);
+        }
+    }
+    free(old);
+    return 0;
+}
+
+static int key_map_get(const s3dfs_store *s, const char *key, uint32_t key_len, s3dfs_key_ent *out)
+{
+    if (!s->key_tab || !key || key_len == 0) {
+        return -1;
+    }
+    uint32_t mask = s->key_cap - 1;
+    uint32_t i = hash_key_bytes(key, key_len) & mask;
+    for (uint32_t n = 0; n < s->key_cap; n++) {
+        const s3dfs_key_ent *e = &s->key_tab[i];
+        if (e->state == S3DFS_MAP_EMPTY) {
+            return -1;
+        }
+        if (e->state == S3DFS_MAP_LIVE && e->key_len == key_len && memcmp(e->key, key, key_len) == 0) {
+            if (out) {
+                *out = *e;
+            }
+            return 0;
+        }
+        i = (i + 1) & mask;
+    }
+    return -1;
+}
+
 
 static uint32_t crc32_table[256];
 static int crc32_ready = 0;
@@ -177,11 +520,12 @@ static uint32_t rec_overhead(uint32_t key_len, uint32_t value_len, int chained, 
     uint32_t tags = 0;
     tags += 6 + key_len;
     tags += 6 + 1; /* KIND */
+    tags += 6 + 8; /* REC_ID */
     tags += 6 + 8; /* MTIME */
     tags += 6 + 4; /* CRC */
     tags += 6 + value_len;
     if (chained) {
-        tags += 6 + 20; /* PREV */
+        tags += 6 + 8; /* PREV recId */
         tags += 6 + 4;  /* SEQ */
         tags += 6 + 8;  /* GENERATION */
         tags += 6 + 8;  /* TOTAL_SIZE */
@@ -233,14 +577,18 @@ static int parse_tags(const uint8_t *tags, uint32_t tags_len, s3dfs_rec_view *v)
             }
             v->kind = val[0];
             break;
+        case S3DFS_TAG_REC_ID:
+            if (len != 8) {
+                return -1;
+            }
+            v->rec_id = rd_u64(val);
+            break;
         case S3DFS_TAG_PREV:
-            if (len != 20) {
+            if (len != 8) {
                 return -1;
             }
             v->has_prev = 1;
-            v->prev_block_id = rd_u64(val);
-            v->prev_offset = rd_u64(val + 8);
-            v->prev_rec_len = rd_u32(val + 16);
+            v->prev_rec_id = rd_u64(val);
             break;
         case S3DFS_TAG_SEQ:
             if (len != 4) {
@@ -315,7 +663,7 @@ static int parse_record(const uint8_t *rec, uint32_t rec_len, s3dfs_rec_view *v)
 }
 
 static int build_record(uint8_t *dst, uint32_t total, const char *key, uint32_t key_len, const void *value,
-                        uint32_t value_len, uint8_t kind, uint32_t crc, uint64_t mtime_ms,
+                        uint32_t value_len, uint8_t kind, uint64_t rec_id, uint32_t crc, uint64_t mtime_ms,
                         const s3dfs_ext_link *link, const s3dfs_put_meta *meta)
 {
     int chained = (kind == S3DFS_KIND_EXTENT || kind == S3DFS_KIND_EXTENT_LAST);
@@ -330,6 +678,9 @@ static int build_record(uint8_t *dst, uint32_t total, const char *key, uint32_t 
     p += 4;
     p = write_tag(p, S3DFS_TAG_KEY, key, key_len);
     p = write_tag(p, S3DFS_TAG_KIND, &kind, 1);
+    uint8_t rid[8];
+    wr_u64(rid, rec_id);
+    p = write_tag(p, S3DFS_TAG_REC_ID, rid, 8);
     uint8_t mtime[8];
     wr_u64(mtime, mtime_ms);
     p = write_tag(p, S3DFS_TAG_MTIME, mtime, 8);
@@ -337,23 +688,19 @@ static int build_record(uint8_t *dst, uint32_t total, const char *key, uint32_t 
     wr_u32(crc_buf, crc);
     p = write_tag(p, S3DFS_TAG_CRC, crc_buf, 4);
     if (chained) {
-        uint8_t prev[20];
-        uint64_t pb = 0, po = 0;
-        uint32_t pr = 0, seq = 0, ext = 0;
+        uint8_t prev[8];
+        uint64_t prid = 0;
+        uint32_t seq = 0, ext = 0;
         uint64_t gen = 0, total_size = 0;
         if (link) {
-            pb = link->prev_block_id;
-            po = link->prev_offset;
-            pr = link->prev_rec_len;
+            prid = link->prev_rec_id;
             seq = link->seq;
             gen = link->generation;
             total_size = link->total_size;
             ext = link->extent_count;
         }
-        wr_u64(prev, pb);
-        wr_u64(prev + 8, po);
-        wr_u32(prev + 16, pr);
-        p = write_tag(p, S3DFS_TAG_PREV, prev, 20);
+        wr_u64(prev, prid);
+        p = write_tag(p, S3DFS_TAG_PREV, prev, 8);
         uint8_t seqb[4], extb[4], genb[8], tsb[8];
         wr_u32(seqb, seq);
         wr_u64(genb, gen);
@@ -542,8 +889,69 @@ static int ensure_writer(s3dfs_store *s, uint32_t need)
     }
     return S3DFS_OK;
 }
+static int append_raw_unlocked(s3dfs_store *s, const uint8_t *rec, uint32_t total, uint64_t *out_block,
+                               uint64_t *out_off)
+{
+    if (!rec || total < S3DFS_FRAME_OVERHEAD || total > s->block_size) {
+        return S3DFS_ERR_ARGS;
+    }
+    int rc = ensure_writer(s, total <= s->buffer_size ? total : 0);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    if (total > s->buffer_size) {
+        rc = flush_buffer_unlocked(s);
+        if (rc != S3DFS_OK) {
+            return rc;
+        }
+        rc = ensure_writer(s, total);
+        if (rc != S3DFS_OK) {
+            return rc;
+        }
+    }
+    uint64_t offset = s->wr_size + s->buf_used;
+    if (total <= s->buffer_size - s->buf_used) {
+        memcpy(s->buf + s->buf_used, rec, total);
+        s->buf_used += total;
+    } else {
+        rc = flush_buffer_unlocked(s);
+        if (rc != S3DFS_OK) {
+            return rc;
+        }
+        rc = ensure_writer(s, total);
+        if (rc != S3DFS_OK) {
+            return rc;
+        }
+        offset = s->wr_size + s->buf_used;
+        if (total <= s->buffer_size - s->buf_used) {
+            memcpy(s->buf + s->buf_used, rec, total);
+            s->buf_used += total;
+        } else {
+            if (s->wr_fd < 0 || write_fully(s->wr_fd, rec, total) != 0) {
+                return S3DFS_ERR_IO;
+            }
+            s->wr_size += total;
+            s->stats.bytes_on_disk += total;
+            s->stats.flushes++;
+            if (s->fsync_on_flush) {
+                if (fsync(s->wr_fd) != 0) {
+                    return S3DFS_ERR_IO;
+                }
+                s->stats.fsyncs++;
+            }
+        }
+    }
+    if (out_block) {
+        *out_block = s->wr_block_id;
+    }
+    if (out_off) {
+        *out_off = offset;
+    }
+    return S3DFS_OK;
+}
+
 static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, const void *value,
-                         uint32_t value_len, uint8_t kind, uint32_t crc, uint64_t mtime_ms,
+                         uint32_t value_len, uint8_t kind, uint64_t rec_id, uint32_t crc, uint64_t mtime_ms,
                          const s3dfs_ext_link *link, const s3dfs_put_meta *meta, uint64_t *out_block,
                          uint64_t *out_off, uint32_t *out_rec_len)
 {
@@ -573,8 +981,8 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
 
     uint64_t offset = s->wr_size + s->buf_used;
     if (total <= s->buffer_size - s->buf_used) {
-        if (build_record(s->buf + s->buf_used, total, key, key_len, value, value_len, kind, crc, mtime_ms,
-                         link, meta) != 0) {
+        if (build_record(s->buf + s->buf_used, total, key, key_len, value, value_len, kind, rec_id, crc,
+                         mtime_ms, link, meta) != 0) {
             return S3DFS_ERR;
         }
         s->buf_used += total;
@@ -583,7 +991,8 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
         if (!tmp) {
             return S3DFS_ERR_NOMEM;
         }
-        if (build_record(tmp, total, key, key_len, value, value_len, kind, crc, mtime_ms, link, meta) != 0) {
+        if (build_record(tmp, total, key, key_len, value, value_len, kind, rec_id, crc, mtime_ms, link,
+                         meta) != 0) {
             free(tmp);
             return S3DFS_ERR;
         }
@@ -612,12 +1021,17 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
     if (out_rec_len) {
         *out_rec_len = total;
     }
+    if (kind != S3DFS_KIND_TOMBSTONE && rec_id) {
+        if (rec_map_put(s, rec_id, s->wr_block_id, offset, total) != 0) {
+            return S3DFS_ERR_NOMEM;
+        }
+    }
     return S3DFS_OK;
 }
 
 static void fill_locator(s3dfs_locator *out, uint8_t kind, uint32_t crc, uint64_t mtime, uint64_t size,
-                         uint64_t gen, uint32_t extent_count, uint64_t block, uint64_t off, uint32_t rec_len,
-                         const s3dfs_put_meta *meta)
+                         uint64_t gen, uint32_t extent_count, uint64_t rec_id, uint64_t block, uint64_t off,
+                         uint32_t rec_len, const s3dfs_put_meta *meta)
 {
     memset(out, 0, sizeof(*out));
     out->chained = (kind == S3DFS_KIND_EXTENT || kind == S3DFS_KIND_EXTENT_LAST) ? 1 : 0;
@@ -627,6 +1041,7 @@ static void fill_locator(s3dfs_locator *out, uint8_t kind, uint32_t crc, uint64_
     out->size = size;
     out->generation = gen;
     out->extent_count = extent_count ? extent_count : 1;
+    out->rec_id = rec_id;
     out->block_id = block;
     out->offset = off;
     out->rec_len = rec_len;
@@ -679,6 +1094,12 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
                                uint32_t value_len, uint32_t crc, uint64_t mtime, const s3dfs_put_meta *meta,
                                s3dfs_locator *out)
 {
+    s3dfs_key_ent existing;
+    if (key_map_get(s, key, key_len, &existing) == 0 && existing.rec_id &&
+        existing.kind != S3DFS_KIND_TOMBSTONE) {
+        retire_chain_unlocked(s, existing.rec_id);
+        s->tickets++;
+    }
     int with_meta = (meta && meta->has_meta) ? 1 : 0;
     uint32_t simple = rec_overhead(key_len, value_len, 0, with_meta);
     uint64_t used = (s->wr_fd >= 0) ? (s->wr_size + s->buf_used) : 0;
@@ -687,12 +1108,16 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
     if (simple <= s->block_size && simple <= remain) {
         uint64_t block = 0, off = 0;
         uint32_t rec_len = 0;
-        int rc = append_record(s, key, key_len, value, value_len, S3DFS_KIND_OBJECT, crc, mtime, NULL, meta,
-                               &block, &off, &rec_len);
+        uint64_t rec_id = s->next_rec_id++;
+        int rc = append_record(s, key, key_len, value, value_len, S3DFS_KIND_OBJECT, rec_id, crc, mtime, NULL,
+                               meta, &block, &off, &rec_len);
         if (rc != S3DFS_OK) {
             return rc;
         }
-        fill_locator(out, S3DFS_KIND_OBJECT, crc, mtime, value_len, 0, 1, block, off, rec_len, meta);
+        if (key_map_put(s, key, key_len, rec_id, S3DFS_KIND_OBJECT) != 0) {
+            return S3DFS_ERR_NOMEM;
+        }
+        fill_locator(out, S3DFS_KIND_OBJECT, crc, mtime, value_len, 0, 1, rec_id, block, off, rec_len, meta);
         return S3DFS_OK;
     }
 
@@ -713,12 +1138,16 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
         if (simple <= s->block_size) {
             uint64_t block = 0, off = 0;
             uint32_t rec_len = 0;
-            rc = append_record(s, key, key_len, value, value_len, S3DFS_KIND_OBJECT, crc, mtime, NULL, meta,
-                               &block, &off, &rec_len);
+            uint64_t rec_id = s->next_rec_id++;
+            rc = append_record(s, key, key_len, value, value_len, S3DFS_KIND_OBJECT, rec_id, crc, mtime, NULL,
+                               meta, &block, &off, &rec_len);
             if (rc != S3DFS_OK) {
                 return rc;
             }
-            fill_locator(out, S3DFS_KIND_OBJECT, crc, mtime, value_len, 0, 1, block, off, rec_len, meta);
+            if (key_map_put(s, key, key_len, rec_id, S3DFS_KIND_OBJECT) != 0) {
+                return S3DFS_ERR_NOMEM;
+            }
+            fill_locator(out, S3DFS_KIND_OBJECT, crc, mtime, value_len, 0, 1, rec_id, block, off, rec_len, meta);
             return S3DFS_OK;
         }
     }
@@ -734,7 +1163,7 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
     const uint8_t *src = (const uint8_t *)value;
     uint32_t left = value_len;
     uint32_t seq = 0;
-    uint64_t last_block = 0, last_off = 0;
+    uint64_t last_block = 0, last_off = 0, last_rec_id = 0;
     uint32_t last_rec_len = 0;
 
     while (left) {
@@ -782,25 +1211,28 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
         uint8_t kind = is_last ? (uint8_t)S3DFS_KIND_EXTENT_LAST : (uint8_t)S3DFS_KIND_EXTENT;
         uint64_t block = 0, off = 0;
         uint32_t rec_len = 0;
-        int rc = append_record(s, key, key_len, src, chunk, kind, is_last ? crc : 0, mtime, &link,
+        uint64_t rec_id = s->next_rec_id++;
+        int rc = append_record(s, key, key_len, src, chunk, kind, rec_id, is_last ? crc : 0, mtime, &link,
                                is_last ? meta : NULL, &block, &off, &rec_len);
         if (rc != S3DFS_OK) {
             return rc;
         }
         memset(&prev, 0, sizeof(prev));
-        prev.prev_block_id = block;
-        prev.prev_offset = off;
-        prev.prev_rec_len = rec_len;
+        prev.prev_rec_id = rec_id;
         last_block = block;
         last_off = off;
         last_rec_len = rec_len;
+        last_rec_id = rec_id;
         src += chunk;
         left -= chunk;
         seq++;
     }
 
-    fill_locator(out, S3DFS_KIND_EXTENT_LAST, crc, mtime, value_len, gen, n_ext, last_block, last_off,
-                 last_rec_len, meta);
+    if (key_map_put(s, key, key_len, last_rec_id, S3DFS_KIND_EXTENT_LAST) != 0) {
+        return S3DFS_ERR_NOMEM;
+    }
+    fill_locator(out, S3DFS_KIND_EXTENT_LAST, crc, mtime, value_len, gen, n_ext, last_rec_id, last_block,
+                 last_off, last_rec_len, meta);
     return S3DFS_OK;
 }
 
@@ -859,6 +1291,31 @@ static int load_record(s3dfs_store *s, uint64_t block_id, uint64_t offset, uint3
     }
     *out = tmp;
     return S3DFS_OK;
+}
+
+static void retire_chain_unlocked(s3dfs_store *s, uint64_t rec_id)
+{
+    uint64_t cur = rec_id;
+    uint32_t n = 0;
+    while (cur && n < S3DFS_MAX_EXTENTS) {
+        s3dfs_rec_ent e;
+        if (rec_map_get(s, cur, &e) != 0) {
+            break;
+        }
+        uint8_t *raw = NULL;
+        s3dfs_rec_view view;
+        uint64_t prev = 0;
+        if (load_record(s, e.block_id, e.offset, e.rec_len, &raw, &view) == S3DFS_OK) {
+            if (view.has_prev) {
+                prev = view.prev_rec_id;
+            }
+            free(raw);
+        }
+        rec_map_del(s, cur);
+        s->dead_bytes += e.rec_len;
+        cur = prev;
+        n++;
+    }
 }
 
 static int scan_block_end(s3dfs_store *s, uint64_t id, uint64_t *size_out)
@@ -987,9 +1444,11 @@ s3dfs_store *s3dfs_open(const char *data_dir, const s3dfs_options *opt)
     }
     s->fsync_on_flush = (!opt || opt->fsync_on_flush) ? 1 : 0;
     s->wr_fd = -1;
+    s->next_rec_id = 1;
     s->buf = (uint8_t *)malloc(s->buffer_size);
     pthread_mutex_init(&s->mu, NULL);
-    if (!s->buf || mkdir_p(s->data_dir) != 0 || mkdir_p(s->blocks_dir) != 0 || recover_writer(s) != S3DFS_OK) {
+    if (!s->buf || maps_init(s) != 0 || mkdir_p(s->data_dir) != 0 || mkdir_p(s->blocks_dir) != 0 ||
+        recover_writer(s) != S3DFS_OK || rebuild_maps_unlocked(s) != S3DFS_OK) {
         s3dfs_close(s);
         return NULL;
     }
@@ -1005,6 +1464,8 @@ void s3dfs_close(s3dfs_store *s)
     flush_buffer_unlocked(s);
     close_write_fd(s);
     free(s->buf);
+    s->buf = NULL;
+    maps_free(s);
     pthread_mutex_unlock(&s->mu);
     pthread_mutex_destroy(&s->mu);
     free(s);
@@ -1072,10 +1533,22 @@ int s3dfs_tombstone(s3dfs_store *s, const char *key, uint32_t key_len)
     }
     uint64_t mtime = now_ms();
     pthread_mutex_lock(&s->mu);
-    int rc = append_record(s, key, key_len, NULL, 0, S3DFS_KIND_TOMBSTONE, 0, mtime, NULL, NULL, NULL, NULL,
-                           NULL);
+    s3dfs_key_ent existing;
+    if (key_map_get(s, key, key_len, &existing) == 0 && existing.rec_id &&
+        existing.kind != S3DFS_KIND_TOMBSTONE) {
+        retire_chain_unlocked(s, existing.rec_id);
+    }
+    uint64_t rec_id = s->next_rec_id++;
+    int rc = append_record(s, key, key_len, NULL, 0, S3DFS_KIND_TOMBSTONE, rec_id, 0, mtime, NULL, NULL, NULL,
+                           NULL, NULL);
     if (rc == S3DFS_OK) {
         s->stats.deletes++;
+        s->tickets++;
+        /* The tombstone record itself is dead payload once compact runs. */
+        if (key_map_put(s, key, key_len, rec_id, S3DFS_KIND_TOMBSTONE) != 0) {
+            pthread_mutex_unlock(&s->mu);
+            return S3DFS_ERR_NOMEM;
+        }
     }
     pthread_mutex_unlock(&s->mu);
     return rc;
@@ -1100,9 +1573,24 @@ static int walk_chain(s3dfs_store *s, const s3dfs_locator *loc, const char *key,
         return S3DFS_ERR_NOMEM;
     }
 
-    uint64_t block = loc->block_id;
-    uint64_t off = loc->offset;
-    uint32_t rec_len = loc->rec_len;
+    if (!loc->rec_id) {
+        free(blocks);
+        free(offs);
+        free(rec_lens);
+        free(val_lens);
+        return S3DFS_ERR_ARGS;
+    }
+    s3dfs_rec_ent ent;
+    if (rec_map_get(s, loc->rec_id, &ent) != 0) {
+        free(blocks);
+        free(offs);
+        free(rec_lens);
+        free(val_lens);
+        return S3DFS_ERR_NOT_FOUND;
+    }
+    uint64_t block = ent.block_id;
+    uint64_t off = ent.offset;
+    uint32_t rec_len = ent.rec_len;
     uint32_t n = 0;
     while (1) {
         if (n >= S3DFS_MAX_EXTENTS) {
@@ -1163,17 +1651,22 @@ static int walk_chain(s3dfs_store *s, const s3dfs_locator *loc, const char *key,
         rec_lens[n] = rec_len;
         val_lens[n] = view.value_len;
         n++;
-        uint64_t next_block = view.prev_block_id;
-        uint64_t next_off = view.prev_offset;
-        uint32_t next_len = view.prev_rec_len;
-        int has_prev = view.has_prev && view.prev_rec_len != 0;
+        uint64_t next_id = view.prev_rec_id;
+        int has_prev = view.has_prev && view.prev_rec_id != 0;
         free(rec);
         if (!has_prev) {
             break;
         }
-        block = next_block;
-        off = next_off;
-        rec_len = next_len;
+        if (rec_map_get(s, next_id, &ent) != 0) {
+            free(blocks);
+            free(offs);
+            free(rec_lens);
+            free(val_lens);
+            return S3DFS_ERR_IO;
+        }
+        block = ent.block_id;
+        off = ent.offset;
+        rec_len = ent.rec_len;
     }
     if (loc->extent_count && n != loc->extent_count) {
         free(blocks);
@@ -1212,10 +1705,14 @@ static int read_value(s3dfs_store *s, const s3dfs_locator *e, const char *key, u
         return S3DFS_ERR_ARGS;
     }
     if (!e->chained) {
-        uint32_t rec_len = e->rec_len ? e->rec_len : rec_overhead(key_len, (uint32_t)e->size, 0, 0);
+        s3dfs_rec_ent ent;
+        if (!e->rec_id || rec_map_get(s, e->rec_id, &ent) != 0) {
+            return S3DFS_ERR_NOT_FOUND;
+        }
+        uint32_t rec_len = ent.rec_len;
         uint8_t *tmp = NULL;
         s3dfs_rec_view view;
-        int rc = load_record(s, e->block_id, e->offset, rec_len, &tmp, &view);
+        int rc = load_record(s, ent.block_id, ent.offset, rec_len, &tmp, &view);
         if (rc != S3DFS_OK) {
             return rc;
         }
@@ -1298,7 +1795,7 @@ static int read_value(s3dfs_store *s, const s3dfs_locator *e, const char *key, u
 int s3dfs_get_at(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_locator *loc, void **out,
                  uint32_t *out_len, uint32_t *crc, uint64_t *mtime_ms)
 {
-    if (!s || !key || !loc || !out || !out_len || loc->block_id == 0 || loc->tombstone) {
+    if (!s || !key || !loc || !out || !out_len || loc->rec_id == 0 || loc->tombstone) {
         return S3DFS_ERR_ARGS;
     }
     pthread_mutex_lock(&s->mu);
@@ -1324,17 +1821,19 @@ void s3dfs_free(void *p)
 int s3dfs_head_at(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_locator *loc, uint32_t *size,
                   uint32_t *crc, uint64_t *mtime_ms)
 {
-    if (!s || !key || !loc || loc->block_id == 0 || loc->tombstone) {
-        return S3DFS_ERR_ARGS;
-    }
-    uint32_t rec_len = loc->rec_len;
-    if (!rec_len) {
+    if (!s || !key || !loc || loc->rec_id == 0 || loc->tombstone) {
         return S3DFS_ERR_ARGS;
     }
     pthread_mutex_lock(&s->mu);
+    s3dfs_rec_ent ent;
+    if (rec_map_get(s, loc->rec_id, &ent) != 0) {
+        pthread_mutex_unlock(&s->mu);
+        return S3DFS_ERR_NOT_FOUND;
+    }
+    uint32_t rec_len = ent.rec_len;
     uint8_t *rec = NULL;
     s3dfs_rec_view view;
-    int rc = load_record(s, loc->block_id, loc->offset, rec_len, &rec, &view);
+    int rc = load_record(s, ent.block_id, ent.offset, rec_len, &rec, &view);
     if (rc != S3DFS_OK) {
         pthread_mutex_unlock(&s->mu);
         return rc == S3DFS_ERR_IO ? S3DFS_ERR_NOT_FOUND : rc;
@@ -1374,6 +1873,7 @@ static void locator_from_view(s3dfs_locator *out, const s3dfs_rec_view *view, ui
     }
     out->generation = view->generation;
     out->extent_count = view->extent_count ? view->extent_count : 1;
+    out->rec_id = view->rec_id;
     out->block_id = block;
     out->offset = off;
     out->rec_len = rec_len;
@@ -1509,6 +2009,370 @@ static int list_block_ids(s3dfs_store *s, uint64_t **ids_out, uint32_t *n_out)
     return S3DFS_OK;
 }
 
+static int index_record(s3dfs_store *s, uint64_t block, uint64_t off, uint32_t rec_len, const s3dfs_rec_view *view)
+{
+    if (view->rec_id) {
+        if (view->rec_id >= s->next_rec_id) {
+            s->next_rec_id = view->rec_id + 1;
+        }
+        if (view->kind != S3DFS_KIND_TOMBSTONE) {
+            if (rec_map_put(s, view->rec_id, block, off, rec_len) != 0) {
+                return S3DFS_ERR_NOMEM;
+            }
+        }
+    }
+    if (view->kind == S3DFS_KIND_OBJECT || view->kind == S3DFS_KIND_EXTENT_LAST ||
+        view->kind == S3DFS_KIND_TOMBSTONE) {
+        if (view->key && view->key_len) {
+            if (key_map_put(s, (const char *)view->key, view->key_len, view->rec_id, view->kind) != 0) {
+                return S3DFS_ERR_NOMEM;
+            }
+        }
+    }
+    return S3DFS_OK;
+}
+
+static int index_block_records(s3dfs_store *s, uint64_t id, uint64_t file_end, int include_buf)
+{
+    uint64_t off = 0;
+    while (off < file_end) {
+        uint8_t head[8];
+        uint8_t *raw = NULL;
+        int from_buf = 0;
+        if (include_buf && s->wr_fd >= 0 && id == s->wr_block_id && off >= s->wr_size) {
+            uint64_t buf_off = off - s->wr_size;
+            if (buf_off + 8 > s->buf_used) {
+                break;
+            }
+            memcpy(head, s->buf + buf_off, 8);
+            from_buf = 1;
+        } else {
+            char path[4096];
+            block_path(s, id, path, sizeof(path));
+            int same = (s->wr_fd >= 0 && id == s->wr_block_id);
+            int fd = same ? s->wr_fd : open(path, O_RDONLY);
+            if (fd < 0) {
+                return S3DFS_ERR_IO;
+            }
+            if (pread(fd, head, 8, (off_t)off) != 8) {
+                if (!same) {
+                    close(fd);
+                }
+                break;
+            }
+            if (!same) {
+                close(fd);
+            }
+        }
+        if (rd_u32(head) != S3DFS_REC_MAGIC) {
+            break;
+        }
+        uint32_t total = rd_u32(head + 4);
+        if (total < S3DFS_FRAME_OVERHEAD || off + total > file_end) {
+            break;
+        }
+        s3dfs_rec_view view;
+        if (from_buf) {
+            uint64_t buf_off = off - s->wr_size;
+            if (buf_off + total > s->buf_used || parse_record(s->buf + buf_off, total, &view) != 0) {
+                break;
+            }
+            int rc = index_record(s, id, off, total, &view);
+            if (rc != S3DFS_OK) {
+                return rc;
+            }
+        } else {
+            int rc = load_bytes(s, id, off, total, &raw);
+            if (rc != S3DFS_OK) {
+                return rc;
+            }
+            if (parse_record(raw, total, &view) != 0) {
+                free(raw);
+                break;
+            }
+            rc = index_record(s, id, off, total, &view);
+            free(raw);
+            if (rc != S3DFS_OK) {
+                return rc;
+            }
+        }
+        off += total;
+    }
+    return S3DFS_OK;
+}
+
+static int live_bytes_for_rec(s3dfs_store *s, uint64_t rec_id, uint64_t *sum)
+{
+    uint64_t cur = rec_id;
+    uint32_t n = 0;
+    uint64_t total = 0;
+    while (cur && n < S3DFS_MAX_EXTENTS) {
+        s3dfs_rec_ent e;
+        if (rec_map_get(s, cur, &e) != 0) {
+            break;
+        }
+        total += e.rec_len;
+        uint8_t *raw = NULL;
+        s3dfs_rec_view view;
+        uint64_t prev = 0;
+        if (load_record(s, e.block_id, e.offset, e.rec_len, &raw, &view) != S3DFS_OK) {
+            break;
+        }
+        if (view.has_prev) {
+            prev = view.prev_rec_id;
+        }
+        free(raw);
+        cur = prev;
+        n++;
+    }
+    *sum = total;
+    return S3DFS_OK;
+}
+
+static int recount_disk_unlocked(s3dfs_store *s)
+{
+    uint64_t *ids = NULL;
+    uint32_t n = 0;
+    int rc = list_block_ids(s, &ids, &n);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    uint64_t bytes = 0;
+    uint32_t files = n;
+    int seen_wr = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (s->wr_fd >= 0 && ids[i] == s->wr_block_id) {
+            bytes += s->wr_size + s->buf_used;
+            seen_wr = 1;
+        } else {
+            uint64_t end = 0;
+            rc = scan_block_end(s, ids[i], &end);
+            if (rc != S3DFS_OK) {
+                free(ids);
+                return rc;
+            }
+            bytes += end;
+        }
+    }
+    if (s->wr_fd >= 0 && !seen_wr) {
+        bytes += s->wr_size + s->buf_used;
+        files++;
+    }
+    s->stats.block_files = files;
+    s->stats.bytes_on_disk = bytes;
+    free(ids);
+    return S3DFS_OK;
+}
+
+static int rebuild_maps_unlocked(s3dfs_store *s)
+{
+    maps_free(s);
+    if (maps_init(s) != 0) {
+        return S3DFS_ERR_NOMEM;
+    }
+    uint64_t *ids = NULL;
+    uint32_t n = 0;
+    int rc = list_block_ids(s, &ids, &n);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    int seen_wr = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t end = 0;
+        int include_buf = 0;
+        if (s->wr_fd >= 0 && ids[i] == s->wr_block_id) {
+            end = s->wr_size + s->buf_used;
+            include_buf = 1;
+            seen_wr = 1;
+        } else {
+            rc = scan_block_end(s, ids[i], &end);
+            if (rc != S3DFS_OK) {
+                free(ids);
+                return rc;
+            }
+        }
+        rc = index_block_records(s, ids[i], end, include_buf);
+        if (rc != S3DFS_OK) {
+            free(ids);
+            return rc;
+        }
+    }
+    if (s->wr_fd >= 0 && !seen_wr && s->wr_size + s->buf_used > 0) {
+        rc = index_block_records(s, s->wr_block_id, s->wr_size + s->buf_used, 1);
+        if (rc != S3DFS_OK) {
+            free(ids);
+            return rc;
+        }
+    }
+    free(ids);
+    rc = recount_disk_unlocked(s);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    uint64_t live = 0;
+    if (s->key_tab) {
+        for (uint32_t i = 0; i < s->key_cap; i++) {
+            s3dfs_key_ent *e = &s->key_tab[i];
+            if (e->state != S3DFS_MAP_LIVE || e->kind == S3DFS_KIND_TOMBSTONE || !e->rec_id) {
+                continue;
+            }
+            uint64_t sum = 0;
+            live_bytes_for_rec(s, e->rec_id, &sum);
+            live += sum;
+        }
+    }
+    s->dead_bytes = (s->stats.bytes_on_disk > live) ? (s->stats.bytes_on_disk - live) : 0;
+    if (s->dead_bytes && s->tickets == 0) {
+        s->tickets = 1;
+    }
+    return S3DFS_OK;
+}
+
+static int copy_live_record(s3dfs_store *s, uint64_t rec_id)
+{
+    s3dfs_rec_ent e;
+    if (rec_map_get(s, rec_id, &e) != 0) {
+        return S3DFS_ERR_IO;
+    }
+    uint8_t *raw = NULL;
+    int rc = load_bytes(s, e.block_id, e.offset, e.rec_len, &raw);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    uint64_t block = 0, off = 0;
+    rc = append_raw_unlocked(s, raw, e.rec_len, &block, &off);
+    free(raw);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    if (rec_map_put(s, rec_id, block, off, e.rec_len) != 0) {
+        return S3DFS_ERR_NOMEM;
+    }
+    return S3DFS_OK;
+}
+
+static int collect_chain_ids(s3dfs_store *s, uint64_t last_id, uint64_t **ids_out, uint32_t *n_out)
+{
+    uint32_t cap = 8, n = 0;
+    uint64_t *ids = (uint64_t *)malloc(cap * sizeof(uint64_t));
+    if (!ids) {
+        return S3DFS_ERR_NOMEM;
+    }
+    uint64_t cur = last_id;
+    while (cur && n < S3DFS_MAX_EXTENTS) {
+        if (n == cap) {
+            cap *= 2;
+            uint64_t *p = (uint64_t *)realloc(ids, cap * sizeof(uint64_t));
+            if (!p) {
+                free(ids);
+                return S3DFS_ERR_NOMEM;
+            }
+            ids = p;
+        }
+        ids[n++] = cur;
+        s3dfs_rec_ent e;
+        if (rec_map_get(s, cur, &e) != 0) {
+            free(ids);
+            return S3DFS_ERR_IO;
+        }
+        uint8_t *raw = NULL;
+        s3dfs_rec_view view;
+        if (load_record(s, e.block_id, e.offset, e.rec_len, &raw, &view) != S3DFS_OK) {
+            free(ids);
+            return S3DFS_ERR_IO;
+        }
+        uint64_t prev = view.has_prev ? view.prev_rec_id : 0;
+        free(raw);
+        cur = prev;
+    }
+    for (uint32_t i = 0, j = n; i < j; i++, j--) {
+        uint32_t b = j - 1;
+        uint64_t tmp = ids[i];
+        ids[i] = ids[b];
+        ids[b] = tmp;
+    }
+    *ids_out = ids;
+    *n_out = n;
+    return S3DFS_OK;
+}
+
+static int compact_unlocked(s3dfs_store *s)
+{
+    int rc = flush_buffer_unlocked(s);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    if (s->dead_bytes == 0) {
+        return S3DFS_OK;
+    }
+    uint64_t *old_ids = NULL;
+    uint32_t n_old = 0;
+    rc = list_block_ids(s, &old_ids, &n_old);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    rc = close_write_fd(s);
+    if (rc != S3DFS_OK) {
+        free(old_ids);
+        return rc;
+    }
+
+    if (s->key_tab) {
+        for (uint32_t i = 0; i < s->key_cap; i++) {
+            s3dfs_key_ent *e = &s->key_tab[i];
+            if (e->state != S3DFS_MAP_LIVE || e->kind == S3DFS_KIND_TOMBSTONE || !e->rec_id) {
+                continue;
+            }
+            uint64_t *chain = NULL;
+            uint32_t cn = 0;
+            rc = collect_chain_ids(s, e->rec_id, &chain, &cn);
+            if (rc != S3DFS_OK) {
+                free(old_ids);
+                return rc;
+            }
+            for (uint32_t k = 0; k < cn; k++) {
+                rc = copy_live_record(s, chain[k]);
+                if (rc != S3DFS_OK) {
+                    free(chain);
+                    free(old_ids);
+                    return rc;
+                }
+            }
+            free(chain);
+        }
+    }
+    rc = flush_buffer_unlocked(s);
+    if (rc != S3DFS_OK) {
+        free(old_ids);
+        return rc;
+    }
+
+    uint64_t new_id = s->wr_block_id;
+    for (uint32_t i = 0; i < n_old; i++) {
+        if (s->wr_fd >= 0 && old_ids[i] == new_id) {
+            continue;
+        }
+        char path[4096];
+        block_path(s, old_ids[i], path, sizeof(path));
+        unlink(path);
+    }
+    free(old_ids);
+    rc = rebuild_maps_unlocked(s);
+    return rc;
+}
+
+int s3dfs_compact(s3dfs_store *s)
+{
+    if (!s) {
+        return S3DFS_ERR_ARGS;
+    }
+    pthread_mutex_lock(&s->mu);
+    int rc = compact_unlocked(s);
+    pthread_mutex_unlock(&s->mu);
+    return rc;
+}
+
+
 int s3dfs_scan(s3dfs_store *s, s3dfs_scan_cb cb, void *user)
 {
     if (!s || !cb) {
@@ -1579,6 +2443,8 @@ void s3dfs_get_stats(s3dfs_store *s, s3dfs_stats *out)
         return;
     }
     pthread_mutex_lock(&s->mu);
+    s->stats.dead_bytes = s->dead_bytes;
+    s->stats.tickets = s->tickets;
     *out = s->stats;
     pthread_mutex_unlock(&s->mu);
 }
