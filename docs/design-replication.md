@@ -17,8 +17,7 @@ S3 API / 控制台
         │     ├── locator：bucket/key、bucket/key:1、bucket/key:2
         │     └── 节点注册：$node/{nodeId}
         └── 大量 block 节点（packed-block C 引擎）
-              ├── 本机 LevelDB（key → block 内偏移）
-              └── packed block 文件（对象正文）
+              └── packed block 文件（TLV 记录，按偏移读写）
 ```
 
 对象正文**不会**写进 dleveldb 的 value。索引里只有很小的 JSON。
@@ -39,17 +38,26 @@ locator JSON 形如：
 
 ```json
 {
-  "v": 1,
+  "v": 2,
   "replica": 0,
   "replicaCount": 3,
   "nodeId": "block1",
   "address": "10.0.0.11:9100",
-  "storageKey": "logs/a.log",
+  "blockId": 1,
+  "offset": 4096,
+  "recLen": 180,
+  "chained": false,
+  "generation": 0,
+  "extentCount": 1,
   "size": 123,
+  "storedSize": 80,
+  "compressType": "zstd",
   "crc": 42,
   "mtimeMs": 1760000000000
 }
 ```
+
+`size` / `crc` 是未压缩正文的长度和校验；`storedSize` 是写进 block 的字节数；`compressType` 为 `none`、`zstd` 或 `gzip`。block 记录本身也是 TLV，同样带上压缩类型，索引丢了时可以扫 `.blk` 重建这些字段。
 
 约定：
 
@@ -58,7 +66,7 @@ locator JSON 形如：
 - 因此对象 key 本身不要以 `:数字` 结尾。
 - 桶标记仍是 `bucket/`。
 
-Get / Head 先读这些 locator，跳过健康检查为 down 的节点，按剩余副本依次尝试。Head 在副本机器暂时不可达时，可以用索引里记下的 size / crc / mtime。Delete 会对已知的 block 副本做 best-effort 删除，然后删掉对应的索引 key。
+Get / Head 先读这些 locator，跳过健康检查为 down 的节点，按剩余副本依次尝试并按 `compressType` 解压。Head 在副本机器暂时不可达时，可以用索引里记下的 size / crc / mtime。Delete 会先在已知副本的 block 上 best-effort 追加墓碑，再删掉对应的索引 key；盘上空间要等以后的 compaction 才会回收。
 
 ## 节点注册与健康检查
 

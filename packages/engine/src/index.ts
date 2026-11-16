@@ -3,12 +3,12 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const require = createRequire(import.meta.url);
-const root = path.dirname(fileURLToPath(import.meta.url));
+const rootDir = path.dirname(fileURLToPath(import.meta.url));
 
 function loadAddon(): { Store: new (dataDir: string, options?: NativeOptions) => NativeStore } {
   const candidates = [
-    path.join(root, '..', 'build', 'Release', 's3dfs_engine.node'),
-    path.join(root, '..', 'build', 'Debug', 's3dfs_engine.node'),
+    path.join(rootDir, '..', 'build', 'Release', 's3dfs_engine.node'),
+    path.join(rootDir, '..', 'build', 'Debug', 's3dfs_engine.node'),
   ];
   let last: unknown;
   for (const file of candidates) {
@@ -27,6 +27,35 @@ export interface NativeOptions {
   fsyncOnFlush?: boolean;
 }
 
+export type CompressType = 'none' | 'zstd' | 'gzip';
+
+export interface PutMeta {
+  compressType?: CompressType;
+  origSize?: number;
+  origCrc?: number;
+}
+
+export interface ExtentLocator {
+  chained: boolean;
+  tombstone?: boolean;
+  crc: number;
+  mtimeMs: number;
+  size: number;
+  generation: number;
+  extentCount: number;
+  blockId: number;
+  offset: number;
+  recLen: number;
+  compressType?: CompressType;
+  origSize?: number;
+  origCrc?: number;
+}
+
+export interface ScanEntry {
+  key: string;
+  locator: ExtentLocator;
+}
+
 export interface ObjectMeta {
   size: number;
   crc: number;
@@ -35,18 +64,6 @@ export interface ObjectMeta {
 
 export interface ObjectValue extends ObjectMeta {
   value: Buffer;
-}
-
-export interface ListedObject {
-  key: string;
-  size: number;
-  crc: number;
-  mtimeMs: number;
-}
-
-export interface ListResult {
-  objects: ListedObject[];
-  truncated: boolean;
 }
 
 export interface StoreStats {
@@ -64,14 +81,13 @@ export interface StoreStats {
 }
 
 interface NativeStore {
-  put(key: string, value: Buffer): void;
-  putBatch(items: { key: string; value: Buffer }[]): void;
-  get(key: string): ObjectValue | null;
-  head(key: string): ObjectMeta | null;
-  delete(key: string): boolean;
-  list(opts?: { prefix?: string; startAfter?: string; maxKeys?: number }): ListResult;
+  put(key: string, value: Buffer, meta?: PutMeta): ExtentLocator;
+  putBatch(items: { key: string; value: Buffer }[]): ExtentLocator[];
+  get(key: string, locator: ExtentLocator): ObjectValue | null;
+  head(key: string, locator: ExtentLocator): ObjectMeta | null;
+  tombstone(key: string): void;
+  scan(): ScanEntry[];
   flush(): void;
-  compact(): void;
   stats(): StoreStats;
   close(): void;
 }
@@ -94,36 +110,32 @@ export class Store {
     return new Store(new addon.Store(dataDir, rest));
   }
 
-  put(key: string, value: Buffer): void {
-    this.inner.put(key, value);
+  put(key: string, value: Buffer, meta?: PutMeta): ExtentLocator {
+    return this.inner.put(key, value, meta);
   }
 
-  putBatch(items: { key: string; value: Buffer }[]): void {
-    this.inner.putBatch(items);
+  putBatch(items: { key: string; value: Buffer }[]): ExtentLocator[] {
+    return this.inner.putBatch(items);
   }
 
-  get(key: string): ObjectValue | null {
-    return this.inner.get(key);
+  get(key: string, locator: ExtentLocator): ObjectValue | null {
+    return this.inner.get(key, locator);
   }
 
-  head(key: string): ObjectMeta | null {
-    return this.inner.head(key);
+  head(key: string, locator: ExtentLocator): ObjectMeta | null {
+    return this.inner.head(key, locator);
   }
 
-  delete(key: string): boolean {
-    return this.inner.delete(key);
+  tombstone(key: string): void {
+    this.inner.tombstone(key);
   }
 
-  list(opts?: { prefix?: string; startAfter?: string; maxKeys?: number }): ListResult {
-    return this.inner.list(opts);
+  scan(): ScanEntry[] {
+    return this.inner.scan();
   }
 
   flush(): void {
     this.inner.flush();
-  }
-
-  compact(): void {
-    this.inner.compact();
   }
 
   stats(): StoreStats {

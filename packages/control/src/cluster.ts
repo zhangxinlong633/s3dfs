@@ -1,4 +1,5 @@
-import { blockCompact, blockDelete, blockFlush, blockGet, blockHead, blockPut } from './block-client.js';
+import { blockFlush, blockGet, blockHead, blockPut, blockTombstone } from './block-client.js';
+import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
 import { isVisibleObjectKey, locatorKey } from './keys.js';
 import type { IndexClient } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
@@ -21,6 +22,7 @@ export interface ClusterStats {
   indexUrls: string[];
   indexOk: boolean;
   blockNodes: BlockHealth[];
+  compressType: CompressType;
 }
 
 export class ObjectCluster {
@@ -28,6 +30,7 @@ export class ObjectCluster {
     private readonly kv: IndexClient,
     private readonly registry: NodeRegistry,
     private readonly dataReplicas: number,
+    private readonly compressType: CompressType = parseCompressType(process.env.S3DFS_COMPRESS),
   ) {}
 
   objectKey(bucket: string, key?: string): string {
@@ -36,31 +39,53 @@ export class ObjectCluster {
 
   async put(bucket: string, key: string, value: Buffer): Promise<void> {
     const objectKey = this.objectKey(bucket, key);
+    const packed = compressValue(value, this.compressType);
+    const digest = crc32(value);
     const targets = this.registry.pick(objectKey, this.dataReplicas);
-    const writes = await Promise.allSettled(targets.map((n) => blockPut(n.address, objectKey, value)));
-    const ok: { nodeId: string; address: string; size: number; crc: number; mtimeMs: number }[] = [];
+    const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
+    const writes = await Promise.allSettled(targets.map((n) => blockPut(n.address, objectKey, packed.stored, meta)));
+    const accepted: { nodeId: string; address: string; blockId: number; offset: number; recLen: number; chained: boolean; generation: number; extentCount: number; storedSize: number; mtimeMs: number }[] = [];
     for (let i = 0; i < writes.length; i++) {
       const result = writes[i]!;
       const node = targets[i]!;
       if (result.status === 'fulfilled') {
-        ok.push({ nodeId: node.nodeId, address: node.address, ...result.value });
+        const ev = result.value;
+        accepted.push({
+          nodeId: node.nodeId,
+          address: node.address,
+          blockId: ev.blockId,
+          offset: ev.offset,
+          recLen: ev.recLen,
+          chained: ev.chained,
+          generation: ev.generation,
+          extentCount: ev.extentCount,
+          storedSize: ev.size,
+          mtimeMs: ev.mtimeMs,
+        });
       }
     }
-    if (ok.length === 0) {
+    if (accepted.length === 0) {
       throw new ControlError('BLOCK_UNAVAILABLE', `failed to write ${objectKey} to any block node`);
     }
-    const meta = ok[0]!;
-    for (let i = 0; i < ok.length; i++) {
+    for (let i = 0; i < accepted.length; i++) {
+      const ev = accepted[i]!;
       const loc: ObjectLocator = {
-        v: 1,
+        v: 2,
         replica: i,
-        replicaCount: ok.length,
-        nodeId: ok[i]!.nodeId,
-        address: ok[i]!.address,
-        storageKey: objectKey,
-        size: meta.size,
-        crc: meta.crc,
-        mtimeMs: meta.mtimeMs,
+        replicaCount: accepted.length,
+        nodeId: ev.nodeId,
+        address: ev.address,
+        blockId: ev.blockId,
+        offset: ev.offset,
+        recLen: ev.recLen,
+        chained: ev.chained,
+        generation: ev.generation,
+        extentCount: ev.extentCount,
+        size: value.length,
+        storedSize: ev.storedSize,
+        compressType: packed.compressType,
+        crc: digest,
+        mtimeMs: ev.mtimeMs,
       };
       await this.kv.put(locatorKey(objectKey, i), Buffer.from(JSON.stringify(loc)));
     }
@@ -93,14 +118,25 @@ export class ObjectCluster {
   }
 
   async get(bucket: string, key: string): Promise<ObjectValue | null> {
-    const locs = this.prefer(await this.locators(this.objectKey(bucket, key)));
+    const objectKey = this.objectKey(bucket, key);
+    const locs = this.prefer(await this.locators(objectKey));
     let last: unknown;
     for (const loc of locs) {
       try {
-        const got = await blockGet(loc.address, loc.storageKey);
-        if (got) {
-          return got;
+        const got = await blockGet(loc.address, objectKey, loc);
+        if (!got) {
+          continue;
         }
+        const value = decompressValue(got.value, loc.compressType ?? 'none');
+        if (loc.size && value.length !== loc.size) {
+          last = new Error(`decompressed size ${value.length} != ${loc.size}`);
+          continue;
+        }
+        if (loc.crc && crc32(value) !== loc.crc) {
+          last = new Error(`crc mismatch for ${objectKey}`);
+          continue;
+        }
+        return { value, size: value.length, crc: loc.crc, mtimeMs: loc.mtimeMs, compressType: loc.compressType };
       } catch (err) {
         last = err;
       }
@@ -113,21 +149,11 @@ export class ObjectCluster {
 
   async head(bucket: string, key: string): Promise<Omit<ObjectValue, 'value'> | null> {
     const locs = this.prefer(await this.locators(this.objectKey(bucket, key)));
-    if (locs[0]) {
-      const loc = locs[0];
-      if (!this.registry.isDown(loc.nodeId)) {
-        try {
-          const live = await blockHead(loc.address, loc.storageKey);
-          if (live) {
-            return live;
-          }
-        } catch {
-          // Fall back to the index metadata.
-        }
-      }
-      return { size: loc.size, crc: loc.crc, mtimeMs: loc.mtimeMs };
+    if (!locs[0]) {
+      return null;
     }
-    return null;
+    const loc = locs[0];
+    return { size: loc.size, crc: loc.crc, mtimeMs: loc.mtimeMs, compressType: loc.compressType };
   }
 
   async delete(bucket: string, key: string): Promise<boolean> {
@@ -136,7 +162,7 @@ export class ObjectCluster {
     if (locs.length === 0) {
       return false;
     }
-    await Promise.allSettled(locs.map((loc) => blockDelete(loc.address, loc.storageKey)));
+    await Promise.allSettled(locs.map((loc) => blockTombstone(loc.address, objectKey)));
     for (const loc of locs) {
       await this.kv.delete(locatorKey(objectKey, loc.replica));
     }
@@ -201,7 +227,8 @@ export class ObjectCluster {
   }
 
   async compact(): Promise<void> {
-    await Promise.all(this.registry.live().map((n) => blockCompact(n.address)));
+    // Block nodes no longer keep a local key index, so they cannot rewrite live
+    // objects on their own. Space left by deletes is not reclaimed yet.
   }
 
   async stats(): Promise<ClusterStats> {
@@ -223,6 +250,7 @@ export class ObjectCluster {
       indexUrls: this.kv.endpoints,
       indexOk,
       blockNodes,
+      compressType: this.compressType,
     };
     try {
       const listed = await this.kv.scan({ prefix: '', maxKeys: 100_000 });

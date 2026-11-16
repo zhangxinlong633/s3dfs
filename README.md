@@ -1,74 +1,181 @@
 # s3dfs
 
-S3 兼容的对象存储。S3 API 和管控台用 TypeScript（Nest.js / Next.js），落盘引擎用 C。
+**English** | [中文](README.zh-CN.md)
 
-对象索引和正文分开扩容：
+S3-compatible object store. The S3 API and console are TypeScript (Nest.js / Next.js). The on-disk engine is C.
 
-- 分布式的对象 key / locator 放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群里，一般 **3–5 台**就够
-- 对象正文放在大量只跑 packed-block 引擎的 **block 机器**上，机器可以很多
-- 默认 3 份数据副本，在索引里记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带上节点信息；API 会定期检查这些节点是否还活着
+The object index and the object body scale independently:
 
-设计上针对小文件：不会一个对象一个目录，而是把对象打进大的 block 文件，在内存里攒批后再 `write` + `fsync`。inode 和 IOPS 跟数据文件数走，而不是跟对象数走。引擎只调用官方 C API `leveldb/c.h`。
+- Object keys and locators live in a standalone [dleveldb](https://github.com/zhangxinlong633/dleveldb) cluster. A small index cluster, about **3–5 machines**, is usually enough.
+- Object bodies live on many **block machines** that only run the packed-block engine.
+- The default is 3 data replicas, recorded in the index as `bucket/key`, `bucket/key:1`, and `bucket/key:2`, with node information in the values. The API periodically checks whether those nodes are still up, skips down nodes on get and put, and can still read from the remaining replicas.
 
-落盘方式：
+The layout is aimed at small objects: there is no per-object directory. Objects are packed into large block files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files, not the number of objects. Block records are checksummed TLV frames. All object placement is in dleveldb. The control plane compresses the body before writing (zstd by default). Each object’s type is stored on its locator as `compressType`. If compression does not shrink the value, the body is stored as-is and the type is recorded as `none`.
 
-- 对象追加进大文件（默认 1GB 一块，可配）；超过一块的对象切成多段，后一段记下前一段的位置，写满再切新文件
-- 记录带 header / tail 魔数（`^` / `$`）和长度，便于回放与校验
-- 1MB 写缓冲做 group commit，一批对象一次刷盘；flush 时默认 `fsync`
-- 用 LevelDB 记住 key 到 `(block_id, offset, size)` 的位置，以及面向 S3 key 的批量 `put_batch`，避免每个小对象都从 JS 进 C 一次
-- 后台 compaction 把仍存活的对象重写成新的 block，回收删除留下的空洞
+## What this repository does
 
-## 仓库结构
+- Objects are appended into large files (1 GiB per block by default). An object that does not fit in the current block is split into extents; the next extent records the previous position, and a new file is opened when a block fills up.
+- Each record is a little-endian TLV frame with magic `S3R1`, a CRC-32, and a matching trailer, so the file can be scanned and checked.
+- A 1 MiB write buffer does group commit: many objects share one flush. Flush fsyncs by default.
+- The control plane writes node information plus `(blockId, offset, recLen)` into a dleveldb locator. The block process reads and writes by offset and does not keep a local LevelDB.
+- If the index is lost, locators can be rebuilt by scanning TLV records. Deletes append a tombstone so a rebuild does not resurrect a deleted object. Compaction that rewrites live objects and reclaims holes is **not implemented** in this version.
+
+## Repository layout
+
+This is a pnpm monorepo. Install and compile with **pnpm 9+** (requires **Node.js 26+**). Node processes run on **Bun 1.4+**. The Nest API is compiled with `tsc` first (decorator metadata is required) and then started with bun. The console is Next.js.
 
 ```
-apps/api              Nest.js 12，S3 兼容 HTTP 网关（默认 :9000），是 dleveldb 和 block 的客户端
-apps/web              Next.js 16 控制台（默认 :9001）
-apps/block            packed-block 存储节点（默认 :9100 起）
-packages/engine       C 存储引擎 + N-API 绑定（单个 s3dfs_store = 一份 LevelDB + packed block）
-packages/control      索引客户端、locator、节点注册、放置与健康检查
+s3dfs/
+  apps/api            # Nest.js 12 S3-compatible HTTP gateway (default :9000); a client of dleveldb and of block nodes
+  apps/web            # Next.js 16 console (default :9001)
+  apps/block          # packed-block storage node (default :9100+)
+  packages/engine     # C storage engine + N-API binding (append-only TLV block files, read/write by offset)
+  packages/control    # index client, locators, compression, node registry, placement, and health checks
+  docs/               # architecture, design, and benchmark notes
 ```
 
-对象索引请运行旁边的 [dleveldb](https://github.com/zhangxinlong633/dleveldb)（`pnpm dev:index` 默认 :9800）。本仓库里的 `packages/dleveldb` 只是历史对照，不再参与构建。
+Run a sibling [dleveldb](https://github.com/zhangxinlong633/dleveldb) checkout as the object index (`pnpm dev:index` defaults to :9800). The in-tree `packages/dleveldb` directory is a historical pointer only and is not part of the build.
 
-版本按当前最新对齐：Node 26、Bun 1.4+、Next.js 16.4.6、Nest.js 12.5、React 19.3。包管理和 monorepo 布局参考 Vastship（pnpm workspace）。
+Layering and the read/write path are in [docs/architecture.md](docs/architecture.md). Placement and health checks are in [docs/design-replication.md](docs/design-replication.md). Large objects are in [docs/design-large-object.md](docs/design-large-object.md). Environment variables are in [docs/capabilities.md](docs/capabilities.md). Those design docs are currently in Chinese. Benchmark methodology and the full tables are in [docs/benchmarks.md](docs/benchmarks.md).
 
-## 运行
+## Architecture overview
 
-需要本机有 Node 26、pnpm 9、Bun 1.4+、Python 3 和 C/C++ 编译器（macOS 上是 Xcode Command Line Tools），以及旁边的 dleveldb 仓库（默认 `../dleveldb`）。
+```mermaid
+flowchart TB
+  subgraph Client["Client"]
+    App["S3 client or console"]
+  end
+
+  subgraph Index["dleveldb index cluster, 3-5 machines"]
+    KV["locators: bucket/key, bucket/key:1, bucket/key:2"]
+  end
+
+  subgraph Blocks["Block machines, many"]
+    B1["block node: packed TLV .blk files"]
+    B2["block node"]
+    B3["block node"]
+  end
+
+  App -->|S3 API :9000| API["s3dfs API / control plane"]
+  API -->|compress, then put/get by offset| B1
+  API --> B2
+  API --> B3
+  API -->|locator JSON| KV
+```
+
+A write looks like this:
+
+1. The control plane may compress the body (`S3DFS_COMPRESS`, default `zstd`). If the result is not smaller, it stores the original bytes and sets `compressType` to `none`.
+2. The same stored bytes are written to N live block nodes (`N = min(configured replicas, live block nodes)`, default 3).
+3. Each successful write returns an extent location. The API writes locator JSON into dleveldb as `bucket/key`, `bucket/key:1`, and so on. User-facing `size` and `crc` are the uncompressed values; `storedSize` and `compressType` describe what is on disk.
+4. A read looks up the locators, skips nodes that are down, fetches by offset, and decompresses with the type on that locator.
+
+## Quick start
+
+You need Node 26, pnpm 9, Bun 1.4+, Python 3, and a C/C++ compiler (Xcode Command Line Tools on macOS), plus a [dleveldb](https://github.com/zhangxinlong633/dleveldb) checkout next to this repository (default `../dleveldb`).
 
 ```bash
-cd /Users/bruce/git/s3dfs
+git clone https://github.com/zhangxinlong633/dleveldb.git
+git clone https://github.com/zhangxinlong633/s3dfs.git
+cd s3dfs
 pnpm install
 pnpm build:engine
 pnpm build:control
-pnpm dev:index    # dleveldb 索引，http://127.0.0.1:9800
-pnpm dev:block    # block 节点，http://127.0.0.1:9100
-pnpm dev:api      # S3 API，http://127.0.0.1:9000
-pnpm dev:web      # 控制台，http://127.0.0.1:9001
+pnpm dev:index    # dleveldb index, http://127.0.0.1:9800
+pnpm dev:block    # block node,     http://127.0.0.1:9100
+pnpm dev:api      # S3 API,         http://127.0.0.1:9000
+pnpm dev:web      # console,        http://127.0.0.1:9001
 ```
 
-单机时有效数据副本是 1。要看多副本，再起几台 block（不同的 `S3DFS_BLOCK_NODE_ID`、`S3DFS_BLOCK_PORT`、`S3DFS_DATA_DIR`），并在 API 的 `S3DFS_BLOCK_NODES` 里加上它们。索引集群若要 3 副本，按 dleveldb 的文档再起两台索引节点，把 `S3DFS_INDEX_URLS` 指过去即可；存储容量仍只靠加 block 机器。
+On a single machine the effective data-replica count is 1. To see multiple replicas, start more block processes (different `S3DFS_BLOCK_NODE_ID`, `S3DFS_BLOCK_PORT`, and `S3DFS_DATA_DIR`) and list them in the API’s `S3DFS_BLOCK_NODES`. For a 3-replica index, start two more dleveldb nodes as in the dleveldb docs and point `S3DFS_INDEX_URLS` at them. Storage capacity still grows by adding block machines.
 
-数据目录已 gitignore。环境变量见 [能力说明](docs/capabilities.md)，放置与健康检查见 [索引与 block 集群](docs/design-replication.md)。
+Data directories are gitignored. Environment variables are in [docs/capabilities.md](docs/capabilities.md).
 
 ```bash
-# 例：用 AWS CLI 指向本地
 aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://logs
 aws --endpoint-url http://127.0.0.1:9000 s3 cp ./a.log s3://logs/a.log
 ```
 
-性能测试数据见 [性能测试](docs/benchmarks.md)。复现：
-
 ```bash
-bun scripts/bench-split.mjs
-```
-
-```bash
-# 测试（原生插件需在能编译 C++ 的机器上先 build）
+# tests (build the native addon first, on a machine that can compile C++)
 pnpm --filter @s3dfs/engine build
 pnpm --filter @s3dfs/control build
 node packages/engine/scripts/test-span.mjs
 bun scripts/test-split.mjs
 ```
 
-已支持 Put/Get/Head/Delete/List、创建桶、把索引和 block 分开部署，以及在一份 block 副本宕机后从剩余副本读取。分片上传、完整 SigV4、纠删码，以及对象副本的自动修复、dleveldb 的加入迁移和 primary 写故障转移，还不在本轮。
+## Performance
+
+Numbers below were measured on 16 Nov 2026, 12:33 (Asia/Shanghai) with Bun 1.4.2 (node-compat v26.3.0), on a MacBook Pro (Apple M5 Pro, 15 cores, 48 GB, Apple SSD AP1024Z). They are single-host results, not a multi-machine network test. N is the object-body replica count: N=1 is one dleveldb process plus one block process; N=3 is one index plus three block processes on the same machine. Bandwidth is **logical** MiB/s (uncompressed object size / time, 1 MiB = 1,048,576 bytes). Compression ratio is logical size / stored size. The repeated payload is `0x61` bytes, a best-case pattern; the random payload is cryptographically random and typically does not shrink. When compression does not help, the locator records `compressType=none`. Reproduce with `pnpm bench` or `bun scripts/bench-split.mjs`. Methodology, raw JSON, and the same tables are in [docs/benchmarks.md](docs/benchmarks.md).
+
+HTTP path, `compress=none` (so these rows are not mixed with the default zstd path):
+
+| Workload | Throughput | Bandwidth | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| direct block put 1 KiB (no index) | 18,716 ops/s | 18.3 MiB/s | 49 µs | 96 µs |
+| direct block get 1 KiB (no index) | 19,334 ops/s | 18.9 MiB/s | 50 µs | 77 µs |
+| cluster put 100 B, N=1 | 6,938 ops/s | 0.7 MiB/s | 137 µs | 231 µs |
+| cluster get 100 B, N=1 | 8,816 ops/s | 0.8 MiB/s | 109 µs | 194 µs |
+| cluster put 1 KiB, N=1 | 6,795 ops/s | 6.6 MiB/s | 138 µs | 341 µs |
+| cluster get 1 KiB, N=1 | 8,708 ops/s | 8.5 MiB/s | 110 µs | 179 µs |
+| cluster put 16 KiB, N=1 | 4,663 ops/s | 72.9 MiB/s | 199 µs | 566 µs |
+| cluster get 16 KiB, N=1 | 6,507 ops/s | 101.7 MiB/s | 144 µs | 348 µs |
+| cluster put 1 KiB, N=1, 32 in flight | 31,157 ops/s | 30.4 MiB/s | 950 µs | 2,620 µs |
+| cluster get 1 KiB, N=1, 32 in flight | 49,001 ops/s | 47.9 MiB/s | 578 µs | 1,637 µs |
+| cluster put 1 KiB, N=3 | 2,775 ops/s | 2.7 MiB/s | 337 µs | 760 µs |
+| cluster get 1 KiB, N=3 | 4,119 ops/s | 4.0 MiB/s | 232 µs | 545 µs |
+| cluster put 1 KiB, N=3, 32 in flight | 11,225 ops/s | 11.0 MiB/s | 2,742 µs | 4,633 µs |
+
+A cluster put writes the block first, then the locator in dleveldb. At N=3 the put must succeed on three block processes, so it is slower than N=1. These numbers should not be compared with the in-process KV benches in the dleveldb repository: that path is pure KV, this one is HTTP index + block.
+
+End-to-end cluster, N=1, including compression. Logical write rate rises on highly compressible objects because far fewer bytes go to disk; it is not a disk-bandwidth number.
+
+| Workload | Stored type | Stored / logical | Ratio | Write | Read |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 KiB repeated, none | none | 1,024 / 1,024 B | 1.00x | 6,716 ops/s, 6.6 MiB/s | 8,823 ops/s, 8.6 MiB/s |
+| 1 KiB repeated, zstd | zstd | 19 / 1,024 B | 53.89x | 6,680 ops/s, 6.5 MiB/s | 8,363 ops/s, 8.2 MiB/s |
+| 1 KiB repeated, gzip | gzip | 30 / 1,024 B | 34.13x | 6,682 ops/s, 6.5 MiB/s | 8,520 ops/s, 8.3 MiB/s |
+| 1 KiB random, zstd | none | 1,024 / 1,024 B | 1.00x | 6,485 ops/s, 6.3 MiB/s | 8,770 ops/s, 8.6 MiB/s |
+| 16 KiB repeated, none | none | 16,384 / 16,384 B | 1.00x | 4,747 ops/s, 74.2 MiB/s | 6,600 ops/s, 103.1 MiB/s |
+| 16 KiB repeated, zstd | zstd | 19 / 16,384 B | 862.32x | 6,777 ops/s, 105.9 MiB/s | 7,691 ops/s, 120.2 MiB/s |
+| 16 KiB random, zstd | none | 16,384 / 16,384 B | 1.00x | 4,423 ops/s, 69.1 MiB/s | 6,678 ops/s, 104.3 MiB/s |
+| 1 MiB repeated, none | none | 1,048,576 / 1,048,576 B | 1.00x | 225 ops/s, 225.2 MiB/s | 419 ops/s, 419.1 MiB/s |
+| 1 MiB repeated, zstd | zstd | 50 / 1,048,576 B | 20,971.52x | 2,319 ops/s, 2,319.4 MiB/s | 2,159 ops/s, 2,159.1 MiB/s |
+| 1 MiB random, zstd | none | 1,048,576 / 1,048,576 B | 1.00x | 209 ops/s, 208.5 MiB/s | 417 ops/s, 416.9 MiB/s |
+
+In-process codec only (no disk, no HTTP). Decompress is omitted when the type falls back to `none`, because that path is a no-op.
+
+| Workload | Applied | Stored / logical | Ratio | Compress | Decompress |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 MiB repeated, zstd | zstd | 50 / 1,048,576 B | 20,971.52x | 8,414 MiB/s | 5,407 MiB/s |
+| 1 MiB repeated, gzip | gzip | 1,052 / 1,048,576 B | 996.75x | 4,100 MiB/s | 4,059 MiB/s |
+| 1 MiB random, zstd | none | 1,048,576 / 1,048,576 B | 1.00x | 3,589 MiB/s | — |
+| 1 MiB random, gzip | none | 1,048,576 / 1,048,576 B | 1.00x | 98 MiB/s | — |
+| 16 KiB repeated, zstd | zstd | 19 / 16,384 B | 862.32x | 3,522 MiB/s | 2,279 MiB/s |
+
+On-disk layout, 5,000 × 1 KiB objects written directly through the C engine and flushed. There is no `index/` directory.
+
+| Case | Files | On disk | Logical | On-disk ratio | fsyncs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| raw repeated (no compression) | 1 × `.blk` | 5,463,890 B | 5,120,000 B | 0.94x | 6 |
+| zstd repeated (19 B payload each) | 1 × `.blk` | 438,890 B | 5,120,000 B | 11.67x | 1 |
+| zstd random (fell back to `none`) | 1 × `.blk` | 5,463,890 B | 5,120,000 B | 0.94x | 6 |
+
+The zstd on-disk ratio is lower than the payload ratio (53.89x) because each record still carries TLV tags, lengths, and a CRC. Inode and file count follow the block file, not the object count.
+
+## Implemented and not yet done
+
+Already working: Put / Get / Head / Delete / List, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, per-object compression, TLV records, locator rebuild by scan, and tombstones on delete.
+
+Not done yet: multipart upload, full SigV4, erasure coding, block compaction / GC (deleted space is not reclaimed), automatic repair or migration of object replicas, streaming, and the engine’s uint32 object-size limit. Join catch-up and primary write failover are also still unimplemented in dleveldb: a new index node does not pull historical keys, and if the index primary is unreachable, writes fail.
+
+## Dependencies
+
+Current major versions:
+
+- Node runtime: Bun 1.4+
+- Install and compile: Node.js 26, pnpm 9.15
+- TypeScript 7.0.2
+- NestJS 12.5.0
+- Next.js 16.4.6, React 19.3.1
+- Object index: [dleveldb](https://github.com/zhangxinlong633/dleveldb)

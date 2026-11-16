@@ -8,13 +8,13 @@
 - 默认 1GB 一块；超过当前块剩余空间或大于一块的对象，切成多段并从后向前记下链接，读取时再从前向后拼回
 - 1MB 写缓冲做 group commit，flush 默认 `fsync`
 - 批量 `put_batch`（单个 block 引擎内部），避免每个小对象都从 JS 进 C 一次
-- 每个 block 进程用官方 C API 维护本地 LevelDB 索引，启动不必全量扫描 block
+- block 记录是带校验的 TLV 帧；不认识的字段可以跳过。索引丢了时可以扫描 `.blk` 重建 locator（删除会写墓碑，避免把已删对象救回来）
 - 对象数据默认 3 副本，记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带 block 节点信息；有效副本数是 `min(配置值, 存活的 block 节点数)`
 - 定期对 block 节点做健康检查，Get / Put 会跳过已标记为 down 的节点
-- 打开单个 block 存储时：有有效索引头则只回放尾巴，否则全量回放重建
-- 后台 compaction，重写存活对象并删除旧 block；API 上的 flush / compact 转发到存活的 block 节点
+- 对象正文默认用 zstd 压缩（`S3DFS_COMPRESS=none|zstd|gzip`），每个对象自己的 `compressType` 记在 locator 里；压不小就存原值
+- 打开 block 时扫描各文件末尾的完整记录，接着追加；没有本地 LevelDB
 - 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact`
-- 控制台查看统计、桶、block 节点状态，并触发 flush / compact
+- 控制台查看统计、桶、block 节点状态，并触发 flush。compact 接口仍在，但还不会回收空间
 
 ## 还不做的
 
@@ -23,6 +23,7 @@
 - 纠删码
 - 把对象值放进 dleveldb；索引里只有 locator JSON，正文始终在 block 文件里
 - 对象数据副本的自动修复 / 迁移（节点宕机后不会把缺失的副本补到别的机器）
+- 按存活对象重写 block 以回收删除 / 覆盖留下的空间（compact 目前是空操作）
 - dleveldb 侧：节点加入后的范围迁移 / catch-up repair，以及 primary 不可达时的安全写故障转移（读可以走剩余 KV 副本；写索引会失败，避免脑裂）
 - 单对象超过约 4GB − 1（引擎对外 API 仍是 `uint32` 长度）
 
@@ -59,4 +60,4 @@
 
 ## 大文件与内存
 
-引擎已经可以把一个逻辑对象切到多块中，索引只记最后一段，读取时沿链条从前向后拼回。不过 HTTP 层仍会把整个 body 读进 Node 内存，所以特别大的上传还是会先受到 API 进程内存的限制。流式 Put/Get 和分片上传是下一步。详见 [大文件跨 block 存放](design-large-object.md)。
+引擎已经可以把一个逻辑对象切到多块中，dleveldb 只记最后一段的 locator，读取时沿链条从前向后拼回。不过 HTTP 层仍会把整个 body 读进 Node 内存，所以特别大的上传还是会先受到 API 进程内存的限制。流式 Put/Get 和分片上传是下一步。详见 [大文件跨 block 存放](design-large-object.md)。

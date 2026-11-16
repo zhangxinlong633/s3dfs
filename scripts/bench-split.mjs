@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { mkdtempSync, readdirSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -62,10 +63,14 @@ function stop(child) {
   });
 }
 
-async function cleanup() {
+async function stopChildren() {
   for (const child of children.splice(0).reverse()) {
     await stop(child);
   }
+}
+
+async function cleanup() {
+  await stopChildren();
   rmSync(work, { recursive: true, force: true });
 }
 
@@ -82,9 +87,9 @@ function fmtUs(ns) {
   return `${(Number(ns) / 1000).toFixed(0)}µs`;
 }
 
-async function measure(name, count, fn) {
+async function measure(name, count, fn, warmN = warmup) {
   const samples = [];
-  for (let i = 0; i < warmup; i++) {
+  for (let i = 0; i < warmN; i++) {
     await fn(i, true);
   }
   const start = process.hrtime.bigint();
@@ -110,8 +115,8 @@ async function measure(name, count, fn) {
   return result;
 }
 
-async function measureConcurrent(name, count, inflight, fn) {
-  for (let i = 0; i < warmup; i++) {
+async function measureConcurrent(name, count, inflight, fn, warmN = warmup) {
+  for (let i = 0; i < warmN; i++) {
     await fn(i, true);
   }
   const samples = [];
@@ -144,11 +149,14 @@ async function measureConcurrent(name, count, inflight, fn) {
   return result;
 }
 
-const { IndexClient, NodeRegistry, ObjectCluster, blockPut, blockGet } = await import(
+const { IndexClient, NodeRegistry, ObjectCluster, blockPut, blockGet, compressValue, decompressValue } = await import(
   pathToFileURL(path.join(root, 'packages/control/src/index.ts')).href
 );
+const { createRequire } = await import('node:module');
+const require = createRequire(import.meta.url);
+const addon = require(path.join(root, 'packages/engine/build/Release/s3dfs_engine.node'));
 
-async function startCluster(blockCount, dataReplicas) {
+async function startCluster(blockCount, dataReplicas, compressType = 'none') {
   const dir = mkdtempSync(path.join(work, `c-`));
   const indexPort = nextPort++;
   run(bun, [dleveldbCli], {
@@ -177,7 +185,7 @@ async function startCluster(blockCount, dataReplicas) {
   }
   const kv = new IndexClient([`http://127.0.0.1:${indexPort}`]);
   const registry = new NodeRegistry(kv, seeds);
-  const cluster = new ObjectCluster(kv, registry, dataReplicas);
+  const cluster = new ObjectCluster(kv, registry, dataReplicas, compressType);
   await registry.checkAll();
   if (registry.live().length !== blockCount) {
     throw new Error(`expected ${blockCount} live blocks`);
@@ -185,10 +193,146 @@ async function startCluster(blockCount, dataReplicas) {
   return { kv, cluster, seeds };
 }
 
+function fmtMib(bytesPerSec) {
+  return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MiB/s`;
+}
+
+function repeatedPayload(n) {
+  return Buffer.alloc(n, 0x61);
+}
+
+function randomPayload(n) {
+  return randomBytes(n);
+}
+
+async function storedStats(cluster, bucket, prefix, count) {
+  const sample = Math.min(count, 100);
+  let stored = 0;
+  let logical = 0;
+  let compressType = 'none';
+  for (let i = 0; i < sample; i++) {
+    const locs = await cluster.locators(`${bucket}/${prefix}${i}`);
+    if (!locs[0]) throw new Error(`missing locator ${prefix}${i}`);
+    stored += locs[0].storedSize;
+    logical += locs[0].size;
+    compressType = locs[0].compressType ?? 'none';
+  }
+  return {
+    compressType,
+    sample,
+    avgLogical: logical / sample,
+    avgStored: stored / sample,
+    ratio: stored === 0 ? 0 : logical / stored,
+    savings: logical === 0 ? 0 : 1 - stored / logical,
+  };
+}
+
+async function measurePair(label, count, cluster, bucket, prefix, body, warmN = warmup) {
+  const put = await measure(`${label} put`, count, async (i, warm) => {
+    await cluster.put(bucket, `${warm ? 'w' : prefix}${i}`, body);
+  }, warmN);
+  const stats = await storedStats(cluster, bucket, prefix, count);
+  const get = await measure(`${label} get`, count, async (i) => {
+    const got = await cluster.get(bucket, `${prefix}${i}`);
+    if (!got) throw new Error('missing');
+  }, warmN);
+  const putMib = (count * body.length) / put.elapsedSec;
+  const getMib = (count * body.length) / get.elapsedSec;
+  const extra = {
+    label,
+    logicalBytes: body.length,
+    ...stats,
+    putOpsPerSec: put.opsPerSec,
+    getOpsPerSec: get.opsPerSec,
+    putMibPerSec: putMib / (1024 * 1024),
+    getMibPerSec: getMib / (1024 * 1024),
+    putP50Ns: put.p50Ns,
+    putP99Ns: put.p99Ns,
+    getP50Ns: get.p50Ns,
+    getP99Ns: get.p99Ns,
+  };
+  console.log(
+    `${''.padEnd(42)} stored ${stats.avgStored.toFixed(0)} / ${stats.avgLogical.toFixed(0)} B   ratio ${stats.ratio.toFixed(2)}x   save ${(stats.savings * 100).toFixed(1)}%   write ${fmtMib(putMib)}   read ${fmtMib(getMib)}`,
+  );
+  return { put, get, compress: extra };
+}
+
+function benchCodec(name, input, prefer, rounds = 200) {
+  let packed = compressValue(input, prefer);
+  for (let i = 0; i < 8; i++) packed = compressValue(input, prefer);
+  const t0 = process.hrtime.bigint();
+  for (let i = 0; i < rounds; i++) packed = compressValue(input, prefer);
+  const compressSec = Number(process.hrtime.bigint() - t0) / 1e9;
+  let out = decompressValue(packed.stored, packed.compressType);
+  for (let i = 0; i < 8; i++) out = decompressValue(packed.stored, packed.compressType);
+  const t1 = process.hrtime.bigint();
+  for (let i = 0; i < rounds; i++) out = decompressValue(packed.stored, packed.compressType);
+  const decompressSec = Number(process.hrtime.bigint() - t1) / 1e9;
+  if (!out.equals(input)) throw new Error(`codec mismatch ${name}`);
+  const logical = input.length * rounds;
+  const result = {
+    name,
+    prefer,
+    applied: packed.compressType,
+    logicalBytes: input.length,
+    storedBytes: packed.stored.length,
+    ratio: packed.stored.length === 0 ? 0 : input.length / packed.stored.length,
+    savings: 1 - packed.stored.length / input.length,
+    rounds,
+    compressMibPerSec: logical / compressSec / (1024 * 1024),
+    decompressMibPerSec: logical / decompressSec / (1024 * 1024),
+  };
+  console.log(
+    `${name.padEnd(42)} ${packed.compressType.padEnd(5)}  ${String(packed.stored.length).padStart(8)} / ${String(input.length).padStart(8)} B   ratio ${result.ratio.toFixed(2)}x   cmp ${result.compressMibPerSec.toFixed(0).padStart(5)} MiB/s   dec ${result.decompressMibPerSec.toFixed(0).padStart(5)} MiB/s`,
+  );
+  return result;
+}
+
+function layoutCheck(name, bodies, logicalBytes) {
+  const dir = mkdtempSync(path.join(work, 'layout-'));
+  const store = new addon.Store(dir, { fsyncOnFlush: true });
+  for (let i = 0; i < bodies.length; i++) store.put(`k/${i}`, bodies[i]);
+  store.flush();
+  const stats = store.stats();
+  store.close();
+  const blk = path.join(dir, 'blocks');
+  const files = existsSync(blk)
+    ? readdirSync(blk)
+        .filter((n) => n.endsWith('.blk'))
+        .map((n) => {
+          const fp = path.join(blk, n);
+          return { name: n, size: statSync(fp).size };
+        })
+    : [];
+  const storedPayload = bodies.reduce((s, b) => s + b.length, 0);
+  const logical = logicalBytes ?? storedPayload;
+  const onDisk = files.reduce((s, f) => s + f.size, 0);
+  const result = {
+    name,
+    objects: bodies.length,
+    fileCount: files.length,
+    files,
+    logicalBytes: logical,
+    storedPayloadBytes: storedPayload,
+    onDiskBytes: onDisk,
+    ratio: onDisk === 0 ? 0 : logical / onDisk,
+    flushes: stats.flushes,
+    fsyncs: stats.fsyncs,
+    indexDir: existsSync(path.join(dir, 'index')),
+  };
+  console.log(
+    `${name.padEnd(42)} ${String(files.length).padStart(2)} files   disk ${onDisk} B   logical ${logical} B   ratio ${result.ratio.toFixed(2)}x   fsyncs ${stats.fsyncs}`,
+  );
+  return result;
+}
+
 const results = [];
-const payload = (n) => Buffer.alloc(n, 0x61);
+const codecResults = [];
+const layoutResults = [];
+const payload = (n) => repeatedPayload(n);
 
 console.log(`s3dfs split bench  ops=${ops} warmup=${warmup}`);
+console.log('cluster baseline rows use compress=none; compression cases are listed separately');
 console.log(`bun ${process.versions.bun ?? bun}  node-compat ${process.version}  ${os.cpus()[0]?.model ?? ''}  ${os.arch()}`);
 console.log('');
 
@@ -196,61 +340,64 @@ console.log('');
   const { cluster, seeds } = await startCluster(1, 1);
   const body = payload(1024);
   await cluster.createBucket('bench');
+  const directLocs = new Array(ops + warmup);
   results.push(
-    await measure('direct block put 1KiB (no index)', ops, async (i) => {
-      await blockPut(seeds[0].address, `raw/${i}`, body);
+    await measure('direct block put 1KiB (no index)', ops, async (i, warm) => {
+      const loc = await blockPut(seeds[0].address, `raw/${warm ? 'w' : 'p'}-${i}`, body);
+      if (!warm) directLocs[i] = loc;
     }),
   );
   results.push(
     await measure('direct block get 1KiB (no index)', ops, async (i) => {
-      const got = await blockGet(seeds[0].address, `raw/${i}`);
+      const got = await blockGet(seeds[0].address, `raw/p-${i}`, directLocs[i]);
       if (!got) throw new Error('missing');
     }),
   );
   results.push(
-    await measure('cluster put 100B  N=1', ops, async (i, warm) => {
+    await measure('cluster put 100B  N=1  none', ops, async (i, warm) => {
       await cluster.put('bench', `${warm ? 'w' : 'p'}-100-${i}`, payload(100));
     }),
   );
   results.push(
-    await measure('cluster get 100B  N=1', ops, async (i) => {
+    await measure('cluster get 100B  N=1  none', ops, async (i) => {
       const got = await cluster.get('bench', `p-100-${i}`);
       if (!got) throw new Error('missing');
     }),
   );
   results.push(
-    await measure('cluster put 1KiB  N=1', ops, async (i, warm) => {
+    await measure('cluster put 1KiB  N=1  none', ops, async (i, warm) => {
       await cluster.put('bench', `${warm ? 'w' : 'p'}-1k-${i}`, body);
     }),
   );
   results.push(
-    await measure('cluster get 1KiB  N=1', ops, async (i) => {
+    await measure('cluster get 1KiB  N=1  none', ops, async (i) => {
       const got = await cluster.get('bench', `p-1k-${i}`);
       if (!got) throw new Error('missing');
     }),
   );
   results.push(
-    await measure('cluster put 16KiB N=1', Math.min(ops, 2000), async (i, warm) => {
+    await measure('cluster put 16KiB N=1  none', Math.min(ops, 2000), async (i, warm) => {
       await cluster.put('bench', `${warm ? 'w' : 'p'}-16k-${i}`, payload(16 * 1024));
     }),
   );
   results.push(
-    await measure('cluster get 16KiB N=1', Math.min(ops, 2000), async (i) => {
+    await measure('cluster get 16KiB N=1  none', Math.min(ops, 2000), async (i) => {
       const got = await cluster.get('bench', `p-16k-${i}`);
       if (!got) throw new Error('missing');
     }),
   );
   results.push(
-    await measureConcurrent('cluster put 1KiB  N=1  32-in-flight', ops, 32, async (i, warm) => {
+    await measureConcurrent('cluster put 1KiB  N=1  none  32-in-flight', ops, 32, async (i, warm) => {
       await cluster.put('bench', `${warm ? 'cw' : 'c'}-1k-${i}`, body);
     }),
   );
   results.push(
-    await measureConcurrent('cluster get 1KiB  N=1  32-in-flight', ops, 32, async (i) => {
+    await measureConcurrent('cluster get 1KiB  N=1  none  32-in-flight', ops, 32, async (i) => {
       const got = await cluster.get('bench', `c-1k-${i}`);
       if (!got) throw new Error('missing');
     }),
   );
+  await stopChildren();
 }
 
 {
@@ -258,21 +405,87 @@ console.log('');
   const body = payload(1024);
   await cluster.createBucket('bench');
   results.push(
-    await measure('cluster put 1KiB  N=3', ops, async (i, warm) => {
+    await measure('cluster put 1KiB  N=3  none', ops, async (i, warm) => {
       await cluster.put('bench', `${warm ? 'w' : 'p'}-1k-${i}`, body);
     }),
   );
   results.push(
-    await measure('cluster get 1KiB  N=3', ops, async (i) => {
+    await measure('cluster get 1KiB  N=3  none', ops, async (i) => {
       const got = await cluster.get('bench', `p-1k-${i}`);
       if (!got) throw new Error('missing');
     }),
   );
   results.push(
-    await measureConcurrent('cluster put 1KiB  N=3  32-in-flight', ops, 32, async (i, warm) => {
+    await measureConcurrent('cluster put 1KiB  N=3  none  32-in-flight', ops, 32, async (i, warm) => {
       await cluster.put('bench', `${warm ? 'cw' : 'c'}-1k-${i}`, body);
     }),
   );
+  await stopChildren();
+}
+
+console.log('\nin-process codec (control plane, no disk)');
+const bigRepeat = repeatedPayload(1024 * 1024);
+const bigRandom = randomPayload(1024 * 1024);
+codecResults.push(benchCodec('codec 1MiB repeated  zstd', bigRepeat, 'zstd'));
+codecResults.push(benchCodec('codec 1MiB repeated  gzip', bigRepeat, 'gzip'));
+codecResults.push(benchCodec('codec 1MiB random    zstd', bigRandom, 'zstd'));
+codecResults.push(benchCodec('codec 1MiB random    gzip', bigRandom, 'gzip'));
+codecResults.push(benchCodec('codec 16KiB repeated zstd', repeatedPayload(16 * 1024), 'zstd', 2000));
+codecResults.push(benchCodec('codec 16KiB random   zstd', randomPayload(16 * 1024), 'zstd', 2000));
+
+console.log('\ncluster compression (N=1, end-to-end put/get + ratio)');
+{
+  const cases = [
+    { type: 'none', kind: 'repeated', size: 1024, count: ops },
+    { type: 'zstd', kind: 'repeated', size: 1024, count: ops },
+    { type: 'gzip', kind: 'repeated', size: 1024, count: ops },
+    { type: 'zstd', kind: 'random', size: 1024, count: ops },
+    { type: 'gzip', kind: 'random', size: 1024, count: ops },
+    { type: 'none', kind: 'repeated', size: 16 * 1024, count: Math.min(ops, 2000) },
+    { type: 'zstd', kind: 'repeated', size: 16 * 1024, count: Math.min(ops, 2000) },
+    { type: 'zstd', kind: 'random', size: 16 * 1024, count: Math.min(ops, 2000) },
+    { type: 'none', kind: 'repeated', size: 1024 * 1024, count: 80 },
+    { type: 'zstd', kind: 'repeated', size: 1024 * 1024, count: 80 },
+    { type: 'zstd', kind: 'random', size: 1024 * 1024, count: 80 },
+  ];
+  const clusters = {};
+  for (const type of ['none', 'zstd', 'gzip']) {
+    const started = await startCluster(1, 1, type);
+    await started.cluster.createBucket('bench');
+    clusters[type] = started.cluster;
+  }
+  let keySeq = 0;
+  for (const c of cases) {
+    const body = c.kind === 'random' ? randomPayload(c.size) : repeatedPayload(c.size);
+    const sizeLabel = c.size >= 1024 * 1024 ? `${c.size / (1024 * 1024)}MiB` : `${c.size / 1024}KiB`;
+    const label = `cluster ${sizeLabel} ${c.kind} ${c.type}`;
+    const prefix = `p${keySeq++}-`;
+    const warmN = c.size >= 1024 * 1024 ? 8 : warmup;
+    const pair = await measurePair(label, c.count, clusters[c.type], 'bench', prefix, body, warmN);
+    results.push(pair.put, pair.get);
+    results.push({ kind: 'compress', ...pair.compress });
+  }
+  await stopChildren();
+}
+
+console.log('\nengine layout (direct C put, 5000 objects)');
+{
+  const n = 5000;
+  const logical = n * 1024;
+  const raw = Array.from({ length: n }, () => repeatedPayload(1024));
+  layoutResults.push(layoutCheck('layout 5000 x 1KiB raw repeated', raw, logical));
+  const zstdRepeat = raw.map((b) => compressValue(b, 'zstd'));
+  layoutResults.push({
+    ...layoutCheck('layout 5000 x 1KiB zstd repeated', zstdRepeat.map((p) => p.stored), logical),
+    applied: zstdRepeat[0].compressType,
+    avgStoredPayload: zstdRepeat.reduce((s, p) => s + p.stored.length, 0) / n,
+  });
+  const zstdRand = Array.from({ length: n }, () => compressValue(randomPayload(1024), 'zstd'));
+  layoutResults.push({
+    ...layoutCheck('layout 5000 x 1KiB zstd random', zstdRand.map((p) => p.stored), logical),
+    applied: zstdRand[0].compressType,
+    avgStoredPayload: zstdRand.reduce((s, p) => s + p.stored.length, 0) / n,
+  });
 }
 
 const report = {
@@ -287,6 +500,8 @@ const report = {
   ops,
   warmup,
   results,
+  codecResults,
+  layoutResults,
 };
 writeFileSync(outFile, JSON.stringify(report, null, 2));
 console.log(`\nwrote ${outFile}`);

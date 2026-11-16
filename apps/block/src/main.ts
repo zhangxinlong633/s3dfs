@@ -43,6 +43,32 @@ function requestKey(req: IncomingMessage, url: URL): string {
   return url.searchParams.get('key') ?? '';
 }
 
+function requestMeta(req: IncomingMessage) {
+  const header = req.headers['x-s3dfs-meta'];
+  const raw = Array.isArray(header) ? header[0] : header;
+  if (!raw) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(decodeURIComponent(raw)) as Parameters<Store['put']>[2];
+  } catch {
+    return undefined;
+  }
+}
+
+function requestLocator(req: IncomingMessage, url: URL) {
+  const header = req.headers['x-s3dfs-locator'];
+  const raw = Array.isArray(header) ? header[0] : (header ?? url.searchParams.get('locator'));
+  if (!raw) {
+    return null;
+  }
+  try {
+    return JSON.parse(decodeURIComponent(raw)) as Parameters<Store['get']>[1];
+  } catch {
+    return null;
+  }
+}
+
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -104,23 +130,23 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       return;
     }
     const value = await readBody(req);
-    store.put(key, value);
-    const meta = store.head(key);
-    if (!meta) {
-      sendJson(res, 500, { error: 'put succeeded but head is missing' });
-      return;
-    }
-    sendJson(res, 200, meta);
+    const loc = store.put(key, value, requestMeta(req));
+    sendJson(res, 200, loc);
     return;
   }
   if ((pathname === '/_s3dfs/block/get' || pathname === '/_s3dfs/block/head') && method === 'GET') {
     const key = requestKey(req, url);
+    const loc = requestLocator(req, url);
     if (!key) {
       sendJson(res, 400, { error: 'missing key' });
       return;
     }
+    if (!loc) {
+      sendJson(res, 400, { error: 'missing x-s3dfs-locator' });
+      return;
+    }
     if (pathname.endsWith('/head')) {
-      const meta = store.head(key);
+      const meta = store.head(key, loc);
       if (!meta) {
         res.statusCode = 404;
         res.end();
@@ -130,7 +156,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 200, meta);
       return;
     }
-    const found = store.get(key);
+    const found = store.get(key, loc);
     if (!found) {
       res.statusCode = 404;
       res.end();
@@ -143,13 +169,17 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   if (pathname === '/_s3dfs/block/delete' && method === 'POST') {
-    const body = JSON.parse((await readBody(req)).toString('utf8') || '{}') as { key?: string };
-    const key = body.key ?? requestKey(req, url);
+    const key = requestKey(req, url) || JSON.parse((await readBody(req)).toString('utf8') || '{}').key;
     if (!key) {
       sendJson(res, 400, { error: 'missing key' });
       return;
     }
-    sendJson(res, 200, { deleted: store.delete(key) });
+    store.tombstone(key);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (pathname === '/_s3dfs/block/scan' && method === 'GET') {
+    sendJson(res, 200, store.scan());
     return;
   }
   if (pathname === '/_s3dfs/block/flush' && method === 'POST') {
@@ -158,8 +188,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   if (pathname === '/_s3dfs/block/compact' && method === 'POST') {
-    store.compact();
-    sendJson(res, 200, { ok: true, stats: store.stats() });
+    sendJson(res, 501, { error: 'compaction is not implemented without a live locator list from the index' });
     return;
   }
 

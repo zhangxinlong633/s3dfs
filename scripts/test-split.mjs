@@ -132,13 +132,28 @@ const locs = await cluster.locators('demo/path/to/obj.txt');
 if (locs.length !== 2) {
   throw new Error(`expected 2 locators (min(3, live)=2), got ${locs.length}`);
 }
+if (locs[0].v !== 2 || locs[0].compressType !== 'none' || typeof locs[0].blockId !== 'number' || typeof locs[0].offset !== 'number') {
+  throw new Error(`unexpected short-object locator ${JSON.stringify(locs[0])}`);
+}
 if (!(await kv.get('demo/path/to/obj.txt:1'))) {
   throw new Error('missing key:1 locator');
 }
 
+const compressible = Buffer.alloc(4096, 0x61);
+await cluster.put('demo', 'path/to/comp.bin', compressible);
+const clocs = await cluster.locators('demo/path/to/comp.bin');
+if (clocs.length !== 2 || clocs[0].compressType !== 'zstd' || !(clocs[0].storedSize < clocs[0].size)) {
+  throw new Error(`expected zstd locator with savings, got ${JSON.stringify(clocs[0])}`);
+}
+const cgot = await cluster.get('demo', 'path/to/comp.bin');
+if (!cgot || !cgot.value.equals(compressible)) {
+  throw new Error('decompressed get mismatch');
+}
+
 const listed = await cluster.list('demo', 'path/');
-if (listed.objects.length !== 1 || listed.objects[0].key !== 'path/to/obj.txt') {
-  throw new Error(`list should hide replica suffixes, got ${JSON.stringify(listed.objects)}`);
+const listedKeys = listed.objects.map((o) => o.key).sort();
+if (listedKeys.join(',') !== 'path/to/comp.bin,path/to/obj.txt') {
+  throw new Error(`list should hide replica suffixes and show both objects, got ${JSON.stringify(listed.objects)}`);
 }
 
 const downId = locs[0].nodeId;

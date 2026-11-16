@@ -18,7 +18,7 @@ const store = new addon.Store(dir, { blockSize, bufferSize: 64 * 1024, fsyncOnFl
 
 try {
   const small = Buffer.from('hello-small');
-  store.put('a/small', small);
+  const smallLoc = store.put('a/small', small);
 
   // Fill most of the first block, then write an object that must span.
   const filler = Buffer.alloc(blockSize - 8 * 1024, 0x11);
@@ -26,32 +26,44 @@ try {
 
   const payload = Buffer.alloc(Math.floor(blockSize * 2.5), 0);
   for (let i = 0; i < payload.length; i++) payload[i] = (i * 7 + 13) & 0xff;
-  store.put('a/big', payload);
+  const bigLoc = store.put('a/big', payload);
   store.flush();
 
-  const got = store.get('a/big');
+  assert(bigLoc && bigLoc.chained && bigLoc.extentCount >= 3, `expected a chained locator, got ${JSON.stringify(bigLoc)}`);
+  const got = store.get('a/big', bigLoc);
   assert(got && got.value.equals(payload), 'get mismatch before reopen');
-  const head = store.head('a/big');
+  const head = store.head('a/big', bigLoc);
   assert(head && head.size === payload.length, 'head size mismatch');
-  const listed = store.list({ prefix: 'a/big' });
-  assert(listed.objects.length === 1 && listed.objects[0].size === payload.length, 'list size mismatch');
 
   const stats = store.stats();
   assert(stats.blockFiles >= 3, `expected >= 3 block files, got ${stats.blockFiles}`);
   store.close();
 
+  const files = fs.readdirSync(path.join(dir, 'blocks')).filter((n) => n.endsWith('.blk')).sort();
+  assert(files.length === stats.blockFiles, 'block file count mismatch');
+  assert(!fs.existsSync(path.join(dir, 'index')), 'local index directory should not exist');
+
   const store2 = new addon.Store(dir, { blockSize, bufferSize: 64 * 1024, fsyncOnFlush: true });
-  const got2 = store2.get('a/big');
+  const got2 = store2.get('a/big', bigLoc);
   assert(got2 && got2.value.equals(payload), 'get mismatch after reopen');
-  const small2 = store2.get('a/small');
+  const small2 = store2.get('a/small', smallLoc);
   assert(small2 && small2.value.equals(small), 'small object lost after reopen');
-  store2.compact();
-  const got3 = store2.get('a/big');
-  assert(got3 && got3.value.equals(payload), 'get mismatch after compact');
+
+  const scanned = store2.scan();
+  const byKey = Object.fromEntries(scanned.map((e) => [e.key, e.locator]));
+  assert(byKey['a/big'] && byKey['a/small'] && byKey['a/filler'], `scan missed keys: ${scanned.map((e) => e.key)}`);
+  const scannedBig = store2.get('a/big', byKey['a/big']);
+  assert(scannedBig && scannedBig.value.equals(payload), 'get via rebuilt locator mismatch');
+
+  store2.tombstone('a/small');
+  store2.flush();
+  const afterDelete = store2.scan();
+  assert(!afterDelete.some((e) => e.key === 'a/small'), 'tombstone should drop key from scan');
+  assert(afterDelete.some((e) => e.key === 'a/big'), 'big object should survive tombstone of small');
   store2.close();
-  console.log('ok', { dir, size: payload.length, blocks: stats.blockFiles });
+  console.log('ok', { dir, size: payload.length, blocks: stats.blockFiles, last: bigLoc, scanned: scanned.length });
 } catch (err) {
-  store.close();
+  try { store.close(); } catch {}
   console.error(err);
   process.exitCode = 1;
 }

@@ -15,6 +15,16 @@ extern "C" {
 #define S3DFS_ERR_ARGS      -4
 #define S3DFS_ERR_NOMEM     -5
 
+/* On-disk block records are little-endian TLV frames (magic "S3R1"):
+ *
+ *   magic u32 | rec_len u32 | tags... | crc32 u32 | rec_len u32 | magic u32
+ *
+ * Each tag is: type u16 | length u32 | value[length].
+ * Unknown tags are skipped, so new fields can be added without breaking
+ * readers. A torn write is detected by magic / rec_len / crc mismatch.
+ * Scanning every .blk file is enough to rebuild the object index.
+ */
+
 typedef struct s3dfs_store s3dfs_store;
 
 typedef struct s3dfs_options {
@@ -37,13 +47,32 @@ typedef struct s3dfs_stats {
     uint64_t index_slots;
 } s3dfs_stats;
 
-typedef struct s3dfs_object_info {
-    const char *key;
-    uint32_t key_len;
-    uint32_t size;
+/* Optional attributes written as TLV tags so a later index rebuild can
+   recover compression metadata. compress_type: 0=none, 1=zstd, 2=gzip. */
+typedef struct s3dfs_put_meta {
+    uint8_t has_meta;
+    uint8_t compress_type;
+    uint64_t orig_size;
+    uint32_t orig_crc;
+} s3dfs_put_meta;
+
+/* Location of the last extent (or the only record). Multi-extent objects
+   walk prev-link tags in the block records; dleveldb stores this locator. */
+typedef struct s3dfs_locator {
+    uint8_t chained;
+    uint8_t tombstone;
     uint32_t crc;
     uint64_t mtime_ms;
-} s3dfs_object_info;
+    uint64_t size;
+    uint64_t generation;
+    uint32_t extent_count;
+    uint64_t block_id;
+    uint64_t offset;
+    uint32_t rec_len;
+    uint8_t compress_type;
+    uint64_t orig_size;
+    uint32_t orig_crc;
+} s3dfs_locator;
 
 typedef struct s3dfs_put_item {
     const char *key;
@@ -52,24 +81,26 @@ typedef struct s3dfs_put_item {
     uint32_t value_len;
 } s3dfs_put_item;
 
+typedef int (*s3dfs_scan_cb)(void *user, const char *key, uint32_t key_len, const s3dfs_locator *loc);
+
 s3dfs_store *s3dfs_open(const char *data_dir, const s3dfs_options *opt);
 void s3dfs_close(s3dfs_store *store);
 
 int s3dfs_put(s3dfs_store *store, const char *key, uint32_t key_len,
-              const void *value, uint32_t value_len);
-int s3dfs_put_batch(s3dfs_store *store, const s3dfs_put_item *items, uint32_t n);
-int s3dfs_get(s3dfs_store *store, const char *key, uint32_t key_len,
-              void **out, uint32_t *out_len, uint32_t *crc, uint64_t *mtime_ms);
+              const void *value, uint32_t value_len, const s3dfs_put_meta *meta,
+              s3dfs_locator *out);
+int s3dfs_put_batch(s3dfs_store *store, const s3dfs_put_item *items, uint32_t n,
+                    const s3dfs_put_meta *meta, s3dfs_locator *out);
+int s3dfs_tombstone(s3dfs_store *store, const char *key, uint32_t key_len);
+int s3dfs_get_at(s3dfs_store *store, const char *key, uint32_t key_len,
+                 const s3dfs_locator *loc, void **out, uint32_t *out_len,
+                 uint32_t *crc, uint64_t *mtime_ms);
 void s3dfs_free(void *p);
-int s3dfs_head(s3dfs_store *store, const char *key, uint32_t key_len,
-               uint32_t *size, uint32_t *crc, uint64_t *mtime_ms);
-int s3dfs_delete(s3dfs_store *store, const char *key, uint32_t key_len);
+int s3dfs_head_at(s3dfs_store *store, const char *key, uint32_t key_len,
+                  const s3dfs_locator *loc, uint32_t *size, uint32_t *crc,
+                  uint64_t *mtime_ms);
+int s3dfs_scan(s3dfs_store *store, s3dfs_scan_cb cb, void *user);
 int s3dfs_flush(s3dfs_store *store);
-int s3dfs_compact(s3dfs_store *store);
-int s3dfs_list(s3dfs_store *store, const char *prefix, uint32_t prefix_len,
-               const char *start_after, uint32_t start_after_len,
-               uint32_t max_keys, s3dfs_object_info *out, uint32_t *out_n,
-               int *truncated);
 void s3dfs_get_stats(s3dfs_store *store, s3dfs_stats *out);
 
 #ifdef __cplusplus

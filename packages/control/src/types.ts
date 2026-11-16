@@ -1,4 +1,5 @@
 export type BlockNodeStatus = 'up' | 'down' | 'unknown';
+export type CompressType = 'none' | 'zstd' | 'gzip';
 
 export interface BlockNodeInfo {
   nodeId: string;
@@ -26,16 +27,26 @@ export interface BlockHealth extends BlockNodeInfo {
   stats?: BlockStats;
 }
 
-export interface ObjectLocator {
-  v: 1;
+export interface ExtentLocator {
+  chained: boolean;
+  crc: number;
+  mtimeMs: number;
+  size: number;
+  generation: number;
+  extentCount: number;
+  blockId: number;
+  offset: number;
+  recLen: number;
+}
+
+export interface ObjectLocator extends ExtentLocator {
+  v: 2;
   replica: number;
   replicaCount: number;
   nodeId: string;
   address: string;
-  storageKey: string;
-  size: number;
-  crc: number;
-  mtimeMs: number;
+  storedSize: number;
+  compressType: CompressType;
 }
 
 export interface ObjectValue {
@@ -43,6 +54,22 @@ export interface ObjectValue {
   size: number;
   crc: number;
   mtimeMs: number;
+  compressType?: CompressType;
+}
+
+export function extentFromLocator(loc: ExtentLocator | ObjectLocator): ExtentLocator {
+  const storedSize = 'storedSize' in loc && typeof loc.storedSize === 'number' ? loc.storedSize : loc.size;
+  return {
+    chained: Boolean(loc.chained),
+    crc: loc.crc,
+    mtimeMs: loc.mtimeMs,
+    size: storedSize,
+    generation: loc.generation ?? 0,
+    extentCount: loc.extentCount ?? 1,
+    blockId: loc.blockId,
+    offset: loc.offset,
+    recLen: loc.recLen,
+  };
 }
 
 export class ControlError extends Error {
