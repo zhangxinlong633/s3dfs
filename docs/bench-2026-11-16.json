@@ -1,0 +1,121 @@
+{
+  "measuredAt": "2026-11-16T03:46:48.808Z",
+  "timeZone": "Asia/Shanghai",
+  "bun": "1.4.2",
+  "nodeCompat": "v26.3.0",
+  "platform": "darwin arm64",
+  "cpus": 15,
+  "model": "Apple M5 Pro",
+  "memoryBytes": 51539607552,
+  "ops": 5000,
+  "warmup": 500,
+  "results": [
+    {
+      "name": "direct block put 1KiB (no index)",
+      "ops": 5000,
+      "opsPerSec": 15966.582989211423,
+      "p50Ns": 48250,
+      "p99Ns": 92375,
+      "elapsedSec": 0.313154042
+    },
+    {
+      "name": "direct block get 1KiB (no index)",
+      "ops": 5000,
+      "opsPerSec": 22296.51082704742,
+      "p50Ns": 44166,
+      "p99Ns": 66959,
+      "elapsedSec": 0.224250334
+    },
+    {
+      "name": "cluster put 100B  N=1",
+      "ops": 5000,
+      "opsPerSec": 5722.498591944886,
+      "p50Ns": 137875,
+      "p99Ns": 669750,
+      "elapsedSec": 0.873744208
+    },
+    {
+      "name": "cluster get 100B  N=1",
+      "ops": 5000,
+      "opsPerSec": 9321.579351237131,
+      "p50Ns": 103542,
+      "p99Ns": 168541,
+      "elapsedSec": 0.536389791
+    },
+    {
+      "name": "cluster put 1KiB  N=1",
+      "ops": 5000,
+      "opsPerSec": 5709.979841327288,
+      "p50Ns": 136291,
+      "p99Ns": 796375,
+      "elapsedSec": 0.875659834
+    },
+    {
+      "name": "cluster get 1KiB  N=1",
+      "ops": 5000,
+      "opsPerSec": 9420.69552524028,
+      "p50Ns": 102500,
+      "p99Ns": 163792,
+      "elapsedSec": 0.530746375
+    },
+    {
+      "name": "cluster put 16KiB N=1",
+      "ops": 2000,
+      "opsPerSec": 3816.8986028958334,
+      "p50Ns": 167083,
+      "p99Ns": 3492959,
+      "elapsedSec": 0.523985625
+    },
+    {
+      "name": "cluster get 16KiB N=1",
+      "ops": 2000,
+      "opsPerSec": 8788.736355486808,
+      "p50Ns": 105875,
+      "p99Ns": 399125,
+      "elapsedSec": 0.227564
+    },
+    {
+      "name": "cluster put 1KiB  N=1  32-in-flight",
+      "ops": 5000,
+      "inflight": 32,
+      "opsPerSec": 27595.919289861627,
+      "p50Ns": 900042,
+      "p99Ns": 4952583,
+      "elapsedSec": 0.181186209
+    },
+    {
+      "name": "cluster get 1KiB  N=1  32-in-flight",
+      "ops": 5000,
+      "inflight": 32,
+      "opsPerSec": 53617.721729386,
+      "p50Ns": 520959,
+      "p99Ns": 1781292,
+      "elapsedSec": 0.09325275
+    },
+    {
+      "name": "cluster put 1KiB  N=3",
+      "ops": 5000,
+      "opsPerSec": 1414.3436199057744,
+      "p50Ns": 358208,
+      "p99Ns": 3938709,
+      "elapsedSec": 3.535208792
+    },
+    {
+      "name": "cluster get 1KiB  N=3",
+      "ops": 5000,
+      "opsPerSec": 4377.352122559353,
+      "p50Ns": 220292,
+      "p99Ns": 366833,
+      "elapsedSec": 1.142243041
+    },
+    {
+      "name": "cluster put 1KiB  N=3  32-in-flight",
+      "ops": 5000,
+      "inflight": 32,
+      "opsPerSec": 6301.02947794868,
+      "p50Ns": 5261458,
+      "p99Ns": 10396958,
+      "elapsedSec": 0.793521125
+    }
+  ]
+}

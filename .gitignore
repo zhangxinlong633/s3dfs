@@ -1,0 +1,26 @@
+node_modules/
+.pnpm-store/
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+*.node
+.env
+.env.*
+!.env.example
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.idea/
+*.swp
+*.swo
+.DS_Store
+coverage/
+data/
+apps/api/dist/
+
+# in-tree dleveldb is retired; keep only the pointer README
+packages/dleveldb/**
+!packages/dleveldb/README.md

@@ -1,0 +1,30 @@
+{
+  "name": "s3dfs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "S3-compatible object store: TypeScript control plane + C packed-block engine",
+  "engines": {
+    "node": ">=26.0.0",
+    "pnpm": ">=9.0.0",
+    "bun": ">=1.4.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel --filter @s3dfs/api --filter @s3dfs/web --filter @s3dfs/block dev",
+    "dev:api": "pnpm --filter @s3dfs/api dev",
+    "dev:web": "pnpm --filter @s3dfs/web dev",
+    "dev:block": "pnpm --filter @s3dfs/block dev",
+    "dev:index": "bash scripts/dev-index.sh",
+    "build": "pnpm --filter @s3dfs/engine build && pnpm --filter @s3dfs/control build && pnpm --filter @s3dfs/api build && pnpm --filter @s3dfs/web build",
+    "build:engine": "pnpm --filter @s3dfs/engine build",
+    "build:control": "pnpm --filter @s3dfs/control build",
+    "typecheck": "pnpm -r typecheck",
+    "clean": "pnpm -r exec rm -rf dist .next build node_modules/.cache",
+    "test:split": "bun scripts/test-split.mjs",
+    "test:engine": "node packages/engine/scripts/test-span.mjs",
+    "bench": "bun scripts/bench-split.mjs"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
