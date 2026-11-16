@@ -17,9 +17,40 @@ pnpm bench
 # or: bun scripts/bench-split.mjs
 ```
 
-The script starts a fresh temporary index and block process for each cluster setup. The raw result is in [bench-2026-11-16-tlv.json](bench-2026-11-16-tlv.json). The same summary tables are also in the [English README](../README.md) and the [Chinese README](../README.zh-CN.md).
+The script starts a fresh temporary index and block process for each cluster setup. The raw result is in [bench-2026-11-16-tlv.json](bench-2026-11-16-tlv.json). The same summary tables are also in the [English README](../README.md) and the [Chinese README](../README.zh-CN.md). A planning summary for people evaluating this class of software is in [Guidance for evaluators](#guidance-for-evaluators).
 
 Do not mix these numbers with the in-process KV benches in the dleveldb repository. That path is pure KV. This one is an object-store HTTP index + block path.
+
+
+## Guidance for evaluators
+
+These figures are a starting reference for people choosing a packed-block, S3-compatible store, not a service-level target. They come from one run on one MacBook Pro, over localhost, with no wide-area network and no shared-disk contention. A different machine or a multi-machine deployment will change the absolute numbers. The more transferable part is the shape of the results: where the bottleneck sits, how replicas and concurrency move the rate, and when compression helps.
+
+There is no single “average ops/s” across the tables in this file. The rows mix 100-byte and 1 MiB objects, one and three replicas, sequential and pipelined requests, and a synthetic best-case compress path. Averaging them would hide the differences that matter for planning. For product comparison, use the cluster path (API + dleveldb index + block), not the direct-block row: that is what an S3 client actually sees.
+
+On this machine, the useful planning figures are:
+
+| Planning case | Write | Read | What it represents |
+| --- | ---: | ---: | --- |
+| 1 KiB, N=1, sequential, `none` | 6,795 ops/s, 6.6 MiB/s | 8,708 ops/s, 8.5 MiB/s | Typical single-copy baseline on this host |
+| 1 KiB, N=1, 32 in flight, `none` | 31,157 ops/s, 30.4 MiB/s | 49,001 ops/s, 47.9 MiB/s | Concurrent small-object peak on this host |
+| 1 KiB, N=3, sequential, `none` | 2,775 ops/s, 2.7 MiB/s | 4,119 ops/s, 4.0 MiB/s | Closer to the default three-copy write |
+| 16 KiB, N=1, sequential, `none` | 4,663 ops/s, 72.9 MiB/s | 6,507 ops/s, 101.7 MiB/s | When bandwidth starts to matter |
+| 1 MiB, N=1, incompressible | 209 ops/s, 208.5 MiB/s | 417 ops/s, 416.9 MiB/s | Large-object rate when compression cannot help |
+
+On the 1 KiB, N=1 sequential path, put p50 / p99 was 138 µs / 341 µs, and get was 110 µs / 179 µs. Under 32 in-flight requests the same 1 KiB path still completes, but latency rises (put p50 / p99 950 µs / 2,620 µs); compare throughput, not p50, for those rows.
+
+Small objects are limited by HTTP and the index write, not by disk bandwidth. A 100 B cluster put (6,938 ops/s) is almost the same as a 1 KiB put (6,795 ops/s). At 16 KiB, ops/s fall but logical bandwidth rises to 72.9 MiB/s write and 101.7 MiB/s read. A 1 MiB incompressible object on the N=1 cluster path wrote at 209 ops/s (208.5 MiB/s) and read at 417 ops/s (416.9 MiB/s). Use ops/s when you are planning for many small objects, and MiB/s when objects are larger.
+
+Default production writes make three object-body copies. In this localhost test, a 1 KiB put that had to succeed on three local block processes ran at 2,775 ops/s, down from 6,795 ops/s at N=1. A multi-machine deployment will add network cost on top, which this test does not include. Pipelining recovers some of that write rate: 32 in-flight 1 KiB puts reached 11,225 ops/s at N=3.
+
+Compression is zstd by default and is recorded per object. It helps most on logs and other repetitive text. The repeated `0x61` payload is a best case: 1 KiB shrinks 53.89×, 16 KiB 862.32×, and 1 MiB 20,971.52×. The 1 MiB logical write rate of 2,319.4 MiB/s is not a disk-bandwidth number; almost nothing was written to disk. Real logs and text usually compress well, but not this well. Already-compressed or random data does not shrink; this run stored those objects as `none`, and the rates stayed close to the uncompressed baseline (6,485 vs 6,716 ops/s at 1 KiB; 209 vs 225 ops/s at 1 MiB). On 1 KiB objects, even a 53.89× shrink barely moves ops/s, because the index and HTTP still dominate. At 16 KiB and 1 MiB, a highly compressible body improves both ops/s and logical MiB/s. zstd is the better default than gzip here: similar ratios when the data compresses, and much less CPU when it will not (3,589 vs 98 MiB/s on a 1 MiB random attempt).
+
+The layout is meant for a large number of small objects. 5,000 × 1 KiB objects landed in a single `.blk` file, with 6 group fsyncs when uncompressed and 1 fsync when zstd shrank the payload. There is no per-object directory and no local LevelDB on the block node. The on-disk ratio after zstd (11.67×) is lower than the payload ratio (53.89×) because each record still carries TLV headers. Deleted space is not reclaimed until compaction is implemented.
+
+Do not compare these rows with the in-process KV benches in the dleveldb repository, or with a local engine that skips HTTP. The direct-block 1 KiB rate (18,716 puts/s and 19,334 gets/s) is the engine-plus-HTTP ceiling without the index; the cluster rows are the ones to use for product comparison. This was not a bake-off against another object store on the same data set.
+
+If you are choosing software in this class: s3dfs is aimed at many small to medium objects, where packing into large files, group commit, and optional compression matter more than a per-object directory tree. Plan capacity by adding block machines, and keep a small 3–5 node dleveldb index. If your data is already compressed, assume the `none` rows. If you need three copies, start from the N=3 rows and then measure on your own network. Multipart upload, erasure coding, compaction / GC, and automatic replica repair are not in this release; those affect day-to-day operations more than the peak numbers above. The most reliable next step is to run `pnpm bench` on your hardware, and to replay a sample of your own objects.
 
 ## HTTP throughput, compress=none
 

@@ -108,6 +108,29 @@ bun scripts/test-split.mjs
 
 Numbers below were measured on 16 Nov 2026, 12:33 (Asia/Shanghai) with Bun 1.4.2 (node-compat v26.3.0), on a MacBook Pro (Apple M5 Pro, 15 cores, 48 GB, Apple SSD AP1024Z). They are single-host results, not a multi-machine network test. N is the object-body replica count: N=1 is one dleveldb process plus one block process; N=3 is one index plus three block processes on the same machine. Bandwidth is **logical** MiB/s (uncompressed object size / time, 1 MiB = 1,048,576 bytes). Compression ratio is logical size / stored size. The repeated payload is `0x61` bytes, a best-case pattern; the random payload is cryptographically random and typically does not shrink. When compression does not help, the locator records `compressType=none`. Reproduce with `pnpm bench` or `bun scripts/bench-split.mjs`. Methodology, raw JSON, and the same tables are in [docs/benchmarks.md](docs/benchmarks.md).
 
+
+### Guidance for evaluators
+
+These figures are a starting reference for people choosing a packed-block, S3-compatible store, not a service-level target. They come from one localhost run on one MacBook Pro. Absolute numbers will change on other hardware or across a real network. For product comparison, use the cluster path (API + index + block), not the direct-block row: that is what an S3 client actually sees.
+
+There is no single “average ops/s” across the tables below. The rows mix object sizes, replica counts, sequential and pipelined requests, and a synthetic best-case compress path. On this machine, the useful planning figures are:
+
+| Planning case | Write | Read | What it represents |
+| --- | ---: | ---: | --- |
+| 1 KiB, N=1, sequential, `none` | 6,795 ops/s, 6.6 MiB/s | 8,708 ops/s, 8.5 MiB/s | Typical single-copy baseline on this host |
+| 1 KiB, N=1, 32 in flight, `none` | 31,157 ops/s, 30.4 MiB/s | 49,001 ops/s, 47.9 MiB/s | Concurrent small-object peak on this host |
+| 1 KiB, N=3, sequential, `none` | 2,775 ops/s, 2.7 MiB/s | 4,119 ops/s, 4.0 MiB/s | Closer to the default three-copy write |
+| 16 KiB, N=1, sequential, `none` | 4,663 ops/s, 72.9 MiB/s | 6,507 ops/s, 101.7 MiB/s | When bandwidth starts to matter |
+| 1 MiB, N=1, incompressible | 209 ops/s, 208.5 MiB/s | 417 ops/s, 416.9 MiB/s | Large-object rate when compression cannot help |
+
+On the 1 KiB, N=1 sequential path, put p50 / p99 was 138 µs / 341 µs, and get was 110 µs / 179 µs. Small objects are limited by HTTP and the index, not by disk bandwidth: a 100 B put (6,938 ops/s) is almost the same as a 1 KiB put (6,795 ops/s). Use ops/s when planning for many small objects, and MiB/s when objects are larger.
+
+Default production writes make three object-body copies. In this localhost test, that cut 1 KiB sequential write throughput from 6,795 ops/s to 2,775 ops/s. A multi-machine deployment will add network cost on top, which is not in these numbers. Pipelining helps: 32 in-flight 1 KiB puts reached 11,225 ops/s at N=3.
+
+Compression is zstd by default and is recorded per object. It helps most on logs and other repetitive text. The repeated `0x61` payload in the tables is a best case; the 1 MiB logical write rate of 2,319 MiB/s is not a disk-bandwidth number. Already-compressed or random data does not shrink; this run stored those objects as `none`, and the 1 KiB / 1 MiB rates stayed close to the uncompressed baseline (6,485 vs 6,716 ops/s at 1 KiB; 209 vs 225 ops/s at 1 MiB). On 1 KiB objects, even a 53.89× shrink barely moves ops/s, because the index and HTTP still dominate.
+
+The layout is meant for a large number of small objects. 5,000 × 1 KiB objects landed in one `.blk` file, with 6 group fsyncs when uncompressed and 1 fsync after zstd shrank the payload. There is no per-object directory and no local LevelDB on the block node. If you need a planning number, start from the table above, then run `pnpm bench` on your hardware with a sample of your own objects. Fuller notes are in [docs/benchmarks.md](docs/benchmarks.md).
+
 HTTP path, `compress=none` (so these rows are not mixed with the default zstd path):
 
 | Workload | Throughput | Bandwidth | p50 | p99 |
