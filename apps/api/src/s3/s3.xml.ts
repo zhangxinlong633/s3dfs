@@ -40,7 +40,11 @@ export function listObjectsXml(opts: {
   maxKeys: number;
   truncated: boolean;
   objects: { key: string; size: number; crc: number; mtimeMs: number }[];
+  delimiter?: string;
+  prefixes?: string[];
+  nextToken?: string;
 }): string {
+  const prefixes = opts.prefixes ?? [];
   const contents = opts.objects
     .map((o) => {
       const etag = o.crc.toString(16).padStart(8, '0');
@@ -53,17 +57,25 @@ export function listObjectsXml(opts: {
   </Contents>`;
     })
     .join('');
-  const next = opts.truncated && opts.objects.length
-    ? `<NextContinuationToken>${xmlEscape(opts.objects[opts.objects.length - 1]!.key)}</NextContinuationToken>`
+  const common = prefixes
+    .map((p) => `<CommonPrefixes><Prefix>${xmlEscape(p)}</Prefix></CommonPrefixes>`)
+    .join('');
+  const delim = opts.delimiter ? `<Delimiter>${xmlEscape(opts.delimiter)}</Delimiter>` : '';
+  const token = opts.nextToken ?? (opts.truncated && opts.objects.length ? opts.objects[opts.objects.length - 1]!.key : undefined);
+  const next = opts.truncated && token
+    ? `<NextContinuationToken>${xmlEscape(token)}</NextContinuationToken>`
     : '';
+  const keyCount = opts.objects.length + prefixes.length;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Name>${xmlEscape(opts.bucket)}</Name>
   <Prefix>${xmlEscape(opts.prefix)}</Prefix>
+  ${delim}
   <MaxKeys>${opts.maxKeys}</MaxKeys>
-  <KeyCount>${opts.objects.length}</KeyCount>
+  <KeyCount>${keyCount}</KeyCount>
   <IsTruncated>${opts.truncated}</IsTruncated>
   ${contents}
+  ${common}
   ${next}
 </ListBucketResult>
 `;

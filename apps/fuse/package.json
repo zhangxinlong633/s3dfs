@@ -1,0 +1,11 @@
+{
+  "name": "@s3dfs/fuse",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FUSE / mount client for a s3dfs bucket",
+  "scripts": {
+    "build": "go build -o s3dfs-fuse .",
+    "test": "go test ./...",
+    "typecheck": "node -e \"process.exit(0)\""
+  }
+}

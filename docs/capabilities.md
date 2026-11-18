@@ -2,19 +2,22 @@
 
 ## 已经可以做的
 
-- S3 风格的 Put / Get / Head / Delete / List，以及创建桶
+- S3 风格的 Put / Get / Head / Delete / List，以及创建桶；List 支持 `delimiter` 与 CommonPrefixes；GET / HEAD 支持单个 HTTP `Range`（206）
 - 对象索引放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群（建议 3–5 台）；对象正文放在可大量扩展的 block 机器上
-- 对象打进追加式 block 文件，而不是一个对象一个目录
+- 对象打进追加式 block 文件，而不是一个对象一个目录；inode 和磁盘文件数跟 block 文件走，不跟对象数走
+- 对象按 key 哈希分散到多台 block；locator 留在 dleveldb。存储侧的对象规模主要是 KV 里的 key 数，而不是本地文件系统的 inode 数
 - 默认 1GB 一块；超过当前块剩余空间或大于一块的对象，切成多段并从后向前记下链接，读取时再从前向后拼回
 - 1MB 写缓冲做 group commit，flush 默认 `fsync`
 - 批量 `put_batch`（单个 block 引擎内部），避免每个小对象都从 JS 进 C 一次
 - block 记录是带校验的 TLV 帧；不认识的字段可以跳过。索引 locator 只记稳定的 `recId`（`v: 3`），物理偏移留在节点内存表里，打开时扫描 `.blk` 重建。索引丢了时可以扫描重建 locator（删除会写墓碑，避免把已删对象救回来）
 - 对象数据默认 3 副本，记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带 block 节点信息；有效副本数是 `min(配置值, 存活的 block 节点数)`
-- 定期对 block 节点做健康检查，Get / Put 会跳过已标记为 down 的节点
+- 定期对 block 节点做健康检查，Get / Put 会跳过已标记为 down 的节点。Get 会在本次请求里依次尝试剩余副本
+- 对象副本补齐（第一期）：活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点。`POST /_s3dfs/repair` 可手动触发；`S3DFS_REPAIR_INTERVAL_MS` 默认 30 秒，0 关闭后台任务。没有活副本的对象补不回来，也不会退役失效 locator。说明见 [故障与恢复](design-recovery.md)
 - 对象正文默认用 zstd 压缩（`S3DFS_COMPRESS=none|zstd|gzip`），每个对象自己的 `compressType` 记在 locator 里；压不小就存原值
-- 打开 block 时扫描各文件末尾的完整记录，接着追加；没有本地 LevelDB
-- 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact`
+- 打开 block 时扫描各文件末尾的完整记录，接着追加。`recId` 映射会写到节点本地的 `recmap.s3m`；重启时优先读快照并补扫新数据，快照不可用则扫描全部 `.blk`。不是再引入一份本地 LevelDB
+- 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact|repair`
 - 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
+- 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录。路径对应对象 key，内容按普通对象进 block；写入采用关闭时整文件上传。Linux 走 `/dev/fuse`；本机没有 FUSE 时，在 macOS 上通过本机 WebDAV 加 `mount_webdav` 挂载
 
 ## 还不做的
 
@@ -22,7 +25,7 @@
 - 流式上传 / 下载；S3 分片上传（Multipart）
 - 纠删码
 - 把对象值放进 dleveldb；索引里只有 locator JSON，正文始终在 block 文件里
-- 对象数据副本的自动修复 / 迁移（节点宕机后不会把缺失的副本补到别的机器）
+- 退役失效的数据 locator，以及在没有活副本时把对象救回来；故障时哪些还能继续，见 [故障与恢复](design-recovery.md)
 - dleveldb 侧：节点加入后的范围迁移 / catch-up repair，以及 primary 不可达时的安全写故障转移（读可以走剩余 KV 副本；写索引会失败，避免脑裂）
 - 单对象超过约 4GB − 1（引擎对外 API 仍是 `uint32` 长度）
 
@@ -37,6 +40,7 @@
 - `S3DFS_BLOCK_NODES`：block 节点种子列表，`nodeId=host:port`，逗号分隔，默认 `block1=127.0.0.1:9100`
 - `S3DFS_DATA_REPLICAS`：对象正文副本数，默认 3。有效值不超过当前存活的 block 节点数
 - `S3DFS_HEALTH_INTERVAL_MS`：对 block 节点做健康检查的间隔，默认 5000
+- `S3DFS_REPAIR_INTERVAL_MS`：后台补齐对象副本的间隔，默认 30000；设为 0 则关闭定时任务，仍可 `POST /_s3dfs/repair`
 
 ### block 节点
 
@@ -61,4 +65,4 @@
 
 ## 大文件与内存
 
-引擎已经可以把一个逻辑对象切到多块中，dleveldb 只记最后一段的 locator，读取时沿链条从前向后拼回。不过 HTTP 层仍会把整个 body 读进 Node 内存，所以特别大的上传还是会先受到 API 进程内存的限制。流式 Put/Get 和分片上传是下一步。详见 [大文件跨 block 存放](design-large-object.md)。
+引擎已经可以把一个逻辑对象切到多块中，dleveldb 只记最后一段的 locator，读取时沿链条从前向后拼回。不过 HTTP 层仍会把整个 body 读进 Node 内存，Range 目前也是先取完整对象再切片，所以特别大的上传或按偏移读取还是会先受到 API 进程内存的限制。流式 Put/Get 和分片上传是下一步。详见 [大文件跨 block 存放](design-large-object.md)。

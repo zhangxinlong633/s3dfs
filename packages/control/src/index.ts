@@ -11,7 +11,7 @@ export {
   blockTombstone,
 } from './block-client.js';
 export { NodeRegistry, parseBlockNodes, parseIndexUrls, type SeedNode } from './registry.js';
-export { ObjectCluster, type ClusterStats } from './cluster.js';
+export { ObjectCluster, type ClusterStats, type RepairReport } from './cluster.js';
 export {
   NODE_PREFIX,
   isNodeKey,
@@ -33,3 +33,4 @@ export {
   type ObjectValue,
 } from './types.js';
 export { compressValue, crc32, decompressValue, parseCompressType } from './compress.js';
+export { parseByteRange, type ByteRange } from './byte-range.js';

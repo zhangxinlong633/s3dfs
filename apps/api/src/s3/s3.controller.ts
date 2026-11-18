@@ -1,12 +1,13 @@
 import { Controller, All, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { ControlError } from '@s3dfs/control';
+import { ControlError, parseByteRange } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
 import { errorXml, etagFromCrc, listBucketsXml, listObjectsXml } from './s3.xml';
 
 type RawReq = Request & { rawBody?: Buffer };
 
 function parsePath(urlPath: string): { bucket?: string; key?: string } {
+  const trailingSlash = urlPath.endsWith('/') && urlPath !== '/';
   const parts = urlPath.split('/').filter(Boolean);
   if (parts.length === 0) {
     return {};
@@ -15,7 +16,11 @@ function parsePath(urlPath: string): { bucket?: string; key?: string } {
     return {};
   }
   const bucket = parts[0];
-  const key = parts.length > 1 ? parts.slice(1).join('/') : undefined;
+  // /bucket and /bucket/ are bucket operations; only object keys keep a trailing slash.
+  if (parts.length === 1) {
+    return { bucket };
+  }
+  const key = parts.slice(1).join('/') + (trailingSlash ? '/' : '');
   return { bucket, key };
 }
 
@@ -86,7 +91,8 @@ export class S3Controller {
       const startAfter =
         url.searchParams.get('start-after') ?? url.searchParams.get('continuation-token') ?? undefined;
       const maxKeys = Number(url.searchParams.get('max-keys') ?? 1000);
-      const listed = await this.engine.list(bucket, prefix, startAfter, maxKeys);
+      const delimiter = url.searchParams.get('delimiter') ?? '';
+      const listed = await this.engine.list(bucket, prefix, startAfter, maxKeys, delimiter);
       if (method === 'HEAD') {
         res.status(200).end();
         return;
@@ -99,6 +105,9 @@ export class S3Controller {
           maxKeys,
           truncated: listed.truncated,
           objects: listed.objects,
+          delimiter,
+          prefixes: listed.prefixes,
+          nextToken: listed.nextToken,
         }),
       );
       return;
@@ -126,21 +135,38 @@ export class S3Controller {
         res.status(404).send(errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
         return;
       }
+      const rangeHeader = req.headers['range'];
+      const range = parseByteRange(Array.isArray(rangeHeader) ? rangeHeader[0] : rangeHeader, meta.size);
+      res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('ETag', etagFromCrc(meta.crc));
       res.setHeader('Last-Modified', new Date(meta.mtimeMs).toUTCString());
-      res.setHeader('Content-Length', String(meta.size));
       res.setHeader('Content-Type', 'application/octet-stream');
-      if (method === 'HEAD') {
-        res.status(200).end();
+      if (range.kind === 'unsatisfiable') {
+        res.setHeader('Content-Range', `bytes */${meta.size}`);
+        res.status(416).end();
         return;
       }
-      const obj = await this.engine.get(bucket, key);
+      const partial = range.kind === 'partial';
+      const start = partial ? range.start : 0;
+      const end = partial ? range.end : Math.max(0, meta.size - 1);
+      const length = meta.size === 0 ? 0 : end - start + 1;
+      if (partial) {
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${meta.size}`);
+      }
+      res.setHeader('Content-Length', String(length));
+      if (method === 'HEAD') {
+        res.status(partial ? 206 : 200).end();
+        return;
+      }
+      const obj = partial
+        ? await this.engine.getRange(bucket, key, start, end)
+        : await this.engine.get(bucket, key);
       if (!obj) {
         res.setHeader('Content-Type', 'application/xml');
         res.status(404).send(errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
         return;
       }
-      res.status(200).send(obj.value);
+      res.status(partial ? 206 : 200).send(obj.value);
       return;
     }
     if (method === 'DELETE') {

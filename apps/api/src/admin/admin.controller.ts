@@ -31,4 +31,10 @@ export class AdminController {
     await this.engine.compact();
     return { ok: true, stats: await this.engine.stats() };
   }
+
+  @Post('repair')
+  async repair() {
+    const report = await this.engine.repair();
+    return { ok: true, report, stats: await this.engine.stats() };
+  }
 }

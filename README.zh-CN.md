@@ -10,7 +10,7 @@ S3 兼容的对象存储。S3 API 和管控台用 TypeScript（Nest.js / Next.js
 - 对象正文放在大量只跑 packed-block 引擎的 **block 机器**上，机器可以很多
 - 默认 3 份数据副本，在索引里记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带上节点信息；API 会定期检查这些节点是否还活着，读写时跳过宕机节点，并可以从剩下的副本读取
 
-设计上针对小文件：不会一个对象一个目录，而是把对象打进大的 block 文件，在内存里攒批后再 `write` + `fsync`。inode 和 IOPS 跟数据文件数走，而不是跟对象数走。block 记录是带校验的 TLV 帧，对象定位全部放在 dleveldb 里。写入前控制面默认用 zstd 压缩，每个对象自己的类型记在 locator 的 `compressType` 里；如果压缩没有变小，就按原文落盘，并把类型记成 `none`。
+设计上针对小文件：不会一个对象一个目录，而是把对象打进大的 block 文件，在内存里攒批后再 `write` + `fsync`。inode 和 IOPS 跟数据文件数走，而不是跟对象数走。对象按 key 哈希分散到多台 block，定位信息是 dleveldb 里的 locator，存储侧不会像普通本地文件系统那样先被 inode 撑爆。block 记录是带校验的 TLV 帧，对象定位全部放在 dleveldb 里。写入前控制面默认用 zstd 压缩，每个对象自己的类型记在 locator 的 `compressType` 里；如果压缩没有变小，就按原文落盘，并把类型记成 `none`。
 
 ## 这个仓库做什么
 
@@ -36,7 +36,7 @@ s3dfs/
 
 对象索引请运行旁边的 [dleveldb](https://github.com/zhangxinlong633/dleveldb)（`pnpm dev:index` 默认 :9800）。本仓库里的 `packages/dleveldb` 只是历史对照，不再参与构建。
 
-分层和读写路径见 [docs/architecture.md](docs/architecture.md)。放置与健康检查见 [docs/design-replication.md](docs/design-replication.md)。大对象见 [docs/design-large-object.md](docs/design-large-object.md)。删除空洞与 compact 见 [docs/design-compaction.md](docs/design-compaction.md)。环境变量见 [docs/capabilities.md](docs/capabilities.md)。这些设计文档目前是中文。方法和完整表格见 [docs/benchmarks.md](docs/benchmarks.md)。
+分层和读写路径见 [docs/architecture.md](docs/architecture.md)。放置与健康检查见 [docs/design-replication.md](docs/design-replication.md)。故障与恢复见 [docs/design-recovery.md](docs/design-recovery.md)。大对象见 [docs/design-large-object.md](docs/design-large-object.md)。删除空洞与 compact 见 [docs/design-compaction.md](docs/design-compaction.md)。FUSE / 挂载见 [docs/design-fuse.md](docs/design-fuse.md)。环境变量见 [docs/capabilities.md](docs/capabilities.md)。这些设计文档目前是中文。方法和完整表格见 [docs/benchmarks.md](docs/benchmarks.md)。
 
 ## 架构概览
 
@@ -69,6 +69,8 @@ flowchart TB
 2. 同一份已存储字节写到 N 台存活的 block 节点上（`N = min(配置副本数, 当前存活的 block 数)`，默认 3）。
 3. 每次成功写入会返回一个 `recId`。API 把 locator JSON 写进 dleveldb，键是 `bucket/key`、`bucket/key:1` 等。对外的 `size` 和 `crc` 是未压缩值；`storedSize` 和 `compressType` 描述盘上实际内容。
 4. 读取时先查 locator，跳过宕机节点，按 `recId` 取数据，再用该 locator 上的类型解压。
+
+也可以用 `s3dfs-fuse` 把一个桶挂成本地目录：路径对应对象 key，内容仍按上面的方式进 block。说明见 [docs/design-fuse.md](docs/design-fuse.md)。
 
 ## 快速开始
 
@@ -188,9 +190,9 @@ zstd 的盘上比低于 payload 比（53.89x），因为每条记录还带有 TL
 
 ## 已经实现和还没有做的
 
-已经可以：Put / Get / Head / Delete / List、创建桶、索引和 block 分开部署、默认 3 份对象正文副本、一份 block 副本宕机后从剩余副本读取、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、删除写墓碑，以及空闲或手动 compact（回收空洞时不必改索引）。
+已经可以：Put / Get / Head / Delete / List（含 delimiter 列举）、HTTP Range GET、创建桶、索引和 block 分开部署、默认 3 份对象正文副本、一份 block 副本宕机后从剩余副本读取、活副本不足时自动或手动补齐到其他存活节点、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、block 节点用本地 `recmap.s3m` 加快重启（快照不可用则仍全量扫描）、删除写墓碑、空闲或手动 compact（回收空洞时不必改索引），以及 `apps/fuse` 里的第一期桶挂载程序。
 
-还没有做：分片上传、完整 SigV4、纠删码、对象副本的自动修复或迁移、流式读写，以及引擎的 uint32 对象大小上限。dleveldb 的加入迁移和 primary 写故障转移也还未实现：新索引节点不会自动拉历史 key；索引主节点不可达时，写入会失败。
+还没有做：分片上传、完整 SigV4、纠删码、流式读写，以及引擎的 uint32 对象大小上限。对象副本补齐的第一期已经有了，但不会退役失效 locator，也救不回已经没有活副本的对象。dleveldb 的加入迁移和 primary 写故障转移也还未实现：新索引节点不会自动拉历史 key；索引主节点不可达时，写入会失败。故障时哪些请求还能继续、哪些不能，见 [docs/design-recovery.md](docs/design-recovery.md)。
 
 ## 依赖
 

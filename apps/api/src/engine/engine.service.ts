@@ -7,6 +7,7 @@ import {
   parseBlockNodes,
   parseIndexUrls,
   type ClusterStats,
+  type RepairReport,
 } from '@s3dfs/control';
 
 @Injectable()
@@ -15,6 +16,8 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   private registry!: NodeRegistry;
   private cluster!: ObjectCluster;
   private timer: ReturnType<typeof setInterval> | undefined;
+  private repairTimer: ReturnType<typeof setInterval> | undefined;
+  private repairing = false;
 
   async onModuleInit(): Promise<void> {
     const urls = parseIndexUrls(process.env.S3DFS_INDEX_URLS ?? 'http://127.0.0.1:9800');
@@ -32,11 +35,27 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
       void this.registry.checkAll();
     }, interval);
     this.timer.unref();
+    const repairEvery = Number(process.env.S3DFS_REPAIR_INTERVAL_MS ?? 30_000);
+    if (repairEvery > 0) {
+      this.repairTimer = setInterval(() => {
+        if (this.repairing) {
+          return;
+        }
+        this.repairing = true;
+        void this.cluster.repair().finally(() => {
+          this.repairing = false;
+        });
+      }, repairEvery);
+      this.repairTimer.unref();
+    }
   }
 
   async onModuleDestroy(): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
+    }
+    if (this.repairTimer) {
+      clearInterval(this.repairTimer);
     }
   }
 
@@ -76,8 +95,12 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     return this.cluster.listBuckets();
   }
 
-  async list(bucket: string, prefix = '', startAfter?: string, maxKeys = 1000) {
-    return this.cluster.list(bucket, prefix, startAfter, maxKeys);
+  async getRange(bucket: string, key: string, start: number, end: number) {
+    return this.cluster.getRange(bucket, key, start, end);
+  }
+
+  async list(bucket: string, prefix = '', startAfter?: string, maxKeys = 1000, delimiter = '') {
+    return this.cluster.list(bucket, prefix, startAfter, maxKeys, delimiter);
   }
 
   async compact(): Promise<void> {
@@ -90,5 +113,9 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   async stats(): Promise<ClusterStats> {
     return this.cluster.stats();
+  }
+
+  async repair(): Promise<RepairReport> {
+    return this.cluster.repair();
   }
 }

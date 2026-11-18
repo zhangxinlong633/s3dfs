@@ -24,3 +24,5 @@ apps/api/dist/
 # in-tree dleveldb is retired; keep only the pointer README
 packages/dleveldb/**
 !packages/dleveldb/README.md
+
+apps/fuse/s3dfs-fuse

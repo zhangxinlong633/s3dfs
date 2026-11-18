@@ -10,7 +10,7 @@ The object index and the object body scale independently:
 - Object bodies live on many **block machines** that only run the packed-block engine.
 - The default is 3 data replicas, recorded in the index as `bucket/key`, `bucket/key:1`, and `bucket/key:2`, with node information in the values. The API periodically checks whether those nodes are still up, skips down nodes on get and put, and can still read from the remaining replicas.
 
-The layout is aimed at small objects: there is no per-object directory. Objects are packed into large block files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files, not the number of objects. Block records are checksummed TLV frames. All object placement is in dleveldb. The control plane compresses the body before writing (zstd by default). Each object’s type is stored on its locator as `compressType`. If compression does not shrink the value, the body is stored as-is and the type is recorded as `none`.
+The layout is aimed at small objects: there is no per-object directory. Objects are packed into large block files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files, not the number of objects. Objects are hashed across block machines, and locators live in dleveldb, so the storage path does not hit a local-filesystem inode ceiling the way a conventional directory tree would. Block records are checksummed TLV frames. All object placement is in dleveldb. The control plane compresses the body before writing (zstd by default). Each object’s type is stored on its locator as `compressType`. If compression does not shrink the value, the body is stored as-is and the type is recorded as `none`.
 
 ## What this repository does
 
@@ -36,7 +36,7 @@ s3dfs/
 
 Run a sibling [dleveldb](https://github.com/zhangxinlong633/dleveldb) checkout as the object index (`pnpm dev:index` defaults to :9800). The in-tree `packages/dleveldb` directory is a historical pointer only and is not part of the build.
 
-Layering and the read/write path are in [docs/architecture.md](docs/architecture.md). Placement and health checks are in [docs/design-replication.md](docs/design-replication.md). Large objects are in [docs/design-large-object.md](docs/design-large-object.md). Deletion holes and compaction (virtual record IDs, deferred cleanup) are in [docs/design-compaction.md](docs/design-compaction.md). Environment variables are in [docs/capabilities.md](docs/capabilities.md). Those design docs are currently in Chinese. Benchmark methodology and the full tables are in [docs/benchmarks.md](docs/benchmarks.md).
+Layering and the read/write path are in [docs/architecture.md](docs/architecture.md). Placement and health checks are in [docs/design-replication.md](docs/design-replication.md). Failure and recovery are in [docs/design-recovery.md](docs/design-recovery.md) (currently in Chinese). Large objects are in [docs/design-large-object.md](docs/design-large-object.md). Deletion holes and compaction (virtual record IDs, deferred cleanup) are in [docs/design-compaction.md](docs/design-compaction.md). The FUSE / mount design is in [docs/design-fuse.md](docs/design-fuse.md). Environment variables are in [docs/capabilities.md](docs/capabilities.md). Those design docs are currently in Chinese. Benchmark methodology and the full tables are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Architecture overview
 
@@ -69,6 +69,8 @@ A write looks like this:
 2. The same stored bytes are written to N live block nodes (`N = min(configured replicas, live block nodes)`, default 3).
 3. Each successful write returns an extent `recId`. The API writes locator JSON into dleveldb as `bucket/key`, `bucket/key:1`, and so on. User-facing `size` and `crc` are the uncompressed values; `storedSize` and `compressType` describe what is on disk.
 4. A read looks up the locators, skips nodes that are down, fetches by `recId`, and decompresses with the type on that locator.
+
+You can also mount a bucket as a local directory with `s3dfs-fuse`: paths map to object keys, and file bodies still follow the path above into the block store. See [docs/design-fuse.md](docs/design-fuse.md) (currently in Chinese).
 
 ## Quick start
 
@@ -188,9 +190,9 @@ The zstd on-disk ratio is lower than the payload ratio (53.89x) because each rec
 
 ## Implemented and not yet done
 
-Already working: Put / Get / Head / Delete / List, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, per-object compression, TLV records, `recId` locators, locator rebuild by scan, tombstones on delete, and idle or manual compaction that reclaims deleted space without updating the index.
+Already working: Put / Get / Head / Delete / List (including delimiter listing), HTTP Range GET, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, topping up under-replicated objects onto other live block nodes, per-object compression, TLV records, `recId` locators, locator rebuild by scan, a local `recmap.s3m` snapshot so a block node can restart without scanning every `.blk` when the snapshot is valid, tombstones on delete, idle or manual compaction that reclaims deleted space without updating the index, and a first-cut bucket mount client in `apps/fuse`.
 
-Not done yet: multipart upload, full SigV4, erasure coding, automatic repair or migration of object replicas, streaming, and the engine’s uint32 object-size limit. Join catch-up and primary write failover are also still unimplemented in dleveldb: a new index node does not pull historical keys, and if the index primary is unreachable, writes fail.
+Not done yet: multipart upload, full SigV4, erasure coding, streaming, and the engine’s uint32 object-size limit. Replica repair can now add copies onto live nodes, but it does not retire locators for down nodes or rebuild an object that has no live copy left. Join catch-up and primary write failover are also still unimplemented in dleveldb: a new index node does not pull historical keys, and if the index primary is unreachable, writes fail. What can still proceed after a failure, and what cannot, is described in [docs/design-recovery.md](docs/design-recovery.md).
 
 ## Dependencies
 

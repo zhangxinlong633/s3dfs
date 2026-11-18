@@ -75,6 +75,7 @@ const {
   isReplicaLocatorKey,
   isVisibleObjectKey,
   locatorKey,
+  parseByteRange,
 } = await import(pathToFileURL(path.join(root, 'packages/control/src/index.ts')).href);
 
 if (locatorKey('logs/a.log', 0) !== 'logs/a.log' || locatorKey('logs/a.log', 1) !== 'logs/a.log:1') {
@@ -157,6 +158,32 @@ if (listedKeys.join(',') !== 'path/to/comp.bin,path/to/obj.txt') {
   throw new Error(`list should hide replica suffixes and show both objects, got ${JSON.stringify(listed.objects)}`);
 }
 
+const rootListing = await cluster.list('demo', '', undefined, 1000, '/');
+if (rootListing.prefixes.slice().sort().join(',') !== 'path/' || rootListing.objects.length !== 0) {
+  throw new Error(`delimiter list at bucket root expected only path/, got ${JSON.stringify(rootListing)}`);
+}
+const toListing = await cluster.list('demo', 'path/to/', undefined, 1000, '/');
+if (toListing.objects.map((o) => o.key).sort().join(',') !== 'path/to/comp.bin,path/to/obj.txt' || toListing.prefixes.length !== 0) {
+  throw new Error(`delimiter list under path/to/ got ${JSON.stringify(toListing)}`);
+}
+await cluster.put('demo', 'empty-dir/', Buffer.alloc(0));
+const withEmpty = await cluster.list('demo', '', undefined, 1000, '/');
+if (!withEmpty.prefixes.includes('empty-dir/') || !withEmpty.prefixes.includes('path/')) {
+  throw new Error(`empty directory marker should appear as a prefix, got ${JSON.stringify(withEmpty.prefixes)}`);
+}
+
+const ranged = await cluster.getRange('demo', 'path/to/obj.txt', 6, 9);
+if (!ranged || ranged.value.toString() !== 'from' || ranged.totalSize !== payload.length) {
+  throw new Error(`getRange expected "from" of ${payload.length}, got ${ranged && ranged.value.toString()} total=${ranged && ranged.totalSize}`);
+}
+const suffix = parseByteRange('bytes=-4', payload.length);
+if (suffix.kind !== 'partial' || suffix.start !== payload.length - 4 || suffix.end !== payload.length - 1) {
+  throw new Error(`parseByteRange suffix failed: ${JSON.stringify(suffix)}`);
+}
+if (parseByteRange('bytes=100-200', payload.length).kind !== 'unsatisfiable') {
+  throw new Error('parseByteRange should reject a range past the end');
+}
+
 
 const extra = Buffer.from('to-be-deleted-for-compact');
 await cluster.put('demo', 'path/to/gone.txt', extra);
@@ -194,6 +221,33 @@ if (locsAfter[0].recId !== recIdBefore) {
   throw new Error(`index recId must stay stable across compact: ${recIdBefore} -> ${locsAfter[0].recId}`);
 }
 
+const block3 = run(bun, [blockMain], blockEnv('block3', 19102));
+await waitPort(19102);
+await registry.checkAll();
+if (registry.live().length !== 3) {
+  throw new Error(`expected 3 live after block3, got ${registry.live().map((n) => n.nodeId).join(',')}`);
+}
+const beforeRepair = await cluster.locators('demo/path/to/obj.txt');
+if (beforeRepair.length !== 2) {
+  throw new Error(`expected 2 locators before repair, got ${beforeRepair.length}`);
+}
+const repair = await cluster.repair();
+if (repair.repaired < 1) {
+  throw new Error(`expected repair to add replicas, got ${JSON.stringify(repair)}`);
+}
+const afterRepair = await cluster.locators('demo/path/to/obj.txt');
+if (afterRepair.length !== 3 || !afterRepair.some((l) => l.nodeId === 'block3')) {
+  throw new Error(`expected a third copy on block3, got ${JSON.stringify(afterRepair)}`);
+}
+const repairedGet = await cluster.get('demo', 'path/to/obj.txt');
+if (!repairedGet || repairedGet.value.toString() !== payload.toString()) {
+  throw new Error('get after repair mismatch');
+}
+const clocsRepaired = await cluster.locators('demo/path/to/comp.bin');
+if (clocsRepaired.length !== 3) {
+  throw new Error(`comp.bin should be topped up to 3 copies, got ${clocsRepaired.length}`);
+}
+
 const downId = locs[0].nodeId;
 const down = downId === 'block1' ? block1 : block2;
 console.log(`stopping ${downId} to verify replica read`);
@@ -219,4 +273,4 @@ if (await cluster.get('demo', 'path/to/obj.txt')) {
 }
 
 await cleanup();
-console.log('ok: index + two block nodes; put, list, kill one replica, still read, then delete');
+console.log('ok: index + two block nodes; put, list, repair onto a third node, kill one replica, still read, then delete');

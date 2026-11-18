@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone } from './block-client.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
 import { isVisibleObjectKey, locatorKey } from './keys.js';
@@ -5,6 +6,14 @@ import type { IndexClient } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
 import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
 import { ControlError } from './types.js';
+
+export interface RepairReport {
+  scanned: number;
+  alreadyOk: number;
+  repaired: number;
+  skipped: number;
+  failed: number;
+}
 
 export interface ClusterStats {
   objects: number;
@@ -143,6 +152,26 @@ export class ObjectCluster {
     return null;
   }
 
+  async getRange(
+    bucket: string,
+    key: string,
+    start: number,
+    end: number,
+  ): Promise<(ObjectValue & { totalSize: number }) | null> {
+    const got = await this.get(bucket, key);
+    if (!got) {
+      return null;
+    }
+    const totalSize = got.value.length;
+    if (totalSize === 0 || start >= totalSize || start > end) {
+      return { ...got, value: Buffer.alloc(0), size: 0, totalSize };
+    }
+    const from = Math.max(0, start);
+    const to = Math.min(end, totalSize - 1);
+    const value = got.value.subarray(from, to + 1);
+    return { ...got, value, size: value.length, totalSize };
+  }
+
   async head(bucket: string, key: string): Promise<Omit<ObjectValue, 'value'> | null> {
     const locs = this.prefer(await this.locators(this.objectKey(bucket, key)));
     if (!locs[0]) {
@@ -200,22 +229,90 @@ export class ObjectCluster {
     return [...map.entries()].map(([name, mtimeMs]) => ({ name, mtimeMs }));
   }
 
-  async list(bucket: string, prefix = '', startAfter?: string, maxKeys = 1000) {
+  async list(bucket: string, prefix = '', startAfter?: string, maxKeys = 1000, delimiter = '') {
+    const cap = Math.max(1, Math.min(maxKeys || 1000, 10_000));
     const fullPrefix = prefix ? `${bucket}/${prefix}` : `${bucket}/`;
-    const after = startAfter ? `${bucket}/${startAfter}` : undefined;
-    const result = await this.kv.scan({
-      prefix: fullPrefix,
-      startAfter: after,
-      maxKeys: Math.max(maxKeys * 3, maxKeys),
-    });
-    const objects = result.objects
-      .filter((o) => isVisibleObjectKey(o.key) && o.key !== `${bucket}/`)
-      .map((o) => ({
-        ...o,
-        key: o.key.slice(bucket.length + 1),
-      }))
-      .slice(0, maxKeys);
-    return { truncated: result.truncated || objects.length === maxKeys, objects };
+    const bucketPrefix = `${bucket}/`;
+    const objects: { key: string; size: number; crc: number; mtimeMs: number }[] = [];
+    const prefixes: string[] = [];
+    const seenPrefixes = new Set<string>();
+    let scanAfter = startAfter ? `${bucket}/${startAfter}` : undefined;
+    let truncated = false;
+    let lastName: string | undefined;
+
+    const emitted = () => objects.length + prefixes.length;
+    const relativeKey = (full: string) => full.slice(bucketPrefix.length);
+    const visible = (full: string) => isVisibleObjectKey(full) && full !== `${bucket}/`;
+
+    while (emitted() < cap) {
+      const result = await this.kv.scan({
+        prefix: fullPrefix,
+        startAfter: scanAfter,
+        maxKeys: Math.max(cap * 3, 64),
+      });
+      if (result.objects.length === 0) {
+        break;
+      }
+
+      let stoppedEarly = false;
+      for (const obj of result.objects) {
+        scanAfter = obj.key;
+        if (!visible(obj.key)) {
+          continue;
+        }
+        const key = relativeKey(obj.key);
+        if (startAfter && key <= startAfter) {
+          continue;
+        }
+
+        if (delimiter) {
+          const rest = key.startsWith(prefix) ? key.slice(prefix.length) : key;
+          const cut = rest.indexOf(delimiter);
+          if (cut >= 0) {
+            const common = prefix + rest.slice(0, cut + delimiter.length);
+            if (startAfter && common <= startAfter) {
+              continue;
+            }
+            if (seenPrefixes.has(common)) {
+              continue;
+            }
+            seenPrefixes.add(common);
+            prefixes.push(common);
+            lastName = common;
+            if (emitted() >= cap) {
+              stoppedEarly = true;
+              break;
+            }
+            continue;
+          }
+        }
+
+        objects.push({
+          ...obj,
+          key,
+        });
+        lastName = key;
+        if (emitted() >= cap) {
+          stoppedEarly = true;
+          break;
+        }
+      }
+
+      if (emitted() >= cap && (stoppedEarly || result.truncated)) {
+        truncated = true;
+        break;
+      }
+      if (!result.truncated) {
+        break;
+      }
+    }
+
+    return {
+      truncated,
+      objects,
+      prefixes,
+      nextToken: truncated ? lastName : undefined,
+    };
   }
 
   async flush(): Promise<void> {
@@ -270,4 +367,134 @@ export class ObjectCluster {
     }
     return acc;
   }
+
+  /**
+   * Top up objects that have fewer live data copies than
+   * min(configured replicas, live block nodes). Adds copies only; does not
+   * drop locators for down nodes, and cannot rebuild an object with no live source.
+   */
+  async repair(opts: { maxObjects?: number } = {}): Promise<RepairReport> {
+    await this.registry.checkAll();
+    const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0 };
+    const maxObjects = Math.max(1, opts.maxObjects ?? Number.MAX_SAFE_INTEGER);
+    let startAfter: string | undefined;
+    while (report.scanned < maxObjects) {
+      const listed = await this.kv.scan({
+        prefix: '',
+        startAfter,
+        maxKeys: Math.min(1000, maxObjects - report.scanned),
+      });
+      if (listed.objects.length === 0) {
+        break;
+      }
+      for (const obj of listed.objects) {
+        startAfter = obj.key;
+        if (!isVisibleObjectKey(obj.key)) {
+          continue;
+        }
+        report.scanned++;
+        const result = await this.repairObject(obj.key);
+        report[result]++;
+        if (report.scanned >= maxObjects) {
+          break;
+        }
+      }
+      if (!listed.truncated || report.scanned >= maxObjects) {
+        break;
+      }
+    }
+    return report;
+  }
+
+  private async repairObject(objectKey: string): Promise<'alreadyOk' | 'repaired' | 'skipped' | 'failed'> {
+    const parts = splitObjectKey(objectKey);
+    if (!parts) {
+      return 'skipped';
+    }
+    const locs = await this.locators(objectKey);
+    if (locs.length === 0 || locs[0]?.v !== 3) {
+      return 'skipped';
+    }
+    const live = this.registry.live();
+    const wanted = Math.min(this.dataReplicas, live.length);
+    const liveLocs = locs.filter((loc) => live.some((n) => n.nodeId === loc.nodeId));
+    if (wanted <= 0 || liveLocs.length >= wanted) {
+      return liveLocs.length >= wanted && wanted > 0 ? 'alreadyOk' : 'failed';
+    }
+    if (liveLocs.length === 0) {
+      return 'failed';
+    }
+    const held = new Set(locs.map((loc) => loc.nodeId));
+    const targets = this.pickAdditional(objectKey, wanted - liveLocs.length, held);
+    if (targets.length === 0) {
+      return 'failed';
+    }
+    const got = await this.get(parts.bucket, parts.key);
+    if (!got) {
+      return 'failed';
+    }
+    const packed = compressValue(got.value, this.compressType);
+    const digest = got.crc || crc32(got.value);
+    const accepted: ObjectLocator[] = [];
+    let nextReplica = Math.max(-1, ...locs.map((loc) => loc.replica)) + 1;
+    for (const node of targets) {
+      try {
+        const ev = await blockPut(node.address, objectKey, packed.stored, {
+          compressType: packed.compressType,
+          origSize: got.value.length,
+          origCrc: digest,
+        });
+        accepted.push({
+          v: 3,
+          replica: nextReplica,
+          replicaCount: locs.length + accepted.length + 1,
+          nodeId: node.nodeId,
+          address: node.address,
+          recId: ev.recId,
+          chained: ev.chained,
+          generation: ev.generation,
+          extentCount: ev.extentCount,
+          size: got.value.length,
+          storedSize: ev.size,
+          compressType: packed.compressType,
+          crc: digest,
+          mtimeMs: ev.mtimeMs,
+        });
+        nextReplica++;
+      } catch {
+        // Try the remaining targets; a partial top-up is still progress.
+      }
+    }
+    if (accepted.length === 0) {
+      return 'failed';
+    }
+    const all = [...locs, ...accepted];
+    for (let i = 0; i < all.length; i++) {
+      all[i]!.replicaCount = all.length;
+      await this.kv.put(locatorKey(objectKey, all[i]!.replica), Buffer.from(JSON.stringify(all[i])));
+    }
+    return 'repaired';
+  }
+
+  private pickAdditional(objectKey: string, need: number, held: Set<string>) {
+    const live = this.registry.live().filter((n) => !held.has(n.nodeId));
+    if (live.length === 0 || need <= 0) {
+      return [];
+    }
+    const want = Math.min(need, live.length);
+    const start = live.length === 1 ? 0 : createHash('sha1').update(objectKey).digest().readUInt32BE(0) % live.length;
+    const out: typeof live = [];
+    for (let i = 0; i < live.length && out.length < want; i++) {
+      out.push(live[(start + i) % live.length]!);
+    }
+    return out;
+  }
+}
+
+function splitObjectKey(objectKey: string): { bucket: string; key: string } | null {
+  const slash = objectKey.indexOf('/');
+  if (slash <= 0) {
+    return null;
+  }
+  return { bucket: objectKey.slice(0, slash), key: objectKey.slice(slash + 1) };
 }

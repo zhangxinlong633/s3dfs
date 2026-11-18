@@ -44,6 +44,7 @@ try {
   const files = fs.readdirSync(path.join(dir, 'blocks')).filter((n) => n.endsWith('.blk')).sort();
   assert(files.length === stats.blockFiles, 'block file count mismatch');
   assert(!fs.existsSync(path.join(dir, 'index')), 'local index directory should not exist');
+  assert(fs.existsSync(path.join(dir, 'recmap.s3m')), 'recmap snapshot should be written on close');
 
   const store2 = new addon.Store(dir, { blockSize, bufferSize: 64 * 1024, fsyncOnFlush: true });
   const got2 = store2.get('a/big', bigLoc);
@@ -80,6 +81,12 @@ try {
   const gone = store3.get('a/small', smallLoc);
   assert(!gone, 'deleted object should stay gone after compact+reopen');
   store3.close();
+  assert(fs.existsSync(path.join(dir, 'recmap.s3m')), 'recmap snapshot should exist after compact and close');
+  fs.writeFileSync(path.join(dir, 'recmap.s3m'), Buffer.from('not-a-valid-recmap'));
+  const store4 = new addon.Store(dir, { blockSize, bufferSize: 64 * 1024, fsyncOnFlush: true });
+  const afterCorrupt = store4.get('a/big', bigLoc);
+  assert(afterCorrupt && afterCorrupt.value.equals(payload), 'get after a corrupt recmap should fall back to a full scan');
+  store4.close();
   console.log('ok', { dir, size: payload.length, blocks: stats.blockFiles, last: bigLoc, scanned: scanned.length, compacted });
 } catch (err) {
   try { store.close(); } catch {}
