@@ -72,8 +72,8 @@ S3 层把对象记成字面量 `bucket/key`。Put 时按 key 的哈希从存活�
 
 ## 目录挂载（FUSE）
 
-本机目录挂载由独立的 `apps/fuse`（`s3dfs-fuse`）完成，它只把路径映射成对象 key，存储仍走上面的 S3 API，不改 packed-block 或 dleveldb。
+能直接访问对象时，应使用 S3 API。本机目录挂载由独立的 `apps/fuse`（`s3dfs-fuse`）完成，只是兼容层：把路径映射成对象 key，存储仍走上面的 S3 API，不改 packed-block 或 dleveldb。它不是更快的写入路径。
 
 挂载点对应的是整个桶，不是桶里的一条空 key。根目录通常也不单独存记录。文件 `dir1/a.txt` 就是对象 `bucket/dir1/a.txt`，正文作为 TLV 记录追加进 `.blk`；多个文件叠在同一个或几个 block 文件里。目录是 key 前缀，加上可选的空标记对象 `dir1/`。
 
-应用侧是 `open` / `read` / `write` / `close`。写先落到客户端临时文件，`close` 时才整文件 Put，不是每次 `write()` 都追加一条记录。修改会再写一条新记录，旧记录变成空洞；删除打墓碑。改名是按新路径再写一份，再删旧 key。空洞留给 compact 清理。完整说明见 [在对象存储上加一层可远程挂载的 FUSE](design-fuse.md)。
+应用侧是 `open` / `read` / `write` / `close`。写先落到客户端临时文件，`close` 时才整文件 Put，不是每次 `write()` 都追加一条记录。修改会再写一条新记录，旧记录变成空洞；删除打墓碑。改名是按新路径再写一份，再删旧 key。空洞留给 compact 清理。每个文件都是一次完整对象上传，再叠加 FUSE 或 WebDAV 的额外请求，所以小文件会明显慢于直接 Put；没有 macFUSE 的 macOS 还要多一层本机 WebDAV。完整说明见 [在对象存储上加一层可远程挂载的 FUSE](design-fuse.md)。

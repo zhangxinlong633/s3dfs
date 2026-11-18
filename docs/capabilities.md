@@ -1,8 +1,10 @@
 # s3dfs 能力
 
+产品主路径是 S3 API。能直接用对象接口的应用，应走 Put / Get / Head / Delete / List，这才是存储要发挥的方式。本机目录挂载是兼容层，给只认路径和 `open` / `read` / `write` 的程序用，不能代替协议，也不应当拿挂载速度来代表存储本身的性能。
+
 ## 已经可以做的
 
-- S3 风格的 Put / Get / Head / Delete / List，以及创建桶；List 支持 `delimiter` 与 CommonPrefixes；GET / HEAD 支持单个 HTTP `Range`（206）
+- S3 风格的 Put / Get / Head / Delete / List，以及创建桶；List 支持 `delimiter` 与 CommonPrefixes；GET / HEAD 支持单个 HTTP `Range`（206）。这是推荐的访问方式
 - 对象索引放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群（建议 3–5 台）；对象正文放在可大量扩展的 block 机器上
 - 对象打进追加式 block 文件，而不是一个对象一个目录；inode 和磁盘文件数跟 block 文件走，不跟对象数走
 - 对象按 key 哈希分散到多台 block；locator 留在 dleveldb。存储侧的对象规模主要是 KV 里的 key 数，而不是本地文件系统的 inode 数
@@ -17,7 +19,7 @@
 - 打开 block 时扫描各文件末尾的完整记录，接着追加。`recId` 映射会写到节点本地的 `recmap.s3m`；重启时优先读快照并补扫新数据，快照不可用则扫描全部 `.blk`。不是再引入一份本地 LevelDB
 - 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact|repair`
 - 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
-- 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录。路径对应对象 key，内容按普通对象进 block；写入采用关闭时整文件上传。Linux 走 `/dev/fuse`；本机没有 FUSE 时，在 macOS 上通过本机 WebDAV 加 `mount_webdav` 挂载
+- 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录，给改不了 S3 接口的程序用。路径对应对象 key，内容仍走 S3 API 再进 block；写入是关闭时整文件上传，每个文件一次完整 Put。Linux 走 `/dev/fuse`；本机没有 FUSE 时，macOS 会再经过本机 WebDAV 和 `mount_webdav`，会更慢。挂载尤其是大量小文件时，明显慢于直接调用 S3 API，不要用这些数字代表引擎或集群性能。说明见 [FUSE 方案](design-fuse.md)
 
 ## 还不做的
 

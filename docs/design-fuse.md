@@ -1,10 +1,10 @@
 # 在对象存储上加一层可远程挂载的 FUSE（方案）
 
-这套方案的**第一期已经落地**。对象存储之上加了一个独立的挂载进程 `apps/fuse`（`s3dfs-fuse`），把一个桶映射成本地目录。不改 packed-block 引擎，也不把 POSIX 语义做进 `.blk` 或 dleveldb。
+这套方案的**第一期已经落地**。它是对象存储上的兼容层，不是更快的写入路径。能直接使用 S3 API 的应用应当走 Put / Get，不要为了性能去挂载。独立进程 `apps/fuse`（`s3dfs-fuse`）把一个桶映射成本地目录，给只认路径和 `open` / `read` / `write` 的程序用。不改 packed-block 引擎，也不把 POSIX 语义做进 `.blk` 或 dleveldb。
 
-已经做的：S3 List 支持 `delimiter=/` 和 CommonPrefixes；GET/HEAD 支持单个 `Range`（HTTP 206）。挂载层采用关闭时整文件上传，目录是对象前缀。Linux 上通过 `/dev/fuse`（`go-fuse`）挂载。本机没有 FUSE 内核接口时（例如未安装 macFUSE 的 macOS），同一进程会在本机开一个 WebDAV，再用系统的 `mount_webdav` 挂上，语义与第一期约定相同。流式传输、分片上传、服务端 Copy、完整签名，以及 macFUSE / FUSE-T 仍属于后续阶段。
+已经做的：S3 List 支持 `delimiter=/` 和 CommonPrefixes；GET/HEAD 支持单个 `Range`（HTTP 206）。挂载层采用关闭时整文件上传，目录是对象前缀。Linux 上通过 `/dev/fuse`（`go-fuse`）挂载。本机没有 FUSE 内核接口时（例如未安装 macFUSE 的 macOS），同一进程会在本机开一个 WebDAV，再用系统的 `mount_webdav` 挂上，语义与第一期约定相同，但会多一层协议，通常更慢。流式传输、分片上传、服务端 Copy、完整签名，以及 macFUSE / FUSE-T 仍属于后续阶段。
 
-FUSE 本身不是网络文件系统协议。远程访问靠客户端本机跑一个挂载进程，再通过 HTTP 访问集群的 S3 API。看起来像本地目录，底下仍是对象的 Put / Get。
+FUSE 本身不是网络文件系统协议。远程访问靠客户端本机跑一个挂载进程，再通过 HTTP 访问集群的 S3 API。看起来像本地目录，底下仍是对象的 Put / Get。每个文件在关闭时都是一次完整对象上传，再叠加 FUSE 或 WebDAV 的元数据请求，所以大量小文件会明显慢于直接调用 S3 API。不要用挂载目录上测到的文件数/秒去代表引擎或集群性能。Linux 上上传发生在 FUSE 的 `Release` 里，`Flush` 目前是空操作，应用侧的 `close` 可能在对象对 API 可见之前就返回；这和「关闭成功后应当能马上读到自己写的内容」还有差距。
 
 ## 要解决的问题
 
@@ -26,7 +26,7 @@ FUSE 本身不是网络文件系统协议。远程访问靠客户端本机跑一
 - 集群侧继续只提供对象接口。挂载进程是普通 S3 客户端，外加目录列举、本地暂存这些文件系统需要的逻辑。
 - 不要为了 FUSE 去改 `recId`、compact、副本或压缩。这些仍然只服务对象存储。
 
-可选的后路是：S3 补齐后，直接用 s3fs、goofys 去挂。先自研一层的原因是当前 API 还不完整（没有 Range、Multipart、delimiter 列举、完整签名），现成工具很难用好。等 S3 够用了，也可以把自研 FUSE 换成这些工具，集群不用再改。
+可选的后路是：S3 再补齐后，也可以直接用 s3fs、goofys 去挂。先自研一层，是因为当时 API 还缺 delimiter 列举和 Range；这两项现在已经有了，但还没有 Multipart、流式读写和完整签名，现成工具仍不一定好用。等 S3 更完整之后，也可以把自研 FUSE 换成这些工具，集群不用再改。产品主路径仍然是把 S3 协议做好。
 
 语言上用 Go（`go-fuse`）做一个小二进制，而不是在 Nest/TypeScript 里做 FUSE。Linux 对接 `/dev/fuse`（当前不依赖 fuse3）；macOS 若没有 macFUSE，则走本机 WebDAV。
 
@@ -136,7 +136,7 @@ s3dfs-fuse --endpoint http://127.0.0.1:9000 --bucket mybucket /mnt/s3dfs
 
 1. **方案（本文）**：已按此实现第一期。
 2. **API 预留**：已做 `delimiter` 列举和 Range Get。Range 在控制面仍是先取完整对象再切片，还没有沿 extent 链只读所需段；压缩过的对象也需要先解压。
-3. **挂载第一期**：`apps/fuse` 已实现单桶挂载，`stat` / `ls` / 读、write-on-close 写、删除、mkdir/rmdir、文件改名（复制再删除）。小文件为主。Linux 走 `/dev/fuse`；没有 macFUSE 时走本机 WebDAV。
+3. **挂载第一期**：`apps/fuse` 已实现单桶挂载，`stat` / `ls` / 读、write-on-close 写、删除、mkdir/rmdir、文件改名（复制再删除）。小文件为主。Linux 走 `/dev/fuse`；没有 macFUSE 时走本机 WebDAV。这只是兼容，不是性能路径。
 4. **大文件**：流式和分片上传就绪后，再让大文件读写走 Range / multipart，而不是整对象进内存。
 5. **可选**：服务端 Copy、鉴权、多桶根挂载、macFUSE / FUSE-T，以及 Kubernetes CSI。CSI 只是把本机挂载或同样的对象访问接到卷生命周期上，不是另一套存储。
 

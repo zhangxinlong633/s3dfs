@@ -70,7 +70,7 @@ A write looks like this:
 3. Each successful write returns an extent `recId`. The API writes locator JSON into dleveldb as `bucket/key`, `bucket/key:1`, and so on. User-facing `size` and `crc` are the uncompressed values; `storedSize` and `compressType` describe what is on disk.
 4. A read looks up the locators, skips nodes that are down, fetches by `recId`, and decompresses with the type on that locator.
 
-You can also mount a bucket as a local directory with `s3dfs-fuse`: paths map to object keys, and file bodies still follow the path above into the block store. See [docs/design-fuse.md](docs/design-fuse.md) (currently in Chinese).
+When an application can speak the object API, it should use the S3 API. You can also mount a bucket as a local directory with `s3dfs-fuse` for programs that only understand paths: keys and bodies still follow the path above into the block store. The mount is a compatibility layer. Each file close is still a full object Put, so many small files are much slower than calling the API directly; do not treat mount throughput as the store's performance. See [docs/design-fuse.md](docs/design-fuse.md) (currently in Chinese).
 
 ## Quick start
 
@@ -190,7 +190,7 @@ The zstd on-disk ratio is lower than the payload ratio (53.89x) because each rec
 
 ## Implemented and not yet done
 
-Already working: Put / Get / Head / Delete / List (including delimiter listing), HTTP Range GET, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, topping up under-replicated objects onto other live block nodes, per-object compression, TLV records, `recId` locators, locator rebuild by scan, a local `recmap.s3m` snapshot so a block node can restart without scanning every `.blk` when the snapshot is valid, tombstones on delete, idle or manual compaction that reclaims deleted space without updating the index, and a first-cut bucket mount client in `apps/fuse`.
+Already working: Put / Get / Head / Delete / List (including delimiter listing), HTTP Range GET, create bucket, a split index and block deployment, default 3 object-body replicas, reads from remaining replicas after a block copy is down, topping up under-replicated objects onto other live block nodes, per-object compression, TLV records, `recId` locators, locator rebuild by scan, a local `recmap.s3m` snapshot so a block node can restart without scanning every `.blk` when the snapshot is valid, tombstones on delete, and idle or manual compaction that reclaims deleted space without updating the index. There is a first-cut bucket mount client in `apps/fuse` for apps that only understand local paths; the S3 API remains the primary interface, and mount speed is not the store's performance.
 
 Not done yet: multipart upload, full SigV4, erasure coding, streaming, and the engine’s uint32 object-size limit. Replica repair can now add copies onto live nodes, but it does not retire locators for down nodes or rebuild an object that has no live copy left. Join catch-up and primary write failover are also still unimplemented in dleveldb: a new index node does not pull historical keys, and if the index primary is unreachable, writes fail. What can still proceed after a failure, and what cannot, is described in [docs/design-recovery.md](docs/design-recovery.md).
 

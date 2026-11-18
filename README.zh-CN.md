@@ -70,7 +70,7 @@ flowchart TB
 3. 每次成功写入会返回一个 `recId`。API 把 locator JSON 写进 dleveldb，键是 `bucket/key`、`bucket/key:1` 等。对外的 `size` 和 `crc` 是未压缩值；`storedSize` 和 `compressType` 描述盘上实际内容。
 4. 读取时先查 locator，跳过宕机节点，按 `recId` 取数据，再用该 locator 上的类型解压。
 
-也可以用 `s3dfs-fuse` 把一个桶挂成本地目录：路径对应对象 key，内容仍按上面的方式进 block。说明见 [docs/design-fuse.md](docs/design-fuse.md)。
+能直接访问对象时，应走 S3 API。也可以用 `s3dfs-fuse` 把一个桶挂成本地目录，给只认路径的程序用：路径对应对象 key，内容仍按上面的方式进 block。挂载是兼容层，每个文件关闭时仍是一次完整 Put，尤其是小文件会明显慢于直接调用 API，不要用挂载速度代表存储性能。说明见 [docs/design-fuse.md](docs/design-fuse.md)。
 
 ## 快速开始
 
@@ -190,7 +190,7 @@ zstd 的盘上比低于 payload 比（53.89x），因为每条记录还带有 TL
 
 ## 已经实现和还没有做的
 
-已经可以：Put / Get / Head / Delete / List（含 delimiter 列举）、HTTP Range GET、创建桶、索引和 block 分开部署、默认 3 份对象正文副本、一份 block 副本宕机后从剩余副本读取、活副本不足时自动或手动补齐到其他存活节点、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、block 节点用本地 `recmap.s3m` 加快重启（快照不可用则仍全量扫描）、删除写墓碑、空闲或手动 compact（回收空洞时不必改索引），以及 `apps/fuse` 里的第一期桶挂载程序。
+已经可以：Put / Get / Head / Delete / List（含 delimiter 列举）、HTTP Range GET、创建桶、索引和 block 分开部署、默认 3 份对象正文副本、一份 block 副本宕机后从剩余副本读取、活副本不足时自动或手动补齐到其他存活节点、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、block 节点用本地 `recmap.s3m` 加快重启（快照不可用则仍全量扫描）、删除写墓碑、空闲或手动 compact（回收空洞时不必改索引）。`apps/fuse` 里有第一期桶挂载程序，给只认本地路径的应用做兼容；产品主路径仍是 S3 API，挂载速度不代表存储本身的性能。
 
 还没有做：分片上传、完整 SigV4、纠删码、流式读写，以及引擎的 uint32 对象大小上限。对象副本补齐的第一期已经有了，但不会退役失效 locator，也救不回已经没有活副本的对象。dleveldb 的加入迁移和 primary 写故障转移也还未实现：新索引节点不会自动拉历史 key；索引主节点不可达时，写入会失败。故障时哪些请求还能继续、哪些不能，见 [docs/design-recovery.md](docs/design-recovery.md)。
 
