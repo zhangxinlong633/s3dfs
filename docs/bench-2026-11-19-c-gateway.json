@@ -1,0 +1,209 @@
+{
+  "unofficial": true,
+  "label": "exploratory C S3 gateway vs same-stack ObjectCluster, 2026-11-19",
+  "measuredAt": "2026-11-19T08:33:12.079Z",
+  "timeZone": "Asia/Shanghai",
+  "platform": "darwin arm64",
+  "cpus": 15,
+  "model": "Apple M5 Pro",
+  "memoryBytes": 51539607552,
+  "method": {
+    "path": "isolated stack under /tmp/s3dfs-c-gw-probe",
+    "ports": {
+      "index": 39100,
+      "block": 39101,
+      "cGateway": 39102
+    },
+    "compress": "none",
+    "dataReplicas": 1,
+    "dleveldbSync": "default true (unset)",
+    "body": "1KiB 0x61 (and optional 1MiB 0x61)",
+    "warmup": 500,
+    "ops": 5000,
+    "concurrency": [
+      1,
+      32
+    ],
+    "s3Client": "node:http keep-alive Agent against C gateway",
+    "clusterClient": "packages/control ObjectCluster against the same index+block (no S3 gateway)",
+    "note": "Not official pnpm bench. Official file docs/bench-2026-11-17.json was not modified."
+  },
+  "capability": {
+    "allPass": true,
+    "results": [
+      {
+        "name": "create bucket",
+        "ok": true,
+        "status": 200
+      },
+      {
+        "name": "list buckets",
+        "ok": true,
+        "status": 200
+      },
+      {
+        "name": "put object",
+        "ok": true,
+        "status": 200,
+        "etag": "\"42eb3ec7\""
+      },
+      {
+        "name": "get object",
+        "ok": true,
+        "status": 200,
+        "bytes": 21
+      },
+      {
+        "name": "head object",
+        "ok": true,
+        "status": 200,
+        "contentLength": "21"
+      },
+      {
+        "name": "list objects",
+        "ok": true,
+        "status": 200
+      },
+      {
+        "name": "list delimiter=/",
+        "ok": true,
+        "status": 200,
+        "note": "common prefix a/"
+      },
+      {
+        "name": "get range 206",
+        "ok": true,
+        "status": 206,
+        "body": "s3dfs",
+        "contentRange": "bytes 6-10/21"
+      },
+      {
+        "name": "overwrite",
+        "ok": true,
+        "status": 200
+      },
+      {
+        "name": "delete 204",
+        "ok": true,
+        "status": 204
+      },
+      {
+        "name": "get 404 after delete",
+        "ok": true,
+        "status": 404
+      },
+      {
+        "name": "head 404 after delete",
+        "ok": true,
+        "status": 404
+      },
+      {
+        "name": "list omits deleted key",
+        "ok": true,
+        "status": 200
+      }
+    ]
+  },
+  "bench": [
+    {
+      "name": "c-gateway S3 put 1KiB seq",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 1,
+      "opsPerSec": 5160.753604205808,
+      "p50Ns": 179875,
+      "p99Ns": 437500,
+      "elapsedSec": 0.96885075
+    },
+    {
+      "name": "c-gateway S3 get 1KiB seq",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 1,
+      "opsPerSec": 6289.488814966179,
+      "p50Ns": 148500,
+      "p99Ns": 337625,
+      "elapsedSec": 0.794977167
+    },
+    {
+      "name": "c-gateway S3 put 1KiB 32-in-flight",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 32,
+      "opsPerSec": 18371.312727809327,
+      "p50Ns": 1658333,
+      "p99Ns": 3268625,
+      "elapsedSec": 0.272163458
+    },
+    {
+      "name": "c-gateway S3 get 1KiB 32-in-flight",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 32,
+      "opsPerSec": 24921.714663812298,
+      "p50Ns": 1214667,
+      "p99Ns": 2599917,
+      "elapsedSec": 0.20062825
+    },
+    {
+      "name": "c-gateway S3 put 1MiB seq",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 1,
+      "opsPerSec": 202.05232527852243,
+      "p50Ns": 4850250,
+      "p99Ns": 6938375,
+      "elapsedSec": 0.395937042,
+      "mibPerSec": 202.05232527852243
+    },
+    {
+      "name": "ObjectCluster put 1KiB seq (same stack)",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 1,
+      "opsPerSec": 6231.293780696226,
+      "p50Ns": 146167,
+      "p99Ns": 355625,
+      "elapsedSec": 0.802401584
+    },
+    {
+      "name": "ObjectCluster get 1KiB seq (same stack)",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 1,
+      "opsPerSec": 8506.212649358482,
+      "p50Ns": 109917,
+      "p99Ns": 230917,
+      "elapsedSec": 0.587805667
+    },
+    {
+      "name": "ObjectCluster put 1KiB 32-in-flight (same stack)",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 32,
+      "opsPerSec": 28272.021242737294,
+      "p50Ns": 1044917,
+      "p99Ns": 2531667,
+      "elapsedSec": 0.176853291
+    },
+    {
+      "name": "ObjectCluster get 1KiB 32-in-flight (same stack)",
+      "ops": 5000,
+      "warmup": 500,
+      "inflight": 32,
+      "opsPerSec": 30327.215430230037,
+      "p50Ns": 545416,
+      "p99Ns": 1942750,
+      "elapsedSec": 0.164868417
+    }
+  ],
+  "officialPublishedForReference": {
+    "source": "docs/bench-2026-11-17.json (official, do not treat this probe as a replacement)",
+    "measuredAt": "2026-11-17T00:40+08:00",
+    "method": "in-process ObjectCluster.put/get, HTTP to index+block, not via S3 gateway",
+    "cluster put 1KiB N=1 none seq": 6937,
+    "cluster get 1KiB N=1 none seq": 8869,
+    "cluster put 1KiB N=1 none 32-in-flight": 31119,
+    "cluster get 1KiB N=1 none 32-in-flight": 51859
+  }
+}
