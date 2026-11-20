@@ -72,8 +72,11 @@ export class ObjectCluster {
         });
       }
     }
-    if (accepted.length === 0) {
-      throw new ControlError('BLOCK_UNAVAILABLE', `failed to write ${objectKey} to any block node`);
+    if (accepted.length !== targets.length) {
+      throw new ControlError(
+        'BLOCK_UNAVAILABLE',
+        `wrote ${accepted.length} of ${targets.length} replicas for ${objectKey}`,
+      );
     }
     for (let i = 0; i < accepted.length; i++) {
       const ev = accepted[i]!;

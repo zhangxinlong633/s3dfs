@@ -612,8 +612,12 @@ static int handle_object(cluster_t *c, const http_in_t *in, const char *bucket, 
 
 int s3_handle(cluster_t *cluster, const http_in_t *in, http_out_t *out)
 {
-    /* SigV4 is enforced by the Nest API when access keys are set. This gateway
-       decodes aws-chunked bodies and accepts multipart uploads in memory. */
+    int auth_status = 0;
+    const char *auth_code = NULL;
+    const char *auth_message = NULL;
+    if (s3_sigv4_verify(in, (int64_t)time(NULL) * 1000, &auth_status, &auth_code, &auth_message) != 0) {
+        return error_xml(out, auth_status, auth_code, auth_message, NULL);
+    }
     if (!strncmp(in->path, "/_s3dfs", 7) && (in->path[7] == '\0' || in->path[7] == '/')) {
         return http_reply(out, 404, NULL, NULL, 0);
     }

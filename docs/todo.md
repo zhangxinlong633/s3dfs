@@ -1,14 +1,24 @@
-# 还没有做的
+# 离生产级还差什么
 
-和 RustFS 的对照在 [diff/rustfs.md](diff/rustfs.md)。下面只记还没做的。
+和 RustFS 的对照在 [diff/rustfs.md](diff/rustfs.md)。下面只记还不能放到不可信网络、不能当唯一副本的缺口。纠删码、Helm、Swift、SFTP 不是这条产品的生产门槛。
 
-## 还差的 S3 和故障行为
+## 数据不能少写
 
-- C S3 网关的 SigV4。`S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY` 目前只在 Nest API 上校验请求头签名和预签名 URL。
-- 单次 Put 仍会在 API 进程里把 body 攒齐。引擎可以用 `putChunks` 按块追加，对象总长可以超过 `uint32`；分片完成时仍是一次整对象写入。
-- dleveldb 的历史追平。控制面发现当前索引地址失败时会改走下一个 `S3DFS_INDEX_URLS`，但新索引节点不会在这个仓库里被灌入历史 key。
-- 在多机网络上补一轮和 RustFS 同量级的小对象 / 大对象对照，写进 benchmarks。本机数字不能当选型结论。
+- 单次 Put 和分片完成不要在 API 进程里攒下整个对象。引擎已有 `putChunks`，HTTP 入口仍先把 body 收进一个 Buffer。
+- 未完成分片的正文改存 block。索引只留清单。现在分片正文直接进 dleveldb。C 网关的分片还在进程内存里，重启就丢。
+- C 网关还没有校验 aws-chunked 的分块签名。请求头和预签名已经和 Nest API 用同一套 SigV4。
+- dleveldb 新节点追平历史 key。控制面只会在配置的地址之间切换。
 
-## 明确排后
+## 对外之前要能拒绝陌生人
 
-纠删码存储类、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP。这些不在当前存储路径上。
+- 进程监听地址和「没配密钥就完全开放」要在部署说明里写死。公网入口必须配密钥，TLS 由前面的反向代理做。
+- C 网关只认 `x-amz-date`。只有 `Date`、没有 `x-amz-date` 的请求会被拒绝。
+
+## 能看出来它是不是活着
+
+- 请求日志里带上已经返回的 `RequestId`，并有一个不需要控制台的计数接口。
+- 在多机上补一轮小对象和大对象的数字，写进 benchmarks。本机数字不能当上线结论。
+
+## 明确不是当前生产门槛
+
+纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP、多用户 IAM、KMS。单密钥加密和一份桶策略已经够开发使用，不够当多租户。

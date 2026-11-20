@@ -806,7 +806,7 @@ int cluster_put(cluster_t *c, const char *bucket, const char *key, const void *v
         }
     }
     free(packed);
-    if (na == 0) {
+    if (na != nt) {
         return S3DFS_ERR_UNAVAILABLE;
     }
     buf_t js = {0};

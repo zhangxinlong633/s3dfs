@@ -143,10 +143,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    const char *access_key = getenv("S3DFS_ACCESS_KEY");
+    const char *secret_key = getenv("S3DFS_SECRET_KEY");
+    s3_set_credentials(access_key, secret_key);
+
     int workers = env_workers();
-    log_info("s3dfs C S3 gateway listening on %s:%d  workers=%d  compress=%s  replicas=%d  index=%s", host, port,
-             workers, compress_name(compress), replicas, index_urls);
-    /* First-cut limitations: no SigV4, no multipart, no chunked upload, auth is none. */
+    log_info("s3dfs C S3 gateway listening on %s:%d  workers=%d  compress=%s  replicas=%d  index=%s  auth=%s", host, port,
+             workers, compress_name(compress), replicas, index_urls, (access_key && access_key[0] && secret_key && secret_key[0]) ? "sigv4" : "open");
 
     worker_arg_t wa = {.listen_fd = lfd, .cluster = &cluster};
     pthread_t *th = calloc((size_t)workers, sizeof(pthread_t));

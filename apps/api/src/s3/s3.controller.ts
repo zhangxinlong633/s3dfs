@@ -3,7 +3,7 @@ import type { Request, Response } from 'express';
 import { ControlError } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
 import { handleS3, type S3Options } from './handle';
-import { IndexConfigStore, IndexUploadStore, IndexVersionStore } from './index-store';
+import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
 import { MultipartUploads } from './multipart';
 import { errorXml } from './s3.xml';
 
@@ -43,12 +43,19 @@ export class S3Controller {
       sseSecret: process.env.S3DFS_SSE_KEY,
       config: new IndexConfigStore(this.engine.index()),
       versions: new IndexVersionStore(this.engine.index()),
+      meta: new IndexObjectMeta(this.engine.index()),
+      maxObjectBytes: Number(process.env.S3DFS_MAX_OBJECT_BYTES ?? 1024 * 1024 * 1024),
     };
   }
 
   @All('{*splat}')
   async handle(@Req() req: RawReq, @Res() res: Response): Promise<void> {
     const url = new URL(req.originalUrl || req.url, 'http://127.0.0.1');
+    if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
+      const ok = await this.engine.index().ping();
+      res.status(ok ? 200 : 503).json({ ok });
+      return;
+    }
     if (url.pathname === '/_s3dfs' || url.pathname.startsWith('/_s3dfs/')) {
       res.status(404).end();
       return;

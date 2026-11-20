@@ -1,5 +1,4 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
-import type { UploadStore } from './multipart';
 import { S3HttpError } from './multipart';
 
 export interface PolicyStatement {
@@ -226,4 +225,24 @@ export function parseLifecycle(body: string): LifecycleRule[] {
   return rules;
 }
 
-export type { UploadStore };
+export interface ObjectUserMeta {
+  save(bucket: string, key: string, meta: Record<string, string>): Promise<void>;
+  load(bucket: string, key: string): Promise<Record<string, string>>;
+  remove(bucket: string, key: string): Promise<void>;
+}
+
+export class MemoryObjectMeta implements ObjectUserMeta {
+  readonly rows = new Map<string, Record<string, string>>();
+
+  async save(bucket: string, key: string, meta: Record<string, string>): Promise<void> {
+    this.rows.set(`${bucket}/${key}`, { ...meta });
+  }
+
+  async load(bucket: string, key: string): Promise<Record<string, string>> {
+    return { ...(this.rows.get(`${bucket}/${key}`) ?? {}) };
+  }
+
+  async remove(bucket: string, key: string): Promise<void> {
+    this.rows.delete(`${bucket}/${key}`);
+  }
+}

@@ -13,6 +13,7 @@ import {
   sealObject,
   sseKeyFromSecret,
   type ConfigStore,
+  type ObjectUserMeta,
   type VersionStore,
 } from './product';
 import { verifyChunkSignatures, verifySigV4, type SigV4Identity } from './sigv4';
@@ -76,6 +77,9 @@ export interface S3Options {
   sseSecret?: string;
   config?: ConfigStore;
   versions?: VersionStore;
+  meta?: ObjectUserMeta;
+  /** Reject a single Put or part larger than this. Unset means no limit. */
+  maxObjectBytes?: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -154,6 +158,57 @@ function isBucketAdmin(req: S3Request): boolean {
 
 function etagHeaders(crc: number): Record<string, string> {
   return { ETag: etagFromCrc(crc), 'x-s3dfs-etag-algorithm': 'crc32' };
+}
+
+function stripEtag(value: string): string {
+  return value.trim().replaceAll('"', '').toLowerCase();
+}
+
+function userMeta(headers: S3Request['headers']): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, raw] of Object.entries(headers)) {
+    const key = name.toLowerCase();
+    if (!key.startsWith('x-amz-meta-') || raw === undefined) {
+      continue;
+    }
+    out[key] = Array.isArray(raw) ? (raw[0] ?? '') : raw;
+  }
+  return out;
+}
+
+function assertObjectSize(body: Buffer, max: number | undefined): void {
+  if (max !== undefined && max > 0 && body.length > max) {
+    throw new S3HttpError(400, 'EntityTooLarge', `Object is larger than ${max} bytes`);
+  }
+}
+
+async function assertPreconditions(
+  backend: S3Backend,
+  bucket: string,
+  key: string,
+  headers: S3Request['headers'],
+  method: string,
+): Promise<S3Response | null> {
+  const match = header(headers, 'if-match');
+  const none = header(headers, 'if-none-match');
+  if (!match && !none) {
+    return null;
+  }
+  const meta = await backend.head(bucket, key);
+  const etag = meta ? stripEtag(etagFromCrc(meta.crc)) : '';
+  if (match && match.trim() !== '*' && (!meta || stripEtag(match) !== etag)) {
+    return xml(412, errorXml('PreconditionFailed', 'If-Match failed', `/${bucket}/${key}`));
+  }
+  if (match && match.trim() === '*' && !meta) {
+    return xml(412, errorXml('PreconditionFailed', 'If-Match failed', `/${bucket}/${key}`));
+  }
+  if (none && method === 'PUT' && none.trim() === '*' && meta) {
+    return xml(412, errorXml('PreconditionFailed', 'If-None-Match failed', `/${bucket}/${key}`));
+  }
+  if (none && method !== 'PUT' && meta && (none.trim() === '*' || stripEtag(none) === etag)) {
+    return empty(304, etagHeaders(meta.crc));
+  }
+  return null;
 }
 
 export async function handleS3(
@@ -295,6 +350,20 @@ async function handleBucket(
       body: Buffer.from(JSON.stringify(result)),
     };
   }
+  if (req.query.has('delete') && method === 'POST') {
+    const body = req.body.toString('utf8');
+    const keys = [...body.matchAll(/<Key>\s*([^<]*?)\s*<\/Key>/gi)].map((match) => match[1] ?? '').filter((key) => key.length > 0);
+    const quiet = /<Quiet>\s*true\s*<\/Quiet>/i.test(body);
+    const rows: string[] = [];
+    for (const objectKey of keys) {
+      await backend.delete(bucket, objectKey);
+      await options.meta?.remove(bucket, objectKey);
+      if (!quiet) {
+        rows.push(`<Deleted><Key>${objectKey.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</Key></Deleted>`);
+      }
+    }
+    return xml(200, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${rows.join('')}</DeleteResult>`);
+  }
   if (method === 'PUT') {
     await backend.createBucket(bucket);
     return empty(200);
@@ -382,7 +451,9 @@ async function handleObject(
   }
   if (uploadId && method === 'PUT') {
     const partNumber = Number(req.query.get('partNumber'));
-    const etag = await uploads.putPart(bucket, key, uploadId, partNumber, payload(req));
+    const body = payload(req);
+    assertObjectSize(body, options.maxObjectBytes);
+    const etag = await uploads.putPart(bucket, key, uploadId, partNumber, body);
     return empty(200, { ETag: etag });
   }
   if (uploadId && method === 'POST') {
@@ -428,6 +499,9 @@ async function handleObject(
       }
       await backend.createBucket(bucket);
       await backend.put(bucket, key, src.value);
+      if (options.meta) {
+        await options.meta.save(bucket, key, await options.meta.load(decoded.slice(0, slash), decoded.slice(slash + 1)));
+      }
       const meta = await backend.head(bucket, key);
       const etag = meta ? etagFromCrc(meta.crc) : '"00000000"';
       await postEvent(config.notifyUrl, { event: 's3:ObjectCreated:Copy', bucket, key }, options.fetchImpl);
@@ -435,6 +509,11 @@ async function handleObject(
     }
     await backend.createBucket(bucket);
     const plain = payload(req);
+    assertObjectSize(plain, options.maxObjectBytes);
+    const failed = await assertPreconditions(backend, bucket, key, req.headers, 'PUT');
+    if (failed) {
+      return failed;
+    }
     const stored = await maybeSeal(req, plain, options);
     await backend.put(bucket, key, stored);
     let versionId: string | undefined;
@@ -449,6 +528,9 @@ async function handleObject(
     }
     if (versionId) {
       headers['x-amz-version-id'] = versionId;
+    }
+    if (options.meta) {
+      await options.meta.save(bucket, key, userMeta(req.headers));
     }
     await postEvent(config.notifyUrl, { event: 's3:ObjectCreated:Put', bucket, key, size: plain.length }, options.fetchImpl);
     return empty(200, headers);
@@ -476,12 +558,18 @@ async function handleObject(
     if (!meta) {
       return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
     }
+    const failed = await assertPreconditions(backend, bucket, key, req.headers, method);
+    if (failed) {
+      return failed;
+    }
+    const saved = options.meta ? await options.meta.load(bucket, key) : {};
     const range = parseByteRange(header(req.headers, 'range'), meta.size);
     const headers: Record<string, string> = {
       'Accept-Ranges': 'bytes',
       ...etagHeaders(meta.crc),
       'Last-Modified': new Date(meta.mtimeMs).toUTCString(),
       'Content-Type': 'application/octet-stream',
+      ...saved,
     };
     if (range.kind === 'unsatisfiable') {
       headers['Content-Range'] = `bytes */${meta.size}`;
@@ -509,14 +597,20 @@ async function handleObject(
     return { status: partial ? 206 : 200, headers, body };
   }
   if (method === 'DELETE') {
+    const failed = await assertPreconditions(backend, bucket, key, req.headers, 'DELETE');
+    if (failed) {
+      return failed;
+    }
     if (versioning) {
       const versionId = randomBytes(8).toString('hex');
       await versioning.put(bucket, key, { id: versionId, body: null, deleteMarker: true, mtimeMs: Date.now() });
       await backend.delete(bucket, key);
+      await options.meta?.remove(bucket, key);
       await postEvent(config.notifyUrl, { event: 's3:ObjectRemoved:DeleteMarkerCreated', bucket, key }, options.fetchImpl);
       return empty(204, { 'x-amz-version-id': versionId, 'x-amz-delete-marker': 'true' });
     }
     await backend.delete(bucket, key);
+    await options.meta?.remove(bucket, key);
     await postEvent(config.notifyUrl, { event: 's3:ObjectRemoved:Delete', bucket, key }, options.fetchImpl);
     return empty(204);
   }

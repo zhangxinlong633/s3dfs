@@ -135,7 +135,7 @@ function credentialParts(credential: string): { accessKeyId: string; date: strin
 }
 
 export function signRequest(secret: string, req: SignedRequest, amzDate: string, scope: string): string {
-  const [, date, region, service] = scope.split('/');
+  const [date, region, service] = scope.split('/');
   if (!date || !region || !service) {
     throw new S3HttpError(400, 'AuthorizationHeaderMalformed', 'Credential scope is malformed');
   }
@@ -216,7 +216,7 @@ const EMPTY_HASH = EMPTY_SHA256;
 
 /** Previous signature for the first chunk is the seed signature from Authorization. */
 export function chunkSignature(secret: string, scope: string, amzDate: string, previous: string, chunk: Buffer): string {
-  const [, date, region, service] = scope.split('/');
+  const [date, region, service] = scope.split('/');
   const stringToSign = [
     'AWS4-HMAC-SHA256-PAYLOAD',
     amzDate,

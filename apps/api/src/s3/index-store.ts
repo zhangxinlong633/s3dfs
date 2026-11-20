@@ -1,5 +1,5 @@
 import type { IndexClient } from '@s3dfs/control';
-import type { BucketConfig, ConfigStore, ObjectVersion, VersionStore } from './product';
+import type { BucketConfig, ConfigStore, ObjectUserMeta, ObjectVersion, VersionStore } from './product';
 import type { StoredPart, StoredUpload, UploadStore } from './multipart';
 
 /** Multipart manifest and part bytes live in the index, so an API restart keeps the upload. */
@@ -136,5 +136,33 @@ export class IndexVersionStore implements VersionStore {
       }
     }
     return out;
+  }
+}
+
+export class IndexObjectMeta implements ObjectUserMeta {
+  constructor(private readonly kv: IndexClient) {}
+
+  private key(bucket: string, objectKey: string): string {
+    return `$umeta/${bucket}/${encodeURIComponent(objectKey)}`;
+  }
+
+  async save(bucket: string, key: string, meta: Record<string, string>): Promise<void> {
+    if (Object.keys(meta).length === 0) {
+      await this.remove(bucket, key);
+      return;
+    }
+    await this.kv.put(this.key(bucket, key), Buffer.from(JSON.stringify(meta)));
+  }
+
+  async load(bucket: string, key: string): Promise<Record<string, string>> {
+    const raw = await this.kv.get(this.key(bucket, key));
+    if (!raw) {
+      return {};
+    }
+    return JSON.parse(raw.value.toString('utf8')) as Record<string, string>;
+  }
+
+  async remove(bucket: string, key: string): Promise<void> {
+    await this.kv.delete(this.key(bucket, key));
   }
 }
