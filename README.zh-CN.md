@@ -151,7 +151,7 @@ HTTP 路径，`compress=none`（避免和默认的 zstd 路径混在一起）：
 | cluster get 1 KiB，N=3 | 4,151 ops/s | 4.1 MiB/s | 232 µs | 396 µs |
 | cluster put 1 KiB，N=3，32 并发 | 11,196 ops/s | 10.9 MiB/s | 2,730 µs | 4,854 µs |
 
-走索引的 put 会先写 block，再把 locator 写入 dleveldb。N=3 时 put 要在三台 block 上都写成功，所以比 N=1 慢。这些数字不要和 dleveldb 仓库里的进程内基准混比：那是纯 KV，这条路径是对象存储的 HTTP 索引 + block。
+走索引的 put 会先写 block，达到法定人数后再把 locator 写入 dleveldb。这次本机 N=3 测试时三台 block 都在，所以三份都会写完，因此比 N=1 慢。当前代码在多数成功后就会提交，不再等待最慢的那一份。这些数字不要和 dleveldb 仓库里的进程内基准混比：那是纯 KV，这条路径是对象存储的 HTTP 索引 + block。
 
 端到端集群，N=1，带压缩。高度可压缩对象的逻辑写入速率会更高，因为落盘字节少得多；这不是磁盘带宽。
 
@@ -190,9 +190,9 @@ zstd 的盘上比低于 payload 比（53.89x），因为每条记录还带有 TL
 
 ## 已经实现和还没有做的
 
-已经可以：Put / Get / Head / Delete / List（含 delimiter 列举）、HTTP Range GET、创建桶、索引和 block 分开部署、默认 3 份对象正文副本、一份 block 副本宕机后从剩余副本读取、活副本不足时自动或手动补齐到其他存活节点、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、block 节点用本地 `recmap.s3m` 加快重启（快照不可用则仍全量扫描）、删除写墓碑、空闲或手动 compact（回收空洞时不必改索引）。`apps/fuse` 里有第一期桶挂载程序，给只认本地路径的应用做兼容；产品主路径仍是 S3 API，挂载速度不代表存储本身的性能。
+已经可以：Put / Get / Head / Delete / List（含 delimiter 列举）、HTTP Range GET、创建桶、删空桶、Copy、预签名、条件请求、用户元数据、批量删除、一份桶策略、单密钥 AES256、版本、生命周期和 webhook、索引和 block 分开部署、默认 3 份对象正文副本且多数成功即提交、`@zone` 故障域、一份 block 副本宕机后从剩余副本读取、活副本不足时自动或手动补齐并退役 down 的 locator、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、block 节点用本地 `recmap.s3m` 加快重启（快照不可用则仍全量扫描）、删除写墓碑、空闲或手动 compact（回收空洞时不必改索引）。`apps/fuse` 里有桶挂载程序，给只认本地路径的应用做兼容；产品主路径仍是 S3 API，挂载速度不代表存储本身的性能。
 
-还没有做：C 网关的 SigV4、单次 Put 不在 API 里攒整个 body、dleveldb 的历史追平、纠删码，以及多机对照。S3 API（默认 :9000）在同时设置 `S3DFS_ACCESS_KEY` 和 `S3DFS_SECRET_KEY` 时校验 SigV4，解开 `aws-chunked`，分片上传的清单和分片正文留在索引里，并删除空桶。未压缩对象的 Range 只向 block 要那一段。故障时哪些请求还能继续，见 [docs/design-recovery.md](docs/design-recovery.md)。
+还没有做：单次 Put 不在 API 里攒整个 body、分片正文仍在索引里、C 网关的分块签名、dleveldb 的历史追平、纠删码，以及多机对照。S3 API（默认 :9000）和 C 网关在同时设置 `S3DFS_ACCESS_KEY` 和 `S3DFS_SECRET_KEY` 时校验 SigV4。API 解开 `aws-chunked`（含分块签名），分片清单和分片正文留在索引里。未压缩对象的 Range 只向 block 要那一段。高可用要满足的条件见 [docs/deploy.md](docs/deploy.md)。故障时哪些请求还能继续，见 [docs/design-recovery.md](docs/design-recovery.md)。
 
 ## 依赖
 

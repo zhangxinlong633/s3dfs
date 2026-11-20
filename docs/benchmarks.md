@@ -50,7 +50,7 @@ The layout is meant for a large number of small objects. 5,000 × 1 KiB objects 
 
 Do not compare these rows with the in-process KV benches in the dleveldb repository, or with a local engine that skips HTTP. The direct-block 1 KiB rate (18,619 puts/s and 19,361 gets/s) is the engine-plus-HTTP ceiling without the index; the cluster rows are the ones to use for product comparison. This was not a bake-off against another object store on the same data set.
 
-If you are choosing software in this class: s3dfs is aimed at many small to medium objects, where packing into large files, group commit, and optional compression matter more than a per-object directory tree. Plan capacity by adding block machines, and keep a small 3–5 node dleveldb index. If your data is already compressed, assume the `none` rows. If you need three copies, start from the N=3 rows and then measure on your own network. Multipart upload, erasure coding, and automatic replica repair are not in this release; those affect day-to-day operations more than the peak numbers above. The most reliable next step is to run `pnpm bench` on your hardware, and to replay a sample of your own objects.
+If you are choosing software in this class: s3dfs is aimed at many small to medium objects, where packing into large files, group commit, and optional compression matter more than a per-object directory tree. Plan capacity by adding block machines, and keep a small 3–5 node dleveldb index. If your data is already compressed, assume the `none` rows. If you need three copies, start from the N=3 rows and then measure on your own network. Multipart upload and automatic replica repair exist now; erasure coding does not. Those affect day-to-day operations more than the peak numbers above. The most reliable next step is to run `pnpm bench` on your hardware, and to replay a sample of your own objects.
 
 ## HTTP throughput, compress=none
 
@@ -70,7 +70,7 @@ If you are choosing software in this class: s3dfs is aimed at many small to medi
 | cluster get 1 KiB, N=3 | 5,000 | 4,151 ops/s | 4.1 MiB/s | 232 µs | 396 µs |
 | cluster put 1 KiB, N=3, 32 in flight | 5,000 | 11,196 ops/s | 10.9 MiB/s | 2,730 µs | 4,854 µs |
 
-A cluster put writes the block first, then the locator in dleveldb. At N=3 the put must succeed on three block processes, so it is slower than N=1.
+A cluster put writes the blocks first, then the locators in dleveldb. This localhost N=3 run had all three block processes up, so all three copies were written and the put is slower than N=1. Current code publishes after a majority.
 
 ## Compression, cluster N=1
 
@@ -117,7 +117,7 @@ The same machine, opening the C engine directly (no HTTP). 5,000 objects of 1 Ki
 | zstd repeated (19 B payload each) | 1 × `blocks/00000000000000000001.blk` | 508,890 B | 5,120,000 B | 95,000 B | 10.06x | 1 |
 | zstd random (fell back to `none`) | 1 × `blocks/00000000000000000001.blk` | 5,533,890 B | 5,120,000 B | 5,120,000 B | 0.93x | 6 |
 
-The zstd on-disk ratio (10.06x) is lower than the payload ratio (53.89x) because each record still carries TLV tags, lengths, a CRC, and a 14-byte `recId` tag. This run was not an IOPS bake-off against RustFS on the same data set. Compared with the 16 Nov 2026, 12:33 layout (5,463,890 B uncompressed; 438,890 B after zstd), the extra 70,000 bytes are exactly 14 bytes times 5,000 records. Object-replica auto-repair / migration is not implemented. Compaction that reclaims deleted space is implemented, but this suite did not measure its throughput.
+The zstd on-disk ratio (10.06x) is lower than the payload ratio (53.89x) because each record still carries TLV tags, lengths, a CRC, and a 14-byte `recId` tag. This run was not an IOPS bake-off against RustFS on the same data set. Compared with the 16 Nov 2026, 12:33 layout (5,463,890 B uncompressed; 438,890 B after zstd), the extra 70,000 bytes are exactly 14 bytes times 5,000 records. Object-replica repair and compaction exist in the current tree; this suite did not measure either.
 
 ## Previous TLV design (16 Nov 2026, 12:33 Asia/Shanghai)
 

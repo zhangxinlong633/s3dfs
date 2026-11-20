@@ -12,12 +12,13 @@
 - 1MB 写缓冲做 group commit，flush 默认 `fsync`
 - 批量 `put_batch`（单个 block 引擎内部），避免每个小对象都从 JS 进 C 一次
 - block 记录是带校验的 TLV 帧；不认识的字段可以跳过。索引 locator 只记稳定的 `recId`（`v: 3`），物理偏移留在节点内存表里，打开时扫描 `.blk` 重建。索引丢了时可以扫描重建 locator（删除会写墓碑，避免把已删对象救回来）
-- 对象数据默认 3 副本，记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带 block 节点信息；有效副本数是 `min(配置值, 存活的 block 节点数)`
+- 对象数据默认 3 副本。达到多数就写索引（3 份要 2 份），没写上的份由后台修复补。`S3DFS_WRITE_QUORUM` 可以要求更严。有效副本数是 `min(配置值, 存活的 block 节点数)`，只有一台 block 时法定人数是 1
+- 种子可以用 `@zone` 标故障域。放置先从不同 zone 各取一台，zone 不够再在同一 zone 里补
 - 定期对 block 节点做健康检查，Get / Put 会跳过已标记为 down 的节点。Get 会在本次请求里依次尝试剩余副本
-- 对象副本补齐（第一期）：活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点。`POST /_s3dfs/repair` 可手动触发；`S3DFS_REPAIR_INTERVAL_MS` 默认 30 秒，0 关闭后台任务。没有活副本的对象补不回来，也不会退役失效 locator。说明见 [故障与恢复](design-recovery.md)
+- 对象副本补齐：活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役已经 down 的 locator。`POST /_s3dfs/repair` 可手动触发；`S3DFS_REPAIR_INTERVAL_MS` 默认 30 秒，0 关闭后台任务。没有任何活副本时记为 `lost`，补不回来。说明见 [故障与恢复](design-recovery.md)
 - 对象正文默认用 zstd 压缩（`S3DFS_COMPRESS=none|zstd|gzip`），每个对象自己的 `compressType` 记在 locator 里；压不小就存原值
 - 打开 block 时扫描各文件末尾的完整记录，接着追加。`recId` 映射会写到节点本地的 `recmap.s3m`；重启时优先读快照并补扫新数据，快照不可用则扫描全部 `.blk`。不是再引入一份本地 LevelDB
-- 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact|repair`
+- 管理接口：`GET /_s3dfs/stats|cluster|buckets|health|metrics`，`POST /_s3dfs/flush|compact|repair`。`health` 在索引不可达时返回 503。`metrics` 是进程内的状态码计数。每个响应带 `x-amz-request-id`，并在标准输出打一行 JSON 日志
 - 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
 - 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录，给改不了 S3 接口的程序用。路径对应对象 key，内容仍走 S3 API 再进 block；写入是关闭时整文件上传，每个文件一次完整 Put。Linux 走 `/dev/fuse`；本机没有 FUSE 时，macOS 会再经过本机 WebDAV 和 `mount_webdav`，会更慢。挂载尤其是大量小文件时，明显慢于直接调用 S3 API，不要用这些数字代表引擎或集群性能。说明见 [FUSE 方案](design-fuse.md)
 - 分片上传：`POST ?uploads`、`PUT ?partNumber&uploadId`、`GET ?uploadId`（ListParts）、`POST ?uploadId`、`DELETE ?uploadId`。分片清单和分片正文记在索引里，API 重启后还在；完成后拼成一个对象再写入 block。ETag 仍是整段正文的 CRC32，响应里带 `x-s3dfs-etag-algorithm: crc32`。客户端如果要校验正文，用 `Content-MD5`（MD5），不要把 ETag 当成 MD5
@@ -27,16 +28,17 @@
 - CopyObject（`x-amz-copy-source`）
 - 桶策略（JSON，`PUT ?policy`）、单密钥服务端加密（`x-amz-server-side-encryption: AES256`，密钥是 `S3DFS_SSE_KEY`）、版本和删除标记（`?versioning`）、生命周期（`?lifecycle`，后台修复周期里也会跑）、webhook（`PUT ?notification`，正文 `{"url":"..."}`）
 - 未压缩对象的 Range 只向 block 要那一段。block 用 `getSpan` 按偏移拷贝，不再把整个对象留在响应里。压缩对象仍要先解开再切
-- 副本修复会去掉已经 down 的 locator。一个对象如果已经没有活副本，记为 `lost`，不会假装补齐成功
-- C S3 网关同样解开 `aws-chunked`、做分片上传和删空桶。网关里的分片还在进程内存中，并且不校验 SigV4
+- 条件请求 `If-Match` / `If-None-Match`，用户元数据 `x-amz-meta-*`，以及 `DeleteObjects`（`POST ?delete`）
+- 单个 Put 或分片的正文超过 `S3DFS_MAX_OBJECT_BYTES`（默认 1GiB，0 表示不限制）时返回 `EntityTooLarge`
+- C S3 网关解开 `aws-chunked`、做内存中的分片和删空桶。配了同一对 `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY` 时校验请求头签名和预签名，写法定人数和 `@zone` 与 Nest API 相同。分片重启会丢，也不校验分块签名。说明见 [S3 网关](design-s3-gateway.md)
 
 ## 还不做的
 
-- C S3 网关上的 SigV4。密钥只在 Nest API 上生效
-- 单次 Put 的 HTTP body 仍会在 API 进程里攒齐再交给 block。引擎另外提供按块追加（`putChunks`），总长度可以超过 `uint32`；分片完成时仍是一次整对象写入
-- dleveldb 自己的历史追平。控制面写入会在配置的索引地址之间切换，但新节点不会从本仓库里被灌入历史 key
-- 多机上和 RustFS 的吞吐对照
-- 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP
+- 单次 Put 的 HTTP body 仍会在 API 进程里攒齐再交给 block。引擎另外提供按块追加（`putChunks`），总长度可以超过 `uint32`；分片完成时仍是一次整对象写入。未完成分片的正文还在索引里
+- C 网关不校验 aws-chunked 的分块签名，也不接受只有 `Date`、没有 `x-amz-date` 的请求
+- dleveldb 自己的历史追平。控制面写入会在配置的索引地址之间切换，但新节点不会从本仓库里被灌入历史 key。索引主不可达时写入失败
+- 多机上的小对象 / 大对象吞吐
+- 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP、多用户 IAM、KMS
 
 ## 环境变量
 
@@ -51,6 +53,7 @@
 - `S3DFS_BLOCK_NODES`：block 节点种子列表，`nodeId=host:port`，可用 `@zone` 标故障域，例如 `b1=10.0.0.1:9100@rack-a`。逗号分隔，默认 `block1=127.0.0.1:9100`
 - `S3DFS_DATA_REPLICAS`：对象正文副本数，默认 3。有效值不超过当前存活的 block 节点数
 - `S3DFS_WRITE_QUORUM`：这次写入至少成功几份才写索引。默认是有效副本数的多数（3 份要 2 份）。不足的份由后台修复补上。单机只有 1 个 block 时法定人数是 1，这不是高可用部署
+- `S3DFS_MAX_OBJECT_BYTES`：单个 Put 或分片的上限，默认 1073741824。设为 0 则不限制
 - `S3DFS_HEALTH_INTERVAL_MS`：对 block 节点做健康检查的间隔，默认 5000
 - `S3DFS_REPAIR_INTERVAL_MS`：后台补齐对象副本的间隔，默认 30000；设为 0 则关闭定时任务，仍可 `POST /_s3dfs/repair`
 
@@ -72,9 +75,9 @@
 ## 列举与副本的注意点
 
 - 列举会跳过 `key:1`、`key:2` 这类副本后缀，以及 `$node/` 下的注册 key。对象 key 不要以 `:数字` 结尾。
-- 配置的数据副本数默认是 3，但有效值不会超过当前存活的 block 节点数。只有一台 block 时，行为和单副本一致。
+- 配置的数据副本数默认是 3。写出的份数达到多数才记进索引。只有一台 block 时，行为和单副本一致，不能叫高可用。部署标准见 [部署](deploy.md)。
 - 多节点语义见 [索引与 block 集群](design-replication.md)。dleveldb 自己的 KV 复制是另一回事，见那个仓库的文档。
 
 ## 大文件与内存
 
-引擎已经可以把一个逻辑对象切到多块中，dleveldb 只记最后一段的 locator，读取时沿链条从前向后拼回。不过 HTTP 层仍会把整个 body 读进 Node 内存，Range 目前也是先取完整对象再切片，所以特别大的上传或按偏移读取还是会先受到 API 进程内存的限制。流式 Put/Get 和分片上传是下一步。详见 [大文件跨 block 存放](design-large-object.md)。
+引擎已经可以把一个逻辑对象切到多块中，dleveldb 只记最后一段的 locator，读取时沿链条从前向后拼回。未压缩对象的 Range 用 `getSpan` 按偏移向 block 要那一段。压缩对象仍要先整段解开。HTTP Put 仍会把整个 body 读进 API 进程。详见 [大文件跨 block 存放](design-large-object.md)。

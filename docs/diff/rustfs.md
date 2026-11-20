@@ -52,7 +52,7 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 - 一份桶策略（Allow / Deny）、单密钥 AES-256-GCM、版本和删除标记、按前缀的天数过期、一个 webhook URL
 - 按对象压缩、3 副本、宕机节点避让、活副本不足时补齐并退役 down 的 locator、没有活副本时记为 `lost`、墓碑、扫描重建 locator、空闲或手动 compact
 
-控制台仍是看统计、桶和 block 状态，并触发 flush。C S3 网关能解开 `aws-chunked`、做内存中的分片和删空桶；配了同一对密钥时校验请求头签名和预签名，不校验分块签名。未压缩对象的 Range 按偏移向 block 要那一段；压缩对象仍先整段解开。单次 Put 的 HTTP body 还是在 API 进程里攒齐。选出的每一份副本都写成功，才把 locator 写入索引。
+控制台仍是看统计、桶和 block 状态，并触发 flush。C S3 网关能解开 `aws-chunked`、做内存中的分片和删空桶；配了同一对密钥时校验请求头签名和预签名，不校验分块签名。未压缩对象的 Range 按偏移向 block 要那一段；压缩对象仍先整段解开。单次 Put 的 HTTP body 还是在 API 进程里攒齐。多数副本写成功就提交索引，种子上的 `@zone` 用来避开同一故障域。每个响应带 `x-amz-request-id`。
 
 这些和 RustFS 同名的能力，深度不一样。RustFS 的签名背后是 IAM，加密可以接到 Vault / AWS KMS，版本和生命周期是产品功能，通知、复制、配额、审计都在数据面上。s3dfs 这边是一条主路径加一组最小实现：一把密钥、一条策略、一个 webhook。Nest API 已有条件请求、用户元数据和批量删除。
 

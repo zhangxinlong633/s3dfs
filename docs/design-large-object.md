@@ -35,4 +35,4 @@ flowchart LR
 
 ## 尚待下一步
 
-S3 API 目前仍在 Node 里缓冲完整请求体，超大上传可能在进入引擎前就占满内存。流式 Put/Get 和 S3 分片上传下一步再做。对象长度在引擎对外 API 里仍是 `uint32`，单对象上限大约 4GB − 1。
+S3 API 目前仍在 Node 里缓冲完整请求体，默认单对象上限 `S3DFS_MAX_OBJECT_BYTES`（1GiB）。分片上传已经有，但完成时仍在 API 里拼成一个对象再写入。未压缩 Range 按偏移读取；压缩对象先整段解开。引擎的 `putChunks` 可以让一个逻辑对象的总长超过单次 `uint32` 写入，普通 `s3dfs_put` 仍是 `uint32`。
