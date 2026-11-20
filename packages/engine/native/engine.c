@@ -1798,6 +1798,241 @@ static int read_value(s3dfs_store *s, const s3dfs_locator *e, const char *key, u
     return S3DFS_OK;
 }
 
+struct s3dfs_writer {
+    s3dfs_store *store;
+    char *key;
+    uint32_t key_len;
+    uint32_t crc;
+    uint64_t total;
+    uint32_t extents;
+    uint64_t prev_rec;
+    uint32_t seq;
+    uint64_t generation;
+    uint64_t mtime;
+    s3dfs_put_meta meta;
+    int alive;
+};
+
+s3dfs_writer *s3dfs_write_begin(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_put_meta *meta)
+{
+    if (!s || !key || key_len == 0) {
+        return NULL;
+    }
+    s3dfs_writer *w = (s3dfs_writer *)calloc(1, sizeof(*w));
+    if (!w) {
+        return NULL;
+    }
+    w->key = (char *)malloc(key_len);
+    if (!w->key) {
+        free(w);
+        return NULL;
+    }
+    memcpy(w->key, key, key_len);
+    w->store = s;
+    w->key_len = key_len;
+    w->crc = crc32_update(0, key, key_len);
+    w->mtime = (uint64_t)time(NULL) * 1000;
+    if (meta && meta->has_meta) {
+        w->meta = *meta;
+    }
+    pthread_mutex_lock(&s->mu);
+    s3dfs_key_ent existing;
+    if (key_map_get(s, key, key_len, &existing) == 0 && existing.rec_id && existing.kind != S3DFS_KIND_TOMBSTONE) {
+        retire_chain_unlocked(s, existing.rec_id);
+        s->tickets++;
+    }
+    w->generation = ++s->put_generation;
+    w->alive = 1;
+    pthread_mutex_unlock(&s->mu);
+    return w;
+}
+
+int s3dfs_write(s3dfs_writer *w, const void *data, uint32_t len)
+{
+    if (!w || !w->alive || (!data && len)) {
+        return S3DFS_ERR_ARGS;
+    }
+    if (len == 0) {
+        return S3DFS_OK;
+    }
+    pthread_mutex_lock(&w->store->mu);
+    w->crc = crc32_update(w->crc, data, len);
+    s3dfs_ext_link link;
+    memset(&link, 0, sizeof(link));
+    link.prev_rec_id = w->prev_rec;
+    link.seq = w->seq;
+    link.generation = w->generation;
+    uint64_t block = 0, off = 0;
+    uint32_t rec_len = 0;
+    uint64_t rec_id = w->store->next_rec_id++;
+    int rc = append_record(w->store, w->key, w->key_len, data, len, S3DFS_KIND_EXTENT, rec_id, 0, w->mtime, &link,
+                           NULL, &block, &off, &rec_len);
+    if (rc == S3DFS_OK) {
+        w->prev_rec = rec_id;
+        w->seq++;
+        w->extents++;
+        w->total += len;
+    }
+    pthread_mutex_unlock(&w->store->mu);
+    return rc;
+}
+
+int s3dfs_write_finish(s3dfs_writer *w, s3dfs_locator *out)
+{
+    if (!w || !w->alive || !out) {
+        return S3DFS_ERR_ARGS;
+    }
+    pthread_mutex_lock(&w->store->mu);
+    uint8_t empty = 0;
+    s3dfs_ext_link link;
+    memset(&link, 0, sizeof(link));
+    link.prev_rec_id = w->prev_rec;
+    link.seq = w->seq;
+    link.generation = w->generation;
+    link.total_size = w->total;
+    link.extent_count = w->extents + 1;
+    uint64_t block = 0, off = 0;
+    uint32_t rec_len = 0;
+    uint64_t rec_id = w->store->next_rec_id++;
+    const s3dfs_put_meta *meta = w->meta.has_meta ? &w->meta : NULL;
+    int rc = append_record(w->store, w->key, w->key_len, &empty, 0, S3DFS_KIND_EXTENT_LAST, rec_id, w->crc, w->mtime,
+                           &link, meta, &block, &off, &rec_len);
+    if (rc == S3DFS_OK) {
+        if (key_map_put(w->store, w->key, w->key_len, rec_id, S3DFS_KIND_EXTENT_LAST) != 0) {
+            rc = S3DFS_ERR_NOMEM;
+        } else {
+            w->store->stats.objects++;
+            w->store->stats.puts++;
+            w->store->stats.bytes_logical += w->total;
+            fill_locator(out, S3DFS_KIND_EXTENT_LAST, w->crc, w->mtime, w->total, w->generation, link.extent_count,
+                         rec_id, block, off, rec_len, meta);
+        }
+    }
+    pthread_mutex_unlock(&w->store->mu);
+    w->alive = 0;
+    free(w->key);
+    free(w);
+    return rc;
+}
+
+void s3dfs_write_abort(s3dfs_writer *w)
+{
+    if (!w) {
+        return;
+    }
+    if (w->alive) {
+        s3dfs_tombstone(w->store, w->key, w->key_len);
+    }
+    free(w->key);
+    free(w);
+}
+
+static int copy_overlap(const uint8_t *value, uint32_t value_len, uint64_t cursor, uint64_t start, uint64_t end,
+                        uint8_t *dst)
+{
+    uint64_t ext_end = cursor + value_len;
+    uint64_t from = cursor > start ? cursor : start;
+    uint64_t to = ext_end < end ? ext_end : end;
+    if (from >= to) {
+        return 0;
+    }
+    memcpy(dst + (from - start), value + (from - cursor), (size_t)(to - from));
+    return 1;
+}
+
+int s3dfs_read_span(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_locator *loc, uint64_t start,
+                    uint64_t len, void **out, uint32_t *out_len)
+{
+    if (!s || !key || !loc || !out || !out_len || loc->rec_id == 0 || loc->tombstone || len > UINT32_MAX) {
+        return S3DFS_ERR_ARGS;
+    }
+    pthread_mutex_lock(&s->mu);
+    uint64_t obj = loc->size;
+    if (start >= obj || len == 0) {
+        void *empty = malloc(1);
+        if (!empty) {
+            pthread_mutex_unlock(&s->mu);
+            return S3DFS_ERR_NOMEM;
+        }
+        *out = empty;
+        *out_len = 0;
+        pthread_mutex_unlock(&s->mu);
+        return S3DFS_OK;
+    }
+    uint64_t end = start + len;
+    if (end > obj) {
+        end = obj;
+    }
+    uint32_t need = (uint32_t)(end - start);
+    uint8_t *dst = (uint8_t *)malloc(need ? need : 1);
+    if (!dst) {
+        pthread_mutex_unlock(&s->mu);
+        return S3DFS_ERR_NOMEM;
+    }
+    if (!loc->chained) {
+        s3dfs_rec_ent ent;
+        if (!loc->rec_id || rec_map_get(s, loc->rec_id, &ent) != 0) {
+            free(dst);
+            pthread_mutex_unlock(&s->mu);
+            return S3DFS_ERR_NOT_FOUND;
+        }
+        uint8_t *tmp = NULL;
+        s3dfs_rec_view view;
+        int rc = load_record(s, ent.block_id, ent.offset, ent.rec_len, &tmp, &view);
+        if (rc != S3DFS_OK) {
+            free(dst);
+            pthread_mutex_unlock(&s->mu);
+            return rc;
+        }
+        copy_overlap(view.value, view.value_len, 0, start, end, dst);
+        free(tmp);
+        *out = dst;
+        *out_len = need;
+        s->stats.gets++;
+        pthread_mutex_unlock(&s->mu);
+        return S3DFS_OK;
+    }
+    uint64_t *blocks = NULL, *offs = NULL;
+    uint32_t *rec_lens = NULL, *val_lens = NULL, n = 0;
+    int rc = walk_chain(s, loc, key, key_len, &blocks, &offs, &rec_lens, &val_lens, &n);
+    if (rc != S3DFS_OK) {
+        free(dst);
+        pthread_mutex_unlock(&s->mu);
+        return rc;
+    }
+    uint64_t cursor = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t ext_end = cursor + val_lens[i];
+        int overlap = ext_end > start && cursor < end;
+        if (overlap && val_lens[i] > 0) {
+            uint8_t *rec = NULL;
+            s3dfs_rec_view view;
+            rc = load_record(s, blocks[i], offs[i], rec_lens[i], &rec, &view);
+            if (rc != S3DFS_OK) {
+                free(dst);
+                free(blocks);
+                free(offs);
+                free(rec_lens);
+                free(val_lens);
+                pthread_mutex_unlock(&s->mu);
+                return rc;
+            }
+            copy_overlap(view.value, view.value_len, cursor, start, end, dst);
+            free(rec);
+        }
+        cursor = ext_end;
+    }
+    free(blocks);
+    free(offs);
+    free(rec_lens);
+    free(val_lens);
+    *out = dst;
+    *out_len = need;
+    s->stats.gets++;
+    pthread_mutex_unlock(&s->mu);
+    return S3DFS_OK;
+}
+
 int s3dfs_get_at(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_locator *loc, void **out,
                  uint32_t *out_len, uint32_t *crc, uint64_t *mtime_ms)
 {
@@ -1824,7 +2059,7 @@ void s3dfs_free(void *p)
     free(p);
 }
 
-int s3dfs_head_at(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_locator *loc, uint32_t *size,
+int s3dfs_head_at(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_locator *loc, uint64_t *size,
                   uint32_t *crc, uint64_t *mtime_ms)
 {
     if (!s || !key || !loc || loc->rec_id == 0 || loc->tombstone) {
@@ -1852,7 +2087,7 @@ int s3dfs_head_at(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs
     }
     if (size) {
         uint64_t sz = loc->size ? loc->size : view.total_size ? view.total_size : view.value_len;
-        *size = sz > UINT32_MAX ? UINT32_MAX : (uint32_t)sz;
+        *size = sz;
     }
     if (crc) {
         *crc = loc->crc ? loc->crc : view.crc;

@@ -84,6 +84,8 @@ interface NativeStore {
   put(key: string, value: Buffer, meta?: PutMeta): ExtentLocator;
   putBatch(items: { key: string; value: Buffer }[]): ExtentLocator[];
   get(key: string, locator: ExtentLocator): ObjectValue | null;
+  getSpan(key: string, locator: ExtentLocator, start: number, len: number): Buffer;
+  putChunks(key: string, chunks: Buffer[]): ExtentLocator;
   head(key: string, locator: ExtentLocator): ObjectMeta | null;
   tombstone(key: string): void;
   scan(): ScanEntry[];
@@ -121,6 +123,14 @@ export class Store {
 
   get(key: string, locator: ExtentLocator): ObjectValue | null {
     return this.inner.get(key, locator);
+  }
+
+  getSpan(key: string, locator: ExtentLocator, start: number, len: number): Buffer {
+    return this.inner.getSpan(key, locator, start, len);
+  }
+
+  putChunks(key: string, chunks: Buffer[]): ExtentLocator {
+    return this.inner.putChunks(key, chunks);
   }
 
   head(key: string, locator: ExtentLocator): ObjectMeta | null {

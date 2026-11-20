@@ -20,20 +20,23 @@
 - 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact|repair`
 - 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
 - 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录，给改不了 S3 接口的程序用。路径对应对象 key，内容仍走 S3 API 再进 block；写入是关闭时整文件上传，每个文件一次完整 Put。Linux 走 `/dev/fuse`；本机没有 FUSE 时，macOS 会再经过本机 WebDAV 和 `mount_webdav`，会更慢。挂载尤其是大量小文件时，明显慢于直接调用 S3 API，不要用这些数字代表引擎或集群性能。说明见 [FUSE 方案](design-fuse.md)
-- AWS CLI 默认上传：解开 `aws-chunked`（含 chunk signature 和校验和 trailer），按 `x-amz-decoded-content-length` 核对后再落盘
-- 分片上传：`POST ?uploads`、`PUT ?partNumber&uploadId`、`POST ?uploadId`、`DELETE ?uploadId`。分片暂存在 API 进程内存里，拼完再写入 block；API 重启后未完成的上传会丢。最终对象的 ETag 仍是整段正文的 CRC32
+- 分片上传：`POST ?uploads`、`PUT ?partNumber&uploadId`、`GET ?uploadId`（ListParts）、`POST ?uploadId`、`DELETE ?uploadId`。分片清单和分片正文记在索引里，API 重启后还在；完成后拼成一个对象再写入 block。ETag 仍是整段正文的 CRC32，响应里带 `x-s3dfs-etag-algorithm: crc32`。客户端如果要校验正文，用 `Content-MD5`（MD5），不要把 ETag 当成 MD5
 - 删除空桶（`DELETE /bucket`）。桶里还有对象时返回 `BucketNotEmpty`
+- SigV4。设置 `S3DFS_ACCESS_KEY` 和 `S3DFS_SECRET_KEY` 后，请求头签名和预签名 URL 会校验；不设置则仍不鉴权。流式签名会核对每个 chunk signature
+- 虚拟主机风格 URL：`S3DFS_DOMAIN=localhost` 时，`http://bucket.localhost:9000/key` 的桶名来自 Host
+- CopyObject（`x-amz-copy-source`）
+- 桶策略（JSON，`PUT ?policy`）、单密钥服务端加密（`x-amz-server-side-encryption: AES256`，密钥是 `S3DFS_SSE_KEY`）、版本和删除标记（`?versioning`）、生命周期（`?lifecycle`，后台修复周期里也会跑）、webhook（`PUT ?notification`，正文 `{"url":"..."}`）
+- 未压缩对象的 Range 只向 block 要那一段。block 用 `getSpan` 按偏移拷贝，不再把整个对象留在响应里。压缩对象仍要先解开再切
+- 副本修复会去掉已经 down 的 locator。一个对象如果已经没有活副本，记为 `lost`，不会假装补齐成功
+- C S3 网关同样解开 `aws-chunked`、做分片上传和删空桶。网关里的分片还在进程内存中，并且不校验 SigV4
 
 ## 还不做的
 
-- 完整 AWS SigV4 鉴权（环境变量里的 access/secret 尚未生效）
-- 流式上传 / 下载。HTTP 层仍会把整个 body 读进进程内存；分片完成时也是一次整对象写入
-- C S3 网关上的 `aws-chunked`、分片上传和删桶。上面三条目前只在 Nest S3 API（默认 :9000）
-- 纠删码
-- 把对象值放进 dleveldb；索引里只有 locator JSON，正文始终在 block 文件里
-- 退役失效的数据 locator，以及在没有活副本时把对象救回来；故障时哪些还能继续，见 [故障与恢复](design-recovery.md)
-- dleveldb 侧：节点加入后的范围迁移 / catch-up repair，以及 primary 不可达时的安全写故障转移（读可以走剩余 KV 副本；写索引会失败，避免脑裂）
-- 单对象超过约 4GB − 1（引擎对外 API 仍是 `uint32` 长度）
+- C S3 网关上的 SigV4。密钥只在 Nest API 上生效
+- 单次 Put 的 HTTP body 仍会在 API 进程里攒齐再交给 block。引擎另外提供按块追加（`putChunks`），总长度可以超过 `uint32`；分片完成时仍是一次整对象写入
+- dleveldb 自己的历史追平。控制面写入会在配置的索引地址之间切换，但新节点不会从本仓库里被灌入历史 key
+- 多机上和 RustFS 的吞吐对照
+- 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP
 
 ## 环境变量
 
@@ -41,7 +44,9 @@
 
 - `S3DFS_API_PORT`：S3 API 端口，默认 9000
 - `NEXT_PUBLIC_API_BASE_URL`：控制台访问 API 的地址
-- `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY`：预留，当前未做签名校验
+- `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY`：两者都设置时校验 SigV4；缺一则不鉴权
+- `S3DFS_DOMAIN`：虚拟主机后缀，例如 `localhost`，则 `bucket.localhost` 是桶名
+- `S3DFS_SSE_KEY`：服务端加密口令。请求带 `x-amz-server-side-encryption: AES256` 时用它派生 AES-256-GCM 密钥
 - `S3DFS_INDEX_URLS`：dleveldb 索引节点，逗号分隔，默认 `http://127.0.0.1:9800`
 - `S3DFS_BLOCK_NODES`：block 节点种子列表，`nodeId=host:port`，逗号分隔，默认 `block1=127.0.0.1:9100`
 - `S3DFS_DATA_REPLICAS`：对象正文副本数，默认 3。有效值不超过当前存活的 block 节点数

@@ -192,7 +192,7 @@ zstd 的盘上比低于 payload 比（53.89x），因为每条记录还带有 TL
 
 已经可以：Put / Get / Head / Delete / List（含 delimiter 列举）、HTTP Range GET、创建桶、索引和 block 分开部署、默认 3 份对象正文副本、一份 block 副本宕机后从剩余副本读取、活副本不足时自动或手动补齐到其他存活节点、按对象压缩、TLV 记录、`recId` locator、扫描重建 locator、block 节点用本地 `recmap.s3m` 加快重启（快照不可用则仍全量扫描）、删除写墓碑、空闲或手动 compact（回收空洞时不必改索引）。`apps/fuse` 里有第一期桶挂载程序，给只认本地路径的应用做兼容；产品主路径仍是 S3 API，挂载速度不代表存储本身的性能。
 
-还没有做：完整 SigV4、纠删码、流式读写，以及引擎的 uint32 对象大小上限。S3 API（默认 :9000）已经能接 AWS CLI 的默认上传：解开 `aws-chunked`、分片上传（分片在 API 进程内存里，重启会丢）、删除空桶。C S3 网关还没有这些。对象副本补齐的第一期已经有了，但不会退役失效 locator，也救不回已经没有活副本的对象。dleveldb 的加入迁移和 primary 写故障转移也还未实现：新索引节点不会自动拉历史 key；索引主节点不可达时，写入会失败。故障时哪些请求还能继续、哪些不能，见 [docs/design-recovery.md](docs/design-recovery.md)。
+还没有做：C 网关的 SigV4、单次 Put 不在 API 里攒整个 body、dleveldb 的历史追平、纠删码，以及多机对照。S3 API（默认 :9000）在同时设置 `S3DFS_ACCESS_KEY` 和 `S3DFS_SECRET_KEY` 时校验 SigV4，解开 `aws-chunked`，分片上传的清单和分片正文留在索引里，并删除空桶。未压缩对象的 Range 只向 block 要那一段。故障时哪些请求还能继续，见 [docs/design-recovery.md](docs/design-recovery.md)。
 
 ## 依赖
 

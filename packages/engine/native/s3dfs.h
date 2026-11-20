@@ -99,9 +99,18 @@ int s3dfs_tombstone(s3dfs_store *store, const char *key, uint32_t key_len);
 int s3dfs_get_at(s3dfs_store *store, const char *key, uint32_t key_len,
                  const s3dfs_locator *loc, void **out, uint32_t *out_len,
                  uint32_t *crc, uint64_t *mtime_ms);
+/* Copy only [start, start+len) of the stored bytes. len must fit in uint32. */
+int s3dfs_read_span(s3dfs_store *store, const char *key, uint32_t key_len, const s3dfs_locator *loc,
+                    uint64_t start, uint64_t len, void **out, uint32_t *out_len);
+typedef struct s3dfs_writer s3dfs_writer;
+/* Append extents so the object size is a uint64, not one uint32 value. */
+s3dfs_writer *s3dfs_write_begin(s3dfs_store *store, const char *key, uint32_t key_len, const s3dfs_put_meta *meta);
+int s3dfs_write(s3dfs_writer *writer, const void *data, uint32_t len);
+int s3dfs_write_finish(s3dfs_writer *writer, s3dfs_locator *out);
+void s3dfs_write_abort(s3dfs_writer *writer);
 void s3dfs_free(void *p);
 int s3dfs_head_at(s3dfs_store *store, const char *key, uint32_t key_len,
-                  const s3dfs_locator *loc, uint32_t *size, uint32_t *crc,
+                  const s3dfs_locator *loc, uint64_t *size, uint32_t *crc,
                   uint64_t *mtime_ms);
 int s3dfs_scan(s3dfs_store *store, s3dfs_scan_cb cb, void *user);
 int s3dfs_flush(s3dfs_store *store);

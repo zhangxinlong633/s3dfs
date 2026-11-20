@@ -21,7 +21,12 @@ export interface ScanResult {
  * This process is not a ring member; it talks to `/_dleveldb/kv/*`.
  */
 export class IndexClient {
-  constructor(private readonly urls: string[]) {
+  private cursor = 0;
+
+  constructor(
+    private readonly urls: string[],
+    private readonly fetchImpl: typeof fetch = fetch,
+  ) {
     if (urls.length === 0) {
       throw new ControlError('INDEX_UNAVAILABLE', 'S3DFS_INDEX_URLS is empty');
     }
@@ -109,17 +114,19 @@ export class IndexClient {
     } = {},
   ): Promise<Response> {
     let last: unknown;
-    for (const base of this.urls) {
+    const order = [...this.urls.slice(this.cursor), ...this.urls.slice(0, this.cursor)];
+    for (const base of order) {
       const ac = new AbortController();
       const timer = setTimeout(() => ac.abort(), opts.timeoutMs ?? 10_000);
       try {
-        const res = await fetch(`${base}${path}`, {
+        const res = await this.fetchImpl(`${base}${path}`, {
           method,
           headers: opts.headers,
           body: opts.body,
           signal: ac.signal,
         });
         if (res.ok || (opts.allow404 && res.status === 404)) {
+          this.cursor = this.urls.indexOf(base);
           return res;
         }
         last = new ControlError('INDEX_UNAVAILABLE', `index ${base} returned ${res.status} for ${path}`);

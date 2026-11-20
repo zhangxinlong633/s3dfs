@@ -106,6 +106,7 @@ int cluster_get_range(cluster_t *c, const char *bucket, const char *key, uint64_
 int cluster_head(cluster_t *c, const char *bucket, const char *key, object_value_t *out);
 int cluster_delete(cluster_t *c, const char *bucket, const char *key);
 int cluster_create_bucket(cluster_t *c, const char *bucket);
+int cluster_delete_bucket(cluster_t *c, const char *bucket);
 int cluster_bucket_exists(cluster_t *c, const char *bucket);
 int cluster_list_buckets(cluster_t *c, bucket_info_t **out, size_t *n);
 int cluster_list(cluster_t *c, const char *bucket, const char *prefix, const char *start_after, int max_keys,

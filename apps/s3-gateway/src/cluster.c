@@ -723,6 +723,26 @@ static int pick_nodes(cluster_t *c, const char *object_key_str, int want, block_
     return S3DFS_OK;
 }
 
+typedef struct {
+    block_node_t node;
+    const char *key;
+    const void *stored;
+    size_t stored_len;
+    compress_type_t applied;
+    uint64_t orig_len;
+    uint32_t digest;
+    object_locator_t ev;
+    int rc;
+} put_job_t;
+
+static void *put_job_run(void *arg)
+{
+    put_job_t *job = (put_job_t *)arg;
+    job->rc = block_put(job->node.host, job->node.port, job->key, job->stored, job->stored_len, job->applied,
+                        job->orig_len, job->digest, &job->ev);
+    return NULL;
+}
+
 int cluster_put(cluster_t *c, const char *bucket, const char *key, const void *value, size_t len, uint32_t *crc_out)
 {
     char ok[2048];
@@ -749,14 +769,36 @@ int cluster_put(cluster_t *c, const char *bucket, const char *key, const void *v
 
     object_locator_t accepted[MAX_REPLICAS];
     int na = 0;
+    put_job_t jobs[MAX_REPLICAS];
+    pthread_t threads[MAX_REPLICAS];
+    int started[MAX_REPLICAS];
+    memset(started, 0, sizeof(started));
     for (int i = 0; i < nt; i++) {
-        object_locator_t ev;
-        if (block_put(targets[i].host, targets[i].port, ok, stored, stored_len, applied, (uint64_t)len, digest, &ev) ==
-            S3DFS_OK) {
+        jobs[i].node = targets[i];
+        jobs[i].key = ok;
+        jobs[i].stored = stored;
+        jobs[i].stored_len = stored_len;
+        jobs[i].applied = applied;
+        jobs[i].orig_len = (uint64_t)len;
+        jobs[i].digest = digest;
+        jobs[i].rc = S3DFS_ERR;
+        if (pthread_create(&threads[i], NULL, put_job_run, &jobs[i]) == 0) {
+            started[i] = 1;
+        } else {
+            jobs[i].rc = block_put(targets[i].host, targets[i].port, ok, stored, stored_len, applied, (uint64_t)len,
+                                   digest, &jobs[i].ev);
+        }
+    }
+    for (int i = 0; i < nt; i++) {
+        if (started[i]) {
+            pthread_join(threads[i], NULL);
+        }
+        if (jobs[i].rc == S3DFS_OK) {
+            object_locator_t ev = jobs[i].ev;
             ev.replica = na;
             ev.replica_count = 0;
-            snprintf(ev.node_id, sizeof(ev.node_id), "%s", targets[i].node_id);
-            snprintf(ev.address, sizeof(ev.address), "%s", targets[i].address);
+            snprintf(ev.node_id, sizeof(ev.node_id), "%s", jobs[i].node.node_id);
+            snprintf(ev.address, sizeof(ev.address), "%s", jobs[i].node.address);
             ev.size = (uint64_t)len;
             ev.compress_type = applied;
             ev.crc = digest;
@@ -984,6 +1026,28 @@ int cluster_create_bucket(cluster_t *c, const char *bucket)
     char body[128];
     int n = snprintf(body, sizeof(body), "{\"v\":1,\"kind\":\"bucket\",\"mtimeMs\":%" PRIu64 "}", now_ms());
     return kv_put(c, marker, body, (size_t)n);
+}
+
+int cluster_delete_bucket(cluster_t *c, const char *bucket)
+{
+    int ex = cluster_bucket_exists(c, bucket);
+    if (ex != S3DFS_OK) {
+        return ex;
+    }
+    list_result_t listed = {0};
+    int rc = cluster_list(c, bucket, "", NULL, 1, "", &listed);
+    if (rc != S3DFS_OK) {
+        list_result_free(&listed);
+        return rc;
+    }
+    int nonempty = listed.object_count > 0 || listed.prefix_count > 0 || listed.truncated;
+    list_result_free(&listed);
+    if (nonempty) {
+        return S3DFS_ERR_CONFLICT;
+    }
+    char marker[512];
+    object_key(bucket, NULL, marker, sizeof(marker));
+    return kv_delete(c, marker, NULL);
 }
 
 int cluster_bucket_exists(cluster_t *c, const char *bucket)

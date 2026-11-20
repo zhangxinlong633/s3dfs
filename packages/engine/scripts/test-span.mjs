@@ -34,6 +34,13 @@ try {
   assert(typeof bigLoc.recId === 'number' && bigLoc.recId > 0, `big recId missing: ${JSON.stringify(bigLoc)}`);
   const got = store.get('a/big', bigLoc);
   assert(got && got.value.equals(payload), 'get mismatch before reopen');
+  const span = store.getSpan('a/big', bigLoc, 10, 4);
+  assert(span.equals(payload.subarray(10, 14)), 'span should read by offset without returning the whole object');
+  const chunks = [Buffer.from('alpha-'), Buffer.from('beta-'), Buffer.from('gamma')];
+  const chunkLoc = store.putChunks('a/chunks', chunks);
+  assert(chunkLoc.size === Buffer.concat(chunks).length, 'chunked object size is the sum of the chunks');
+  const mid = store.getSpan('a/chunks', chunkLoc, 6, 4);
+  assert(mid.equals(Buffer.from('beta')), 'chunked span should cross extent boundaries');
   const head = store.head('a/big', bigLoc);
   assert(head && head.size === payload.length, 'head size mismatch');
 

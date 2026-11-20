@@ -158,6 +158,26 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       sendJson(res, 200, meta);
       return;
     }
+    const startRaw = url.searchParams.get('start');
+    const endRaw = url.searchParams.get('end');
+    if (startRaw !== null && endRaw !== null) {
+      const meta = store.head(key, loc);
+      if (!meta) {
+        res.statusCode = 404;
+        res.end();
+        return;
+      }
+      const start = Number(startRaw);
+      const end = Number(endRaw);
+      const len = end >= start ? end - start + 1 : 0;
+      const span = store.getSpan(key, loc, start, len);
+      metaHeaders(res, meta);
+      res.statusCode = 200;
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('x-s3dfs-total-size', String(meta.size));
+      res.end(span);
+      return;
+    }
     const found = store.get(key, loc);
     if (!found) {
       res.statusCode = 404;

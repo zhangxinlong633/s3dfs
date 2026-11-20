@@ -13,6 +13,7 @@ export interface RepairReport {
   repaired: number;
   skipped: number;
   failed: number;
+  lost: number;
 }
 
 export interface ClusterStats {
@@ -158,18 +159,39 @@ export class ObjectCluster {
     start: number,
     end: number,
   ): Promise<(ObjectValue & { totalSize: number }) | null> {
-    const got = await this.get(bucket, key);
-    if (!got) {
+    const objectKey = this.objectKey(bucket, key);
+    const locs = this.prefer(await this.locators(objectKey));
+    if (locs.length === 0) {
       return null;
     }
-    const totalSize = got.value.length;
-    if (totalSize === 0 || start >= totalSize || start > end) {
-      return { ...got, value: Buffer.alloc(0), size: 0, totalSize };
+    const totalSize = locs[0]!.size;
+    if ((locs[0]!.compressType ?? 'none') !== 'none') {
+      const got = await this.get(bucket, key);
+      if (!got) {
+        return null;
+      }
+      if (got.value.length === 0 || start >= got.value.length || start > end) {
+        return { ...got, value: Buffer.alloc(0), size: 0, totalSize: got.value.length };
+      }
+      const value = got.value.subarray(start, Math.min(end, got.value.length - 1) + 1);
+      return { ...got, value, size: value.length, totalSize: got.value.length };
     }
-    const from = Math.max(0, start);
-    const to = Math.min(end, totalSize - 1);
-    const value = got.value.subarray(from, to + 1);
-    return { ...got, value, size: value.length, totalSize };
+    let last: unknown;
+    for (const loc of locs) {
+      try {
+        const got = await blockGet(loc.address, objectKey, loc, { start, end });
+        if (!got) {
+          continue;
+        }
+        return { value: got.value, size: got.value.length, crc: loc.crc, mtimeMs: loc.mtimeMs, compressType: 'none', totalSize };
+      } catch (err) {
+        last = err;
+      }
+    }
+    if (last) {
+      throw new ControlError('BLOCK_UNAVAILABLE', `ranged read failed for ${bucket}/${key}: ${String(last)}`);
+    }
+    return null;
   }
 
   async head(bucket: string, key: string): Promise<Omit<ObjectValue, 'value'> | null> {
@@ -387,7 +409,7 @@ export class ObjectCluster {
    */
   async repair(opts: { maxObjects?: number } = {}): Promise<RepairReport> {
     await this.registry.checkAll();
-    const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0 };
+    const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0, lost: 0 };
     const maxObjects = Math.max(1, opts.maxObjects ?? Number.MAX_SAFE_INTEGER);
     let startAfter: string | undefined;
     while (report.scanned < maxObjects) {
@@ -418,7 +440,7 @@ export class ObjectCluster {
     return report;
   }
 
-  private async repairObject(objectKey: string): Promise<'alreadyOk' | 'repaired' | 'skipped' | 'failed'> {
+  private async repairObject(objectKey: string): Promise<'alreadyOk' | 'repaired' | 'skipped' | 'failed' | 'lost'> {
     const parts = splitObjectKey(objectKey);
     if (!parts) {
       return 'skipped';
@@ -430,62 +452,68 @@ export class ObjectCluster {
     const live = this.registry.live();
     const wanted = Math.min(this.dataReplicas, live.length);
     const liveLocs = locs.filter((loc) => live.some((n) => n.nodeId === loc.nodeId));
-    if (wanted <= 0 || liveLocs.length >= wanted) {
-      return liveLocs.length >= wanted && wanted > 0 ? 'alreadyOk' : 'failed';
-    }
+    const downLocs = locs.filter((loc) => !live.some((n) => n.nodeId === loc.nodeId));
     if (liveLocs.length === 0) {
-      return 'failed';
+      return 'lost';
     }
-    const held = new Set(locs.map((loc) => loc.nodeId));
-    const targets = this.pickAdditional(objectKey, wanted - liveLocs.length, held);
-    if (targets.length === 0) {
-      return 'failed';
+    if (liveLocs.length >= wanted && downLocs.length === 0) {
+      return 'alreadyOk';
     }
-    const got = await this.get(parts.bucket, parts.key);
-    if (!got) {
-      return 'failed';
-    }
-    const packed = compressValue(got.value, this.compressType);
-    const digest = got.crc || crc32(got.value);
+    const held = new Set(liveLocs.map((loc) => loc.nodeId));
+    const need = Math.max(0, wanted - liveLocs.length);
+    const targets = need > 0 ? this.pickAdditional(objectKey, need, held) : [];
     const accepted: ObjectLocator[] = [];
-    let nextReplica = Math.max(-1, ...locs.map((loc) => loc.replica)) + 1;
-    for (const node of targets) {
-      try {
-        const ev = await blockPut(node.address, objectKey, packed.stored, {
-          compressType: packed.compressType,
-          origSize: got.value.length,
-          origCrc: digest,
-        });
-        accepted.push({
-          v: 3,
-          replica: nextReplica,
-          replicaCount: locs.length + accepted.length + 1,
-          nodeId: node.nodeId,
-          address: node.address,
-          recId: ev.recId,
-          chained: ev.chained,
-          generation: ev.generation,
-          extentCount: ev.extentCount,
-          size: got.value.length,
-          storedSize: ev.size,
-          compressType: packed.compressType,
-          crc: digest,
-          mtimeMs: ev.mtimeMs,
-        });
-        nextReplica++;
-      } catch {
-        // Try the remaining targets; a partial top-up is still progress.
+    if (need > 0) {
+      if (targets.length === 0) {
+        return 'failed';
+      }
+      const got = await this.get(parts.bucket, parts.key);
+      if (!got) {
+        return 'failed';
+      }
+      const packed = compressValue(got.value, this.compressType);
+      const digest = got.crc || crc32(got.value);
+      for (const node of targets) {
+        try {
+          const ev = await blockPut(node.address, objectKey, packed.stored, {
+            compressType: packed.compressType,
+            origSize: got.value.length,
+            origCrc: digest,
+          });
+          accepted.push({
+            v: 3,
+            replica: 0,
+            replicaCount: 0,
+            nodeId: node.nodeId,
+            address: node.address,
+            recId: ev.recId,
+            chained: ev.chained,
+            generation: ev.generation,
+            extentCount: ev.extentCount,
+            size: got.value.length,
+            storedSize: ev.size,
+            compressType: packed.compressType,
+            crc: digest,
+            mtimeMs: ev.mtimeMs,
+          });
+        } catch {
+          // A later target can still satisfy the missing copy.
+        }
+      }
+      if (accepted.length === 0) {
+        return 'failed';
       }
     }
-    if (accepted.length === 0) {
-      return 'failed';
+    const keep = [...liveLocs, ...accepted];
+    for (const loc of locs) {
+      await this.kv.delete(locatorKey(objectKey, loc.replica));
     }
-    const all = [...locs, ...accepted];
-    for (let i = 0; i < all.length; i++) {
-      all[i]!.replicaCount = all.length;
-      await this.kv.put(locatorKey(objectKey, all[i]!.replica), Buffer.from(JSON.stringify(all[i])));
+    for (let i = 0; i < keep.length; i++) {
+      keep[i]!.replica = i;
+      keep[i]!.replicaCount = keep.length;
+      await this.kv.put(locatorKey(objectKey, i), Buffer.from(JSON.stringify(keep[i])));
     }
-    return 'repaired';
+    return downLocs.length > 0 || accepted.length > 0 ? 'repaired' : 'alreadyOk';
   }
 
   private pickAdditional(objectKey: string, need: number, held: Set<string>) {

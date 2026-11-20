@@ -62,8 +62,14 @@ export async function blockPut(
   return (await res.json()) as ExtentLocator;
 }
 
-export async function blockGet(address: string, key: string, loc: ExtentLocator): Promise<ObjectValue | null> {
-  const res = await fetch(blockUrl(address, `/_s3dfs/block/get?key=${encodeURIComponent(key)}`), {
+export async function blockGet(
+  address: string,
+  key: string,
+  loc: ExtentLocator,
+  range?: { start: number; end: number },
+): Promise<ObjectValue | null> {
+  const query = range ? `&start=${range.start}&end=${range.end}` : '';
+  const res = await fetch(blockUrl(address, `/_s3dfs/block/get?key=${encodeURIComponent(key)}${query}`), {
     headers: locatorHeaders(key, loc),
   });
   if (res.status === 404) {

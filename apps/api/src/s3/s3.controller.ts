@@ -2,7 +2,8 @@ import { Controller, All, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { ControlError } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
-import { handleS3 } from './handle';
+import { handleS3, type S3Options } from './handle';
+import { IndexConfigStore, IndexUploadStore, IndexVersionStore } from './index-store';
 import { MultipartUploads } from './multipart';
 import { errorXml } from './s3.xml';
 
@@ -22,9 +23,28 @@ function sendServiceError(res: Response, err: unknown): boolean {
 
 @Controller()
 export class S3Controller {
-  private readonly uploads = new MultipartUploads();
+  private uploads?: MultipartUploads;
 
   constructor(private readonly engine: EngineService) {}
+
+  private sessions(): MultipartUploads {
+    if (!this.uploads) {
+      this.uploads = new MultipartUploads(new IndexUploadStore(this.engine.index()));
+    }
+    return this.uploads;
+  }
+
+  private options(): S3Options {
+    const accessKeyId = process.env.S3DFS_ACCESS_KEY;
+    const secretAccessKey = process.env.S3DFS_SECRET_KEY;
+    return {
+      credentials: accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined,
+      domain: process.env.S3DFS_DOMAIN,
+      sseSecret: process.env.S3DFS_SSE_KEY,
+      config: new IndexConfigStore(this.engine.index()),
+      versions: new IndexVersionStore(this.engine.index()),
+    };
+  }
 
   @All('{*splat}')
   async handle(@Req() req: RawReq, @Res() res: Response): Promise<void> {
@@ -45,7 +65,8 @@ export class S3Controller {
           host: req.headers.host,
         },
         this.engine,
-        this.uploads,
+        this.sessions(),
+        this.options(),
       );
       for (const [name, value] of Object.entries(out.headers)) {
         res.setHeader(name, value);

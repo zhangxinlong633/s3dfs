@@ -150,6 +150,8 @@ public:
             InstanceMethod("put", &Store::Put),
             InstanceMethod("putBatch", &Store::PutBatch),
             InstanceMethod("get", &Store::Get),
+            InstanceMethod("getSpan", &Store::GetSpan),
+            InstanceMethod("putChunks", &Store::PutChunks),
             InstanceMethod("head", &Store::Head),
             InstanceMethod("tombstone", &Store::Tombstone),
             InstanceMethod("scan", &Store::Scan),
@@ -297,6 +299,66 @@ private:
         return o;
     }
 
+    Napi::Value GetSpan(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (info.Length() < 4 || !info[0].IsString() || !info[2].IsNumber() || !info[3].IsNumber()) {
+            Napi::TypeError::New(env, "getSpan(key, locator, start, len)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        std::string key = info[0].As<Napi::String>().Utf8Value();
+        s3dfs_locator loc;
+        if (!LocFromJs(info[1], &loc)) {
+            Napi::TypeError::New(env, "getSpan(key, locator, start, len)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        uint64_t start = (uint64_t)info[2].As<Napi::Number>().DoubleValue();
+        uint64_t len = (uint64_t)info[3].As<Napi::Number>().DoubleValue();
+        void *data = nullptr;
+        uint32_t out_len = 0;
+        int rc = s3dfs_read_span(store_, key.c_str(), (uint32_t)key.size(), &loc, start, len, &data, &out_len);
+        if (rc != S3DFS_OK) {
+            ErrFrom(env, rc).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Buffer<uint8_t> buf = Napi::Buffer<uint8_t>::Copy(env, (uint8_t *)data, out_len);
+        s3dfs_free(data);
+        return buf;
+    }
+
+    Napi::Value PutChunks(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+            Napi::TypeError::New(env, "putChunks(key, buffers)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        std::string key = info[0].As<Napi::String>().Utf8Value();
+        Napi::Array arr = info[1].As<Napi::Array>();
+        s3dfs_writer *writer = s3dfs_write_begin(store_, key.c_str(), (uint32_t)key.size(), nullptr);
+        if (!writer) {
+            ErrFrom(env, S3DFS_ERR_NOMEM).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        for (uint32_t i = 0; i < arr.Length(); i++) {
+            auto buf = arr.Get(i).As<Napi::Buffer<uint8_t>>();
+            int rc = s3dfs_write(writer, buf.Data(), (uint32_t)buf.Length());
+            if (rc != S3DFS_OK) {
+                s3dfs_write_abort(writer);
+                ErrFrom(env, rc).ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+        }
+        s3dfs_locator loc;
+        memset(&loc, 0, sizeof(loc));
+        int rc = s3dfs_write_finish(writer, &loc);
+        if (rc != S3DFS_OK) {
+            ErrFrom(env, rc).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        return LocToJs(env, loc);
+    }
+
     Napi::Value Head(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
@@ -310,7 +372,8 @@ private:
             Napi::TypeError::New(env, "head(key, locator)").ThrowAsJavaScriptException();
             return env.Undefined();
         }
-        uint32_t size = 0, crc = 0;
+        uint64_t size = 0;
+        uint32_t crc = 0;
         uint64_t mtime = 0;
         int rc = s3dfs_head_at(store_, key.c_str(), (uint32_t)key.size(), &loc, &size, &crc, &mtime);
         if (rc == S3DFS_ERR_NOT_FOUND) {
@@ -321,7 +384,7 @@ private:
             return env.Undefined();
         }
         Napi::Object o = Napi::Object::New(env);
-        o.Set("size", Napi::Number::New(env, size));
+        o.Set("size", Napi::Number::New(env, (double)size));
         o.Set("crc", Napi::Number::New(env, crc));
         o.Set("mtimeMs", Napi::Number::New(env, (double)mtime));
         return o;

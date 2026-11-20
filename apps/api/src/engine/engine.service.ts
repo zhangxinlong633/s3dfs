@@ -9,6 +9,9 @@ import {
   type ClusterStats,
   type RepairReport,
 } from '@s3dfs/control';
+import { IndexConfigStore, IndexUploadStore } from '../s3/index-store';
+import { MultipartUploads } from '../s3/multipart';
+import { applyLifecycle } from '../s3/product';
 
 @Injectable()
 export class EngineService implements OnModuleInit, OnModuleDestroy {
@@ -42,9 +45,12 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
           return;
         }
         this.repairing = true;
-        void this.cluster.repair().finally(() => {
-          this.repairing = false;
-        });
+        void this.cluster
+          .repair()
+          .then(() => this.applyLifecycle())
+          .finally(() => {
+            this.repairing = false;
+          });
       }, repairEvery);
       this.repairTimer.unref();
     }
@@ -57,6 +63,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     if (this.repairTimer) {
       clearInterval(this.repairTimer);
     }
+  }
+
+  index(): IndexClient {
+    return this.kv;
   }
 
   objects(): ObjectCluster {
@@ -121,5 +131,29 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   async repair(): Promise<RepairReport> {
     return this.cluster.repair();
+  }
+
+  async applyLifecycle(): Promise<void> {
+    const configStore = new IndexConfigStore(this.kv);
+    const uploads = new MultipartUploads(new IndexUploadStore(this.kv));
+    const buckets = await this.cluster.listBuckets();
+    const now = Date.now();
+    for (const bucket of buckets) {
+      const config = await configStore.get(bucket.name);
+      if (!config.lifecycle || config.lifecycle.length === 0) {
+        continue;
+      }
+      const listed = await this.cluster.list(bucket.name, '', undefined, 10_000, '');
+      await applyLifecycle({
+        objects: listed.objects.map((object) => ({ bucket: bucket.name, key: object.key, mtimeMs: object.mtimeMs })),
+        rules: config.lifecycle,
+        now,
+        deleteObject: async (name, key) => {
+          await this.cluster.delete(name, key);
+        },
+        uploads: (await uploads.store.list()).filter((upload) => upload.bucket === bucket.name),
+        abortUpload: (name, key, id) => uploads.abort(name, key, id).then(() => undefined),
+      });
+    }
   }
 }

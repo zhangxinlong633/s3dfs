@@ -95,6 +95,56 @@ export function initiateMultipartXml(bucket: string, key: string, uploadId: stri
 `;
 }
 
+export function listPartsXml(
+  bucket: string,
+  key: string,
+  uploadId: string,
+  parts: { partNumber: number; etag: string; size: number }[],
+): string {
+  const body = parts
+    .map(
+      (part) => `<Part><PartNumber>${part.partNumber}</PartNumber><ETag>${xmlEscape(part.etag)}</ETag><Size>${part.size}</Size></Part>`,
+    )
+    .join('');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>${xmlEscape(bucket)}</Bucket>
+  <Key>${xmlEscape(key)}</Key>
+  <UploadId>${xmlEscape(uploadId)}</UploadId>
+  ${body}
+</ListPartsResult>
+`;
+}
+
+export function copyObjectXml(etag: string, lastModified: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<CopyObjectResult>
+  <LastModified>${xmlEscape(lastModified)}</LastModified>
+  <ETag>${xmlEscape(etag)}</ETag>
+</CopyObjectResult>
+`;
+}
+
+export function listVersionsXml(
+  bucket: string,
+  key: string,
+  versions: { id: string; deleteMarker: boolean; mtimeMs: number; body: Buffer | null }[],
+): string {
+  const rows = versions
+    .map((version) => {
+      const tag = version.deleteMarker ? 'DeleteMarker' : 'Version';
+      return `<${tag}><Key>${xmlEscape(key)}</Key><VersionId>${xmlEscape(version.id)}</VersionId><IsLatest>false</IsLatest><LastModified>${new Date(version.mtimeMs).toISOString()}</LastModified><Size>${version.body?.length ?? 0}</Size></${tag}>`;
+    })
+    .join('');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>${xmlEscape(bucket)}</Name>
+  <Prefix>${xmlEscape(key)}</Prefix>
+  ${rows}
+</ListVersionsResult>
+`;
+}
+
 export function completeMultipartXml(opts: { location: string; bucket: string; key: string; etag: string }): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
