@@ -2,9 +2,22 @@ import type { IndexClient } from '@s3dfs/control';
 import type { BucketConfig, ConfigStore, ObjectUserMeta, ObjectVersion, VersionStore } from './product';
 import type { StoredPart, StoredUpload, UploadStore } from './multipart';
 
-/** Multipart manifest and part bytes live in the index, so an API restart keeps the upload. */
+export interface PartObjects {
+  put(bucket: string, key: string, value: Buffer): Promise<void>;
+  get(bucket: string, key: string): Promise<{ value: Buffer } | null>;
+  delete(bucket: string, key: string): Promise<unknown>;
+}
+
+function partKey(id: string, partNumber: number): string {
+  return `$upload/${id}/${partNumber}`;
+}
+
+/** Manifest stays in the index. Part bytes go to the block store under a hidden key. */
 export class IndexUploadStore implements UploadStore {
-  constructor(private readonly kv: IndexClient) {}
+  constructor(
+    private readonly kv: IndexClient,
+    private readonly objects: PartObjects,
+  ) {}
 
   async create(id: string, bucket: string, key: string, createdMs: number): Promise<void> {
     await this.kv.put(`$upload/${id}`, Buffer.from(JSON.stringify({ bucket, key, createdMs, parts: {} })));
@@ -22,8 +35,13 @@ export class IndexUploadStore implements UploadStore {
       parts: Record<string, { etag: string; size: number; mtimeMs: number }>;
     };
     meta.parts[String(partNumber)] = { etag: part.etag, size: part.body.length, mtimeMs: part.mtimeMs };
-    await this.kv.put(`$upload/${id}/b/${partNumber}`, part.body);
-    await this.kv.put(`$upload/${id}`, Buffer.from(JSON.stringify(meta)));
+    await this.objects.put(meta.bucket, partKey(id, partNumber), part.body);
+    try {
+      await this.kv.put(`$upload/${id}`, Buffer.from(JSON.stringify(meta)));
+    } catch (err) {
+      await this.objects.delete(meta.bucket, partKey(id, partNumber));
+      throw err;
+    }
   }
 
   async get(id: string): Promise<StoredUpload | null> {
@@ -39,7 +57,7 @@ export class IndexUploadStore implements UploadStore {
     };
     const parts = new Map<number, StoredPart>();
     for (const [num, part] of Object.entries(meta.parts)) {
-      const body = await this.kv.get(`$upload/${id}/b/${num}`);
+      const body = await this.objects.get(meta.bucket, partKey(id, num));
       if (!body) {
         continue;
       }
@@ -49,9 +67,11 @@ export class IndexUploadStore implements UploadStore {
   }
 
   async remove(id: string): Promise<void> {
-    const current = await this.get(id);
-    if (current) {
-      for (const num of current.parts.keys()) {
+    const raw = await this.kv.get(`$upload/${id}`);
+    if (raw) {
+      const meta = JSON.parse(raw.value.toString('utf8')) as { bucket: string; parts: Record<string, unknown> };
+      for (const num of Object.keys(meta.parts)) {
+        await this.objects.delete(meta.bucket, partKey(id, Number(num)));
         await this.kv.delete(`$upload/${id}/b/${num}`);
       }
     }

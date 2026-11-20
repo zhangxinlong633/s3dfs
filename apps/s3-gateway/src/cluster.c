@@ -723,6 +723,45 @@ static int is_down(cluster_t *c, const char *node_id)
     return down;
 }
 
+static int strict_layout(void)
+{
+    const char *raw = getenv("S3DFS_STRICT_LAYOUT");
+    if (!raw || !raw[0]) {
+        return 1;
+    }
+    return strcmp(raw, "0") != 0 && strcmp(raw, "false") != 0;
+}
+
+static int layout_allows_put(cluster_t *c)
+{
+    block_node_t live[MAX_BLOCK_NODES];
+    int nlive = 0;
+    if (!strict_layout() || c->data_replicas <= 1) {
+        return 1;
+    }
+    collect_live(c, live, &nlive);
+    if (nlive < c->data_replicas) {
+        return 0;
+    }
+    int domains = 0;
+    for (int i = 0; i < nlive; i++) {
+        if (!live[i].zone[0]) {
+            return 0;
+        }
+        int seen = 0;
+        for (int j = 0; j < i; j++) {
+            if (strcmp(live[j].zone, live[i].zone) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            domains++;
+        }
+    }
+    return domains >= c->data_replicas;
+}
+
 static int write_quorum(int copies)
 {
     int majority = copies / 2 + 1;
@@ -827,6 +866,10 @@ int cluster_put(cluster_t *c, const char *bucket, const char *key, const void *v
 
     block_node_t targets[MAX_REPLICAS];
     int nt = 0;
+    if (!layout_allows_put(c)) {
+        free(packed);
+        return S3DFS_ERR_UNAVAILABLE;
+    }
     if (pick_nodes(c, ok, c->data_replicas, targets, &nt) != S3DFS_OK) {
         free(packed);
         return S3DFS_ERR_UNAVAILABLE;
@@ -883,6 +926,11 @@ int cluster_put(cluster_t *c, const char *bucket, const char *key, const void *v
         locator_key(ok, i, lkey, sizeof(lkey));
         int rc = kv_put(c, lkey, js.data, js.len);
         if (rc != S3DFS_OK) {
+            for (int j = 0; j < i; j++) {
+                char drop[2100];
+                locator_key(ok, j, drop, sizeof(drop));
+                kv_delete(c, drop, NULL);
+            }
             buf_free(&js);
             return rc;
         }

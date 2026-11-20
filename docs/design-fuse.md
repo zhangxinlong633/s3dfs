@@ -1,6 +1,11 @@
-# 在对象存储上加一层可远程挂载的 FUSE（方案）
+# 目录挂载
 
-这套方案的**第一期已经落地**。它是对象存储上的兼容层，不是更快的写入路径。能直接使用 S3 API 的应用应当走 Put / Get，不要为了性能去挂载。独立进程 `apps/fuse`（`s3dfs-fuse`）把一个桶映射成本地目录，给只认路径和 `open` / `read` / `write` 的程序用。不改 packed-block 引擎，也不把 POSIX 语义做进 `.blk` 或 dleveldb。
+| | |
+| --- | --- |
+| 读者 | 只能使用本地路径、不能改成 S3 客户端的应用 |
+| 定位 | 兼容层。产品主路径仍是 S3 API。挂载速度不代表存储性能 |
+
+独立进程 `apps/fuse`（`s3dfs-fuse`）把一个桶映射成本地目录。不改 packed-block 引擎，也不把 POSIX 语义写进 `.blk` 或 dleveldb。
 
 已经做的：S3 List 支持 `delimiter=/` 和 CommonPrefixes；GET/HEAD 支持单个 `Range`（HTTP 206）。挂载层采用关闭时整文件上传，目录是对象前缀。Linux 上没有 libfuse 时直接对 `/dev/fuse` 说话；装了 libfuse 或 macFUSE 时走 libfuse。本机没有 FUSE 内核接口时（例如未安装 macFUSE 的 macOS），同一进程会在本机开一个 WebDAV，再用系统的 `mount_webdav` 挂上，会多一层协议，通常更慢。挂载进程自己仍是 Get 再 Put，不走服务端 Copy。流式传输和 FUSE-T 仍属于后续阶段。
 

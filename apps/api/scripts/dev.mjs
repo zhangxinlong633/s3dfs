@@ -22,7 +22,15 @@ if (code !== 0 || !existsSync(dist)) {
 }
 
 const tsc = run('tsc', ['-p', 'tsconfig.build.json', '--watch', '--preserveWatchOutput']);
-const app = run('bun', ['--watch', dist]);
+const app = spawn('bun', ['--watch', dist], {
+  cwd: root,
+  stdio: 'inherit',
+  env: {
+    ...process.env,
+    S3DFS_DATA_REPLICAS: process.env.S3DFS_DATA_REPLICAS ?? '1',
+    S3DFS_STRICT_LAYOUT: process.env.S3DFS_STRICT_LAYOUT ?? '0',
+  },
+});
 
 const stop = () => {
   tsc.kill('SIGTERM');

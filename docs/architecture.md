@@ -1,5 +1,10 @@
 # s3dfs 架构
 
+| | |
+| --- | --- |
+| 读者 | 需要理解进程边界和数据落点的人 |
+| 本文回答 | 控制台、API、索引、block、引擎各管什么，一次对象如何被定位 |
+
 s3dfs 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的核心在 C 引擎里，通过 N-API 暴露给 Node。对象索引和对象正文分开扩容：
 
 - **索引**落在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群里，一般 **3–5 台**就够。S3 API 只是这个集群的客户端，自己不加入 dleveldb 的环。
@@ -60,7 +65,7 @@ S3 层把对象记成字面量 `bucket/key`。Put 时按 key 的哈希从存活�
 
 ## 故障与恢复
 
-不是任何情况下都能秒级恢复，也没有测过确定的恢复时间上限。已经有的是健康检查、避让，以及对象副本补齐：Get 会在本次请求里尝试剩余的数据副本，新的 Put 会躲开已标记为 down 的 block；后台或 `POST /_s3dfs/repair` 会把活副本不足的对象再写到空闲的存活节点，并退役 down 的 locator。没有活副本的对象记为 `lost`，补不回来；索引主节点不可达时写入仍会失败；block 重启优先读 `recmap.s3m` 并补扫尾巴，快照不可用才全量扫描。完整说明见 [故障与恢复](design-recovery.md)。部署是否算高可用，见 [部署](deploy.md)。
+没有测过确定的恢复时间上限。Get 会在本次请求里尝试剩余的数据副本，新的 Put 会躲开已标记为 down 的 block。后台或 `POST /_s3dfs/repair` 会把活副本不足的对象再写到空闲的存活节点，并退役 down 的 locator。没有活副本的对象记为 `lost`，补不回来，本进程的健康检查随之返回 503。索引在剩余副本达到法定人数时仍可写入，节点回来后由 dleveldb 按较新的 mtime 追平。block 重启优先读 `recmap.s3m` 并补扫尾巴，快照不可用才全量扫描。完整说明见 [故障与恢复](design-recovery.md)。一套部署是否可以承接业务，见 [部署](deploy.md) 和 [上线标准](diff/production.md)。
 
 ## 对象规模与分布
 

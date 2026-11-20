@@ -10,6 +10,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dleveldbCli = path.resolve(root, '../dleveldb/packages/dleveldb/src/cli.ts');
 const blockMain = path.join(root, 'apps/block/src/main.ts');
 const bun = process.env.BUN_BIN ?? 'bun';
+process.env.S3DFS_STRICT_LAYOUT ??= '0';
 const ops = Number(process.env.S3DFS_BENCH_OPS ?? 5000);
 const warmup = Number(process.env.S3DFS_BENCH_WARMUP ?? 500);
 const outFile = process.env.S3DFS_BENCH_OUT ?? '/tmp/s3dfs-bench.json';

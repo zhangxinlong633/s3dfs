@@ -21,6 +21,55 @@ export function writeQuorum(copies: number): number {
   return Math.min(copies, configured);
 }
 
+export function strictLayoutEnabled(): boolean {
+  const raw = process.env.S3DFS_STRICT_LAYOUT;
+  if (raw === undefined || raw === '') {
+    return true;
+  }
+  return raw !== '0' && raw.toLowerCase() !== 'false';
+}
+
+export interface LayoutReport {
+  ok: boolean;
+  strict: boolean;
+  dataReplicas: number;
+  liveBlocks: number;
+  failureDomains: number;
+  reasons: string[];
+}
+
+/** A configured replica count above 1 needs that many live nodes and that many distinct zones. */
+export function assessLayout(
+  nodes: { zone?: string }[],
+  dataReplicas: number,
+): LayoutReport {
+  const reasons: string[] = [];
+  const zones = new Set(nodes.map((node) => node.zone).filter((zone): zone is string => Boolean(zone)));
+  if (nodes.length < dataReplicas) {
+    reasons.push(`live block nodes ${nodes.length} < configured replicas ${dataReplicas}`);
+  }
+  if (dataReplicas > 1) {
+    if (nodes.some((node) => !node.zone)) {
+      reasons.push('block nodes are missing a failure domain');
+    }
+    if (zones.size < dataReplicas) {
+      reasons.push(`failure domains ${zones.size} < configured replicas ${dataReplicas}`);
+    }
+  }
+  return {
+    ok: reasons.length === 0,
+    strict: strictLayoutEnabled(),
+    dataReplicas,
+    liveBlocks: nodes.length,
+    failureDomains: zones.size,
+    reasons,
+  };
+}
+
+export function serviceHealthy(indexOk: boolean, layout: LayoutReport, lost: number): boolean {
+  return indexOk && (!layout.strict || layout.ok) && lost === 0;
+}
+
 export interface RepairReport {
   scanned: number;
   alreadyOk: number;
@@ -58,11 +107,21 @@ export class ObjectCluster {
     private readonly compressType: CompressType = parseCompressType(process.env.S3DFS_COMPRESS),
   ) {}
 
+  private lostTotal = 0;
+
+  lostCount(): number {
+    return this.lostTotal;
+  }
+
   objectKey(bucket: string, key?: string): string {
     return key ? `${bucket}/${key}` : `${bucket}/`;
   }
 
   async put(bucket: string, key: string, value: Buffer): Promise<void> {
+    const layout = assessLayout(this.registry.live(), this.dataReplicas);
+    if (layout.strict && !layout.ok) {
+      throw new ControlError('BLOCK_UNAVAILABLE', layout.reasons.join('; '));
+    }
     const objectKey = this.objectKey(bucket, key);
     const packed = compressValue(value, this.compressType);
     const digest = crc32(value);
@@ -93,25 +152,33 @@ export class ObjectCluster {
         `wrote ${accepted.length} of ${targets.length} replicas for ${objectKey}`,
       );
     }
-    for (let i = 0; i < accepted.length; i++) {
-      const ev = accepted[i]!;
-      const loc: ObjectLocator = {
-        v: 3,
-        replica: i,
-        replicaCount: accepted.length,
-        nodeId: ev.nodeId,
-        address: ev.address,
-        recId: ev.recId,
-        chained: ev.chained,
-        generation: ev.generation,
-        extentCount: ev.extentCount,
-        size: value.length,
-        storedSize: ev.storedSize,
-        compressType: packed.compressType,
-        crc: digest,
-        mtimeMs: ev.mtimeMs,
-      };
-      await this.kv.put(locatorKey(objectKey, i), Buffer.from(JSON.stringify(loc)));
+    const written: string[] = [];
+    try {
+      for (let i = 0; i < accepted.length; i++) {
+        const ev = accepted[i]!;
+        const loc: ObjectLocator = {
+          v: 3,
+          replica: i,
+          replicaCount: accepted.length,
+          nodeId: ev.nodeId,
+          address: ev.address,
+          recId: ev.recId,
+          chained: ev.chained,
+          generation: ev.generation,
+          extentCount: ev.extentCount,
+          size: value.length,
+          storedSize: ev.storedSize,
+          compressType: packed.compressType,
+          crc: digest,
+          mtimeMs: ev.mtimeMs,
+        };
+        const indexKey = locatorKey(objectKey, i);
+        await this.kv.put(indexKey, Buffer.from(JSON.stringify(loc)));
+        written.push(indexKey);
+      }
+    } catch (err) {
+      await Promise.all(written.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
+      throw err;
     }
   }
 
@@ -367,6 +434,10 @@ export class ObjectCluster {
     };
   }
 
+  layout(): LayoutReport {
+    return assessLayout(this.registry.live(), this.dataReplicas);
+  }
+
   async flush(): Promise<void> {
     await Promise.all(this.registry.live().map((n) => blockFlush(n.address)));
   }
@@ -456,6 +527,7 @@ export class ObjectCluster {
         break;
       }
     }
+    this.lostTotal += report.lost;
     return report;
   }
 

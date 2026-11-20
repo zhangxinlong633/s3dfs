@@ -1,83 +1,105 @@
-# s3dfs 能力
+# 产品能力
 
-产品主路径是 S3 API。能直接用对象接口的应用，应走 Put / Get / Head / Delete / List，这才是存储要发挥的方式。本机目录挂载是兼容层，给只认路径和 `open` / `read` / `write` 的程序用，不能代替协议，也不应当拿挂载速度来代表存储本身的性能。
+| | |
+| --- | --- |
+| 读者 | 对接 S3 接口、配置进程的人 |
+| 主路径 | S3 API 的 Put / Get / Head / Delete / List |
+| 相关 | [部署](deploy.md)、[环境与行为以本文为准](#4-环境变量) |
 
-## 已经可以做的
+本机目录挂载是兼容层，给只认路径的程序使用。挂载速度不代表存储性能。
 
-- S3 风格的 Put / Get / Head / Delete / List，以及创建桶；List 支持 `delimiter` 与 CommonPrefixes；GET / HEAD 支持单个 HTTP `Range`（206）。这是推荐的访问方式
-- 对象索引放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群（建议 3–5 台）；对象正文放在可大量扩展的 block 机器上
-- 对象打进追加式 block 文件，而不是一个对象一个目录；inode 和磁盘文件数跟 block 文件走，不跟对象数走
-- 对象按 key 哈希分散到多台 block；locator 留在 dleveldb。存储侧的对象规模主要是 KV 里的 key 数，而不是本地文件系统的 inode 数
-- 默认 1GB 一块；超过当前块剩余空间或大于一块的对象，切成多段并从后向前记下链接，读取时再从前向后拼回
-- 1MB 写缓冲做 group commit，flush 默认 `fsync`
-- 批量 `put_batch`（单个 block 引擎内部），避免每个小对象都从 JS 进 C 一次
-- block 记录是带校验的 TLV 帧；不认识的字段可以跳过。索引 locator 只记稳定的 `recId`（`v: 3`），物理偏移留在节点内存表里，打开时扫描 `.blk` 重建。索引丢了时可以扫描重建 locator（删除会写墓碑，避免把已删对象救回来）
-- 对象数据默认 3 副本。达到多数就写索引（3 份要 2 份），没写上的份由后台修复补。`S3DFS_WRITE_QUORUM` 可以要求更严。有效副本数是 `min(配置值, 存活的 block 节点数)`，只有一台 block 时法定人数是 1
-- 种子可以用 `@zone` 标故障域。放置先从不同 zone 各取一台，zone 不够再在同一 zone 里补
-- 定期对 block 节点做健康检查，Get / Put 会跳过已标记为 down 的节点。Get 会在本次请求里依次尝试剩余副本
-- 对象副本补齐：活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役已经 down 的 locator。`POST /_s3dfs/repair` 可手动触发；`S3DFS_REPAIR_INTERVAL_MS` 默认 30 秒，0 关闭后台任务。没有任何活副本时记为 `lost`，补不回来。说明见 [故障与恢复](design-recovery.md)
-- 对象正文默认用 zstd 压缩（`S3DFS_COMPRESS=none|zstd|gzip`），每个对象自己的 `compressType` 记在 locator 里；压不小就存原值
-- 打开 block 时扫描各文件末尾的完整记录，接着追加。`recId` 映射会写到节点本地的 `recmap.s3m`；重启时优先读快照并补扫新数据，快照不可用则扫描全部 `.blk`。不是再引入一份本地 LevelDB
-- 管理接口：`GET /_s3dfs/stats|cluster|buckets|health|metrics`，`POST /_s3dfs/flush|compact|repair`。`health` 在索引不可达时返回 503。`metrics` 是进程内的状态码计数。每个响应带 `x-amz-request-id`，并在标准输出打一行 JSON 日志
-- 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
-- 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录，给改不了 S3 接口的程序用。路径对应对象 key，内容仍走 S3 API 再进 block；写入是关闭时整文件上传，每个文件一次完整 Put。Linux 走 `/dev/fuse`；本机没有 FUSE 时，macOS 会再经过本机 WebDAV 和 `mount_webdav`，会更慢。挂载尤其是大量小文件时，明显慢于直接调用 S3 API，不要用这些数字代表引擎或集群性能。说明见 [FUSE 方案](design-fuse.md)
-- 分片上传：`POST ?uploads`、`PUT ?partNumber&uploadId`、`GET ?uploadId`（ListParts）、`POST ?uploadId`、`DELETE ?uploadId`。分片清单和分片正文记在索引里，API 重启后还在；完成后拼成一个对象再写入 block。ETag 仍是整段正文的 CRC32，响应里带 `x-s3dfs-etag-algorithm: crc32`。客户端如果要校验正文，用 `Content-MD5`（MD5），不要把 ETag 当成 MD5
-- 删除空桶（`DELETE /bucket`）。桶里还有对象时返回 `BucketNotEmpty`
-- SigV4。设置 `S3DFS_ACCESS_KEY` 和 `S3DFS_SECRET_KEY` 后，请求头签名和预签名 URL 会校验；不设置则仍不鉴权。流式签名会核对每个 chunk signature
-- 虚拟主机风格 URL：`S3DFS_DOMAIN=localhost` 时，`http://bucket.localhost:9000/key` 的桶名来自 Host
-- CopyObject（`x-amz-copy-source`）
-- 桶策略（JSON，`PUT ?policy`）、单密钥服务端加密（`x-amz-server-side-encryption: AES256`，密钥是 `S3DFS_SSE_KEY`）、版本和删除标记（`?versioning`）、生命周期（`?lifecycle`，后台修复周期里也会跑）、webhook（`PUT ?notification`，正文 `{"url":"..."}`）
-- 未压缩对象的 Range 只向 block 要那一段。block 用 `getSpan` 按偏移拷贝，不再把整个对象留在响应里。压缩对象仍要先解开再切
-- 条件请求 `If-Match` / `If-None-Match`，用户元数据 `x-amz-meta-*`，以及 `DeleteObjects`（`POST ?delete`）
-- 单个 Put 或分片的正文超过 `S3DFS_MAX_OBJECT_BYTES`（默认 1GiB，0 表示不限制）时返回 `EntityTooLarge`
-- C S3 网关解开 `aws-chunked`、做内存中的分片和删空桶。配了同一对 `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY` 时校验请求头签名和预签名，写法定人数和 `@zone` 与 Nest API 相同。分片重启会丢，也不校验分块签名。说明见 [S3 网关](design-s3-gateway.md)
+## 1. 数据布局
 
-## 还不做的
+| 能力 | 说明 |
+| --- | --- |
+| 索引与正文分离 | 索引在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群，建议 3–5 台。正文在可扩展的 block 机器上 |
+| 打包 | 对象追加进大文件，默认 1 GiB 一块。inode 和磁盘文件数跟 block 文件走，不跟对象数走 |
+| 定位 | 按 key 哈希分散。locator（`v: 3`）只记节点和稳定的 `recId`。物理偏移留在 block 内存表，打开时可由 `.blk` 重建 |
+| 跨块 | 放不进当前块的对象切成多段，后一段记下前一段的 `recId`。索引只保留最后一段 |
+| 刷盘 | 1 MiB 写缓冲做组提交，flush 默认 `fsync` |
+| 压缩 | 默认 zstd（`none` / `zstd` / `gzip`）。压不小则存原文，locator 记 `compressType=none` |
+| 副本 | 默认 3 份。达到多数即写索引，未写上的份由修复补齐 |
+| 故障域 | 种子可用 `@zone`。放置先从不同 zone 各取一台 |
+| 严格布局 | 默认要求存活节点数和故障域都不少于副本数，不足则拒绝写入 |
 
-- 单次 Put 的 HTTP body 仍会在 API 进程里攒齐再交给 block。引擎另外提供按块追加（`putChunks`），总长度可以超过 `uint32`；分片完成时仍是一次整对象写入。未完成分片的正文还在索引里
-- C 网关不校验 aws-chunked 的分块签名，也不接受只有 `Date`、没有 `x-amz-date` 的请求
-- dleveldb 自己的历史追平。控制面写入会在配置的索引地址之间切换，但新节点不会从本仓库里被灌入历史 key。索引主不可达时写入失败
-- 多机上的小对象 / 大对象吞吐
-- 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP、多用户 IAM、KMS
+## 2. S3 接口
 
-## 环境变量
+| 能力 | 说明 |
+| --- | --- |
+| 对象与桶 | Put / Get / Head / Delete / List（含 `delimiter` 与 CommonPrefixes）、建桶、删除空桶。桶非空时返回 `BucketNotEmpty` |
+| Range | 单个 HTTP Range，返回 206。未压缩对象按偏移向 block 读取。压缩对象先解开再切 |
+| 拷贝与条件 | CopyObject（`x-amz-copy-source`）、`If-Match` / `If-None-Match`、`x-amz-meta-*`、`DeleteObjects` |
+| AWS CLI | 官方 CLI 用 `--endpoint-url` 直连 Nest API，寻址为路径风格。配置见 [README](../README.zh-CN.md#用-aws-cli-接入) |
+| 签名 | 同时设置访问密钥和秘密密钥后校验 SigV4，含预签名。流式签名会核对每个 chunk signature。未设置则不鉴权 |
+| 虚拟主机 | `S3DFS_DOMAIN=localhost` 时，桶名来自 Host |
+| 分片 | 创建、上传、ListParts、完成、中止。清单在索引，正文在 block，key 以 `$upload/` 开头，列表不可见。API 重启后分片仍在。完成后拼成正式对象。ETag 为整段 CRC32，响应带 `x-s3dfs-etag-algorithm: crc32`。校验正文请用 `Content-MD5` |
+| 桶策略与加密 | JSON 桶策略、单密钥 AES256（`S3DFS_SSE_KEY`）、版本与删除标记、生命周期、webhook |
+| 大小上限 | 超过 `S3DFS_MAX_OBJECT_BYTES`（默认 1 GiB，0 为不限制）返回 `EntityTooLarge` |
+| 请求追踪 | 每个响应带 `x-amz-request-id`，标准输出打一行 JSON 日志 |
 
-### S3 API / 控制台
+## 3. 运维与兼容
 
-- `S3DFS_API_PORT`：S3 API 端口，默认 9000
-- `NEXT_PUBLIC_API_BASE_URL`：控制台访问 API 的地址
-- `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY`：两者都设置时校验 SigV4；缺一则不鉴权
-- `S3DFS_DOMAIN`：虚拟主机后缀，例如 `localhost`，则 `bucket.localhost` 是桶名
-- `S3DFS_SSE_KEY`：服务端加密口令。请求带 `x-amz-server-side-encryption: AES256` 时用它派生 AES-256-GCM 密钥
-- `S3DFS_INDEX_URLS`：dleveldb 索引节点，逗号分隔，默认 `http://127.0.0.1:9800`
-- `S3DFS_BLOCK_NODES`：block 节点种子列表，`nodeId=host:port`，可用 `@zone` 标故障域，例如 `b1=10.0.0.1:9100@rack-a`。逗号分隔，默认 `block1=127.0.0.1:9100`
-- `S3DFS_DATA_REPLICAS`：对象正文副本数，默认 3。有效值不超过当前存活的 block 节点数
-- `S3DFS_WRITE_QUORUM`：这次写入至少成功几份才写索引。默认是有效副本数的多数（3 份要 2 份）。不足的份由后台修复补上。单机只有 1 个 block 时法定人数是 1，这不是高可用部署
-- `S3DFS_MAX_OBJECT_BYTES`：单个 Put 或分片的上限，默认 1073741824。设为 0 则不限制
-- `S3DFS_HEALTH_INTERVAL_MS`：对 block 节点做健康检查的间隔，默认 5000
-- `S3DFS_REPAIR_INTERVAL_MS`：后台补齐对象副本的间隔，默认 30000；设为 0 则关闭定时任务，仍可 `POST /_s3dfs/repair`
+| 能力 | 说明 |
+| --- | --- |
+| 健康检查 | 定期探测 block。Get / Put 跳过 down 节点。Get 在本次请求内尝试剩余副本 |
+| 副本补齐 | 活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役 down 的 locator。`POST /_s3dfs/repair`，后台默认 30 秒。没有任何活副本记为 `lost`，健康检查 503 |
+| 管理接口 | `GET /_s3dfs/stats\|cluster\|buckets\|health\|metrics`，`POST /_s3dfs/flush\|compact\|repair` |
+| 控制台 | 查看统计、桶、节点，并触发 flush |
+| 重启 | 优先读 `recmap.s3m`，再补扫新数据。快照不可用则扫描全部 `.blk` |
+| 空间回收 | 删除先出票。空闲或手动 compact 回收空洞，保留原 `recId`，不必改索引 |
+| 挂载 | `s3dfs-fuse` 把一个桶挂成本地目录。关闭时整文件上传。Linux 走 `/dev/fuse`；没有 FUSE 的 macOS 再经本机 WebDAV。说明见 [FUSE](design-fuse.md) |
+| C 网关 | 可选入口，不是默认上线入口。内存分片在重启后丢失，不校验分块签名。说明见 [S3 网关](design-s3-gateway.md) |
+
+## 4. 尚未提供
+
+| 事项 | 现状 |
+| --- | --- |
+| 单次 Put | HTTP body 仍在 API 进程内收齐再交给 block。引擎另有 `putChunks`，总长度可以超过 `uint32` |
+| C 网关签名 | 不校验 aws-chunked 分块签名，也不接受只有 `Date`、没有 `x-amz-date` 的请求 |
+| 多机吞吐 | 尚无准备上线的机器和网络上的测量 |
+| 产品面以外 | 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP、多用户 IAM、KMS |
+
+索引的故障写入和历史追平由 dleveldb 完成。s3dfs 在配置的索引地址之间切换，不在本仓库内复制历史 key。
+
+## 5. 环境变量
+
+### S3 API 与控制台
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `S3DFS_API_PORT` | `9000` | S3 API 端口 |
+| `NEXT_PUBLIC_API_BASE_URL` | — | 控制台访问 API 的地址 |
+| `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY` | 未设置 | 两者都设置时校验 SigV4。默认严格布局下缺一则进程不监听 |
+| `S3DFS_DOMAIN` | 未设置 | 虚拟主机后缀。`localhost` 时 `bucket.localhost` 为桶名 |
+| `S3DFS_SSE_KEY` | 未设置 | `x-amz-server-side-encryption: AES256` 时派生 AES-256-GCM 密钥 |
+| `S3DFS_INDEX_URLS` | `http://127.0.0.1:9800` | 索引节点，逗号分隔 |
+| `S3DFS_BLOCK_NODES` | `block1=127.0.0.1:9100` | `nodeId=host:port`，可用 `@zone`。逗号分隔 |
+| `S3DFS_DATA_REPLICAS` | `3` | 对象正文副本数 |
+| `S3DFS_STRICT_LAYOUT` | 开启 | `0` 或 `false` 才允许按存活节点数降级 |
+| `S3DFS_WRITE_QUORUM` | 当次副本数的多数 | 至少成功几份才写索引 |
+| `S3DFS_MAX_OBJECT_BYTES` | `1073741824` | 单个 Put 或分片上限。`0` 为不限制 |
+| `S3DFS_HEALTH_INTERVAL_MS` | `5000` | block 健康检查间隔 |
+| `S3DFS_REPAIR_INTERVAL_MS` | `30000` | 副本补齐间隔。`0` 关闭定时任务，仍可手动触发 |
 
 ### block 节点
 
-- `S3DFS_BLOCK_NODE_ID`：本 block 进程的节点名，默认 `block1`；多机时必须互不相同
-- `S3DFS_BLOCK_PORT`：block 服务端口，默认 9100
-- `S3DFS_ADVERTISE_ADDR`：其它进程访问本 block 用的 `host:port`，默认 `127.0.0.1:${S3DFS_BLOCK_PORT}`
-- `S3DFS_DATA_DIR`：本 block 的数据目录，默认 `./data/block`
-- `S3DFS_BLOCK_SIZE`：单个 block 大小，默认 1GB（`1073741824`）
-- `S3DFS_BUFFER_SIZE`：写缓冲，默认 1MB
-- `S3DFS_FLUSH_INTERVAL_MS`：定期 flush 的间隔，默认 50ms
-- `S3DFS_COMPACT_INTERVAL_MS`：后台 compact 间隔，默认 30000；设为 0 则关闭定时任务，仍可手动触发
-- `S3DFS_COMPACT_DEAD_RATIO`：自动合并的空洞比例阈值，默认 0.2（`deadBytes / bytesOnDisk`）
-- `S3DFS_INDEX_URLS`：可选；设置后 block 会向索引注册 `$node/{nodeId}`
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `S3DFS_BLOCK_NODE_ID` | `block1` | 节点名。多机时必须互不相同 |
+| `S3DFS_BLOCK_PORT` | `9100` | 监听端口 |
+| `S3DFS_ADVERTISE_ADDR` | `127.0.0.1:${PORT}` | 其他进程访问本节点的 `host:port` |
+| `S3DFS_DATA_DIR` | `./data/block` | 数据目录 |
+| `S3DFS_BLOCK_SIZE` | `1073741824` | 单个 block 大小 |
+| `S3DFS_BUFFER_SIZE` | `1048576` | 写缓冲 |
+| `S3DFS_FLUSH_INTERVAL_MS` | `50` | 定期 flush |
+| `S3DFS_COMPACT_INTERVAL_MS` | `30000` | 后台 compact。`0` 关闭定时任务 |
+| `S3DFS_COMPACT_DEAD_RATIO` | `0.2` | 自动合并的空洞比例 |
+| `S3DFS_INDEX_URLS` | 未设置 | 设置后向索引注册 `$node/{nodeId}` |
 
-索引进程本身的端口、目录、副本数请看 dleveldb 的 `DLEVELDB_*` 环境变量。本仓库的 `pnpm dev:index` 默认把索引开在 `127.0.0.1:9800`，数据目录是 `s3dfs/data/index`。
+索引进程的端口、目录和副本数见 dleveldb 的 `DLEVELDB_*`。本仓库 `pnpm dev:index` 默认把索引开在 `127.0.0.1:9800`，数据目录是 `s3dfs/data/index`。
 
-## 列举与副本的注意点
+## 6. 列举约定
 
-- 列举会跳过 `key:1`、`key:2` 这类副本后缀，以及 `$node/` 下的注册 key。对象 key 不要以 `:数字` 结尾。
-- 配置的数据副本数默认是 3。写出的份数达到多数才记进索引。只有一台 block 时，行为和单副本一致，不能叫高可用。部署标准见 [部署](deploy.md)。
-- 多节点语义见 [索引与 block 集群](design-replication.md)。dleveldb 自己的 KV 复制是另一回事，见那个仓库的文档。
-
-## 大文件与内存
-
-引擎已经可以把一个逻辑对象切到多块中，dleveldb 只记最后一段的 locator，读取时沿链条从前向后拼回。未压缩对象的 Range 用 `getSpan` 按偏移向 block 要那一段。压缩对象仍要先整段解开。HTTP Put 仍会把整个 body 读进 API 进程。详见 [大文件跨 block 存放](design-large-object.md)。
+- 列举跳过 `key:1`、`key:2` 这类副本后缀、`$node/` 注册项，以及路径中含 `/$` 的内部对象。对象 key 不要以 `:数字` 结尾。
+- 多节点语义见 [索引与 block 集群](design-replication.md)。dleveldb 自己的 KV 复制见该仓库文档。
+- 大文件与 Range 见 [大文件跨 block 存放](design-large-object.md)。HTTP Put 仍把整个 body 读进 API 进程。

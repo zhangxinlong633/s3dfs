@@ -73,6 +73,14 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     return this.cluster;
   }
 
+  layout() {
+    return this.cluster.layout();
+  }
+
+  lostCount(): number {
+    return this.cluster.lostCount();
+  }
+
   objectKey(bucket: string, key?: string): string {
     return this.cluster.objectKey(bucket, key);
   }
@@ -135,7 +143,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   async applyLifecycle(): Promise<void> {
     const configStore = new IndexConfigStore(this.kv);
-    const uploads = new MultipartUploads(new IndexUploadStore(this.kv));
+    const uploads = new MultipartUploads(new IndexUploadStore(this.kv, this.cluster));
     const buckets = await this.cluster.listBuckets();
     const now = Date.now();
     for (const bucket of buckets) {

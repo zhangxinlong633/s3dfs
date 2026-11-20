@@ -3,10 +3,17 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import type { NestExpressApplication } from '@nestjs/platform-express';
+import { assertProductionAuth } from './s3/auth-gate';
 
 type RawRequest = IncomingMessage & { rawBody?: Buffer; originalUrl?: string };
 
 async function bootstrap() {
+  try {
+    assertProductionAuth();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     bodyParser: false,
   });

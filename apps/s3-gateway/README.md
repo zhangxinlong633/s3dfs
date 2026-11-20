@@ -1,9 +1,11 @@
 # s3dfs C S3 gateway
 
-A thin HTTP/1.1 S3-compatible frontend written in C. After parsing a request it
-talks to the dleveldb index and block nodes the same way `packages/control`
-`ObjectCluster` does (HTTP keep-alive). The existing Nest TypeScript API is
-unchanged; this binary is an alternative entry point for the hot path.
+| | |
+| --- | --- |
+| Role | Optional HTTP/1.1 entry in front of the same index and block nodes |
+| Default launch entry | The Nest API. See `docs/diff/production.md` before placing this binary on a load balancer |
+
+After parsing a request, the process talks to dleveldb and the block nodes the same way `packages/control` `ObjectCluster` does (HTTP keep-alive). The Nest API is unchanged.
 
 ## Build
 

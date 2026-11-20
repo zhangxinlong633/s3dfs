@@ -1,21 +1,15 @@
-# Design: thin C S3 gateway
+# C S3 网关
 
-## Why
+| | |
+| --- | --- |
+| 读者 | 评估是否把 C 网关接到与 Nest API 相同的索引和 block 上 |
+| 定位 | 可选入口。默认上线入口是 Nest API，见 [上线标准](diff/production.md) |
 
-The official 2026-11-17 Mac benchmark calls `ObjectCluster.put/get` in-process.
-That still uses HTTP to the dleveldb index and the block nodes, but it does not
-go through the Nest S3 API. A short 2026-11-19 probe against the TypeScript
-gateway was slower on the same class of 1KiB Put/Get work, mostly because of
-that extra hop (Nest routing, S3 parsing, and an extra head after Put to mint
-the ETag).
+2026-11-17 的本机基准调用的是进程内 `ObjectCluster`，请求仍经 HTTP 到达索引和 block，但不经过 Nest。2026-11-19 对 TypeScript 网关的短探针在同类 1 KiB Put / Get 上更慢，主要开销在 Nest 路由、S3 解析，以及 Put 之后为生成 ETag 多做的一次 Head。
 
-This gateway is a small C HTTP/1.1 frontend that, after parsing the S3 request,
-follows the same control-plane path as `packages/control` `ObjectCluster`: HTTP
-keep-alive to `/_dleveldb/kv/*` and `/_s3dfs/block/*`. The packed-block engine
-and the index cluster are unchanged. The Nest API remains in place.
+本网关是一个小型 C HTTP/1.1 前端。解析 S3 请求之后，走与 `packages/control` 中 `ObjectCluster` 相同的路径：用 HTTP keep-alive 访问 `/_dleveldb/kv/*` 和 `/_s3dfs/block/*`。packed-block 引擎和索引集群不变。Nest API 保留。
 
-It is not nginx-s3-gateway (a reverse-proxy config in front of an existing S3
-service) and not Ceph radosgw (bound to RADOS).
+它不是 nginx-s3-gateway（已有 S3 服务前的反向代理配置），也不是绑定 RADOS 的 Ceph radosgw。
 
 ## Request path
 

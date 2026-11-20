@@ -75,8 +75,8 @@ describe('replica write', () => {
     try {
       const kv = new MemIndex();
       const registry = new NodeRegistry(kv as unknown as IndexClient, [
-        { nodeId: 'a', address: '10.0.0.1:9100' },
-        { nodeId: 'b', address: '10.0.0.2:9100' },
+        { nodeId: 'a', address: '10.0.0.1:9100', zone: 'z1' },
+        { nodeId: 'b', address: '10.0.0.2:9100', zone: 'z2' },
       ]);
       const cluster = new ObjectCluster(kv as unknown as IndexClient, registry, 2, 'none');
       await expect(cluster.put('logs', 'a.txt', Buffer.from('abc'))).rejects.toThrow(/1 of 2/);

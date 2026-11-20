@@ -26,7 +26,7 @@ export function nodeIdFromKey(indexKey: string): string | null {
 }
 
 export function isVisibleObjectKey(indexKey: string): boolean {
-  if (indexKey.startsWith('$')) {
+  if (indexKey.startsWith('$') || indexKey.includes('/$')) {
     return false;
   }
   return !isReplicaLocatorKey(indexKey);

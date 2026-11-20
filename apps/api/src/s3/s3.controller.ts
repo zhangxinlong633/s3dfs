@@ -1,7 +1,7 @@
 import { Controller, All, Req, Res } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
 import type { Request, Response } from 'express';
-import { ControlError } from '@s3dfs/control';
+import { ControlError, serviceHealthy } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
 import { handleS3, type S3Options } from './handle';
 import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
@@ -32,7 +32,7 @@ export class S3Controller {
 
   private sessions(): MultipartUploads {
     if (!this.uploads) {
-      this.uploads = new MultipartUploads(new IndexUploadStore(this.engine.index()));
+      this.uploads = new MultipartUploads(new IndexUploadStore(this.engine.index(), this.engine));
     }
     return this.uploads;
   }
@@ -60,9 +60,12 @@ export class S3Controller {
     let status = 500;
     try {
       if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
-        const ok = await this.engine.index().ping();
+        const indexOk = await this.engine.index().ping();
+        const layout = this.engine.layout();
+        const lost = this.engine.lostCount();
+        const ok = serviceHealthy(indexOk, layout, lost);
         status = ok ? 200 : 503;
-        res.status(status).json({ ok });
+        res.status(status).json({ ok, indexOk, lost, ...layout });
         return;
       }
       if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {

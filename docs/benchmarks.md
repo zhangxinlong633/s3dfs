@@ -1,14 +1,19 @@
 # Benchmarks
 
-Numbers below were measured on 17 Nov 2026, 00:40 (Asia/Shanghai) with Bun 1.4.2 (node-compat v26.3.0), on a MacBook Pro (Apple M5 Pro, 15 cores, 48 GB, Apple SSD AP1024Z, macOS arm64). They describe the current tree: locators in dleveldb use a stable `recId` (`v: 3`), block records are TLV frames, optional control-plane compression is enabled, and idle or manual compaction can reclaim deleted space. Background compact was disabled for this run (`S3DFS_COMPACT_INTERVAL_MS=0`) so cleanup would not mix into the rates. They are single-host results, not a multi-machine network test.
+| | |
+| --- | --- |
+| 读者 | 需要复现或引用本机数字的人 |
+| 测量 | 2026-11-17 00:40（Asia/Shanghai），Bun 1.4.2，MacBook Pro（Apple M5 Pro，15 核，48 GB，Apple SSD AP1024Z） |
+| 范围 | 单机 localhost。N=3 是同一台机器上的三个 block 进程，不是多机网络 |
+| 效力 | 选型时的形状说明，不是容量承诺。上线容量以目标集群的测量为准 |
 
-N is the object-body replica count. N=1 is one dleveldb process plus one block process. N=3 is one index plus three block processes on the same machine, talking over HTTP on localhost. `direct block` calls the block HTTP API only and does not go through the index.
+数字对应当时的代码：locator 使用稳定的 `recId`（`v: 3`），记录为 TLV，控制面可压缩，空闲或手动 compact 可回收删除空间。本次关闭了后台 compact（`S3DFS_COMPACT_INTERVAL_MS=0`）。README 只保留规划用的摘要表，完整表格在本文。
 
-Bandwidth is **logical** MiB/s: uncompressed object size divided by elapsed time, with 1 MiB = 1,048,576 bytes. On a highly compressible object the logical write rate is much higher than the bytes actually written to disk. Compression ratio is logical size / stored size (larger means more compact). The repeated payload is filled with `0x61` bytes and is a best-case pattern. The random payload is `crypto.randomBytes`. If compression does not shrink the value, the body is stored as-is and the locator records `compressType=none`. Default `S3DFS_COMPRESS` is `zstd`; the HTTP throughput table below forces `none` so it is not mixed with the default path.
+N 是对象正文副本数。N=1 是一台 dleveldb 加一台 block。带宽是**逻辑** MiB/s（未压缩对象大小 / 时间，1 MiB = 1,048,576 字节）。压缩比是逻辑大小 / 存储大小。重复内容是全部 `0x61` 的字节，属于最好情况；随机内容是密码学随机数。压不小则 locator 记 `compressType=none`。下文 HTTP 表强制 `none`，避免和默认 zstd 混在一起。
 
-Most cases run 5,000 operations after 500 warmup operations. The 16 KiB cases run 2,000 operations. The 1 MiB cases run 80 operations after 8 warmup operations. Latency percentiles come from the same sequential run, or from the named concurrent run. The “32 in flight” rows pipeline 32 concurrent requests and still report latency, but throughput is the number to compare.
+多数用例在 500 次预热后测 5,000 次。16 KiB 测 2,000 次。1 MiB 在 8 次预热后测 80 次。「32 in flight」是 32 个并发请求。
 
-Reproduce:
+复现：
 
 ```bash
 pnpm --filter @s3dfs/engine build
@@ -17,18 +22,14 @@ S3DFS_COMPACT_INTERVAL_MS=0 pnpm bench
 # or: S3DFS_COMPACT_INTERVAL_MS=0 bun scripts/bench-split.mjs
 ```
 
-The script starts a fresh temporary index and block process for each cluster setup. The raw result is in [bench-2026-11-17.json](bench-2026-11-17.json). The same summary tables are also in the [English README](../README.md) and the [Chinese README](../README.zh-CN.md). A planning summary for people evaluating this class of software is in [Guidance for evaluators](#guidance-for-evaluators). Earlier runs of previous designs are kept below.
-
-Do not mix these numbers with the in-process KV benches in the dleveldb repository. That path is pure KV. This one is an object-store HTTP index + block path.
+原始结果在 [bench-2026-11-17.json](bench-2026-11-17.json)。这些数字不要和 dleveldb 仓库里的进程内 KV 基准混比。
 
 
-## Guidance for evaluators
+## 规划摘要
 
-These figures are a starting reference for people choosing a packed-block, S3-compatible store, not a service-level target. They come from one run on one MacBook Pro, over localhost, with no wide-area network and no shared-disk contention. A different machine or a multi-machine deployment will change the absolute numbers. The more transferable part is the shape of the results: where the bottleneck sits, how replicas and concurrency move the rate, and when compression helps.
+这些数字是选型时的起点，不是服务承诺。它们来自一台 MacBook Pro 上的一次 localhost 测试。换机器、走真实网络或多机部署，绝对值都会变。产品比较请看集群路径（API + 索引 + block），不要看不经索引、直接打到 block 的那一行。
 
-There is no single “average ops/s” across the tables in this file. The rows mix 100-byte and 1 MiB objects, one and three replicas, sequential and pipelined requests, and a synthetic best-case compress path. Averaging them would hide the differences that matter for planning. For product comparison, use the cluster path (API + dleveldb index + block), not the direct-block row: that is what an S3 client actually sees.
-
-On this machine, the useful planning figures are:
+表与表之间混了不同对象大小、副本数、串行和流水线，以及专门用来看压缩上限的重复内容，不能加成一个「平均 ops/s」。这台机器上比较有代表性的规划数字如下。
 
 | Planning case | Write | Read | What it represents |
 | --- | ---: | ---: | --- |

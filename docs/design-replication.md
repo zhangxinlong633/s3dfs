@@ -1,6 +1,9 @@
 # 索引与 block 集群
 
-s3dfs 把「对象在哪」和「对象正文」分成两套集群。
+| | |
+| --- | --- |
+| 读者 | 需要区分索引副本和对象正文副本的人 |
+| 本文回答 | 两套集群各自负责什么，一次读写经过哪些进程 |
 
 - **对象索引**放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 里。这是一个标准的分布式 LevelDB（Get / Put / Delete / 前缀扫描），**不包含** packed-block 引擎。索引集群通常只需 **3–5 台**：locator 很小，不必和存储容量一起扩。dleveldb 自己的 KV 副本（默认 3，写法定人数 W）由那套产品负责，和对象正文副本不是一回事。
 - **对象正文**放在大量 **block 节点**上（`apps/block`）。每台机器只跑 C 引擎，把对象打进默认 1GB 的追加式 block 文件。block 机器可以很多，按容量加机器即可。
@@ -24,7 +27,7 @@ S3 API / 控制台
 
 ## 对象数据副本
 
-配置项 `S3DFS_DATA_REPLICAS` 默认是 3。有效副本数是 `min(配置值, 当前存活的 block 节点数)`。单机开发只有一台 block 时，有效副本就是 1，写入不会因为默认 3 而失败。这次写入要成功的份数默认是有效副本数的多数，可用 `S3DFS_WRITE_QUORUM` 改。
+配置项 `S3DFS_DATA_REPLICAS` 默认是 3。`S3DFS_STRICT_LAYOUT` 默认开启时，存活 block 或故障域少于这个数，写入直接失败。设为 `0` 时，有效副本数才降到 `min(配置值, 当前存活的 block 节点数)`，单机一台 block 仍能写入。这次写入要成功的份数默认是当次选出的副本数的多数，可用 `S3DFS_WRITE_QUORUM` 改。
 
 Put 按 `SHA-1(utf8(objectKey))` 在当前存活的 block 节点列表上选起点。节点带了 `zone` 时，先从不同故障域各取一台，不够再在同一故障域里补。同一份正文写到选出的机器上，达到法定人数后在 dleveldb 写入已经成功的 locator：
 

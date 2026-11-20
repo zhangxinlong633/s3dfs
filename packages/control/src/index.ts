@@ -11,7 +11,7 @@ export {
   blockTombstone,
 } from './block-client.js';
 export { NodeRegistry, parseBlockNodes, parseIndexUrls, type SeedNode } from './registry.js';
-export { ObjectCluster, type ClusterStats, type RepairReport } from './cluster.js';
+export { ObjectCluster, assessLayout, serviceHealthy, strictLayoutEnabled, writeQuorum, type ClusterStats, type LayoutReport, type RepairReport } from './cluster.js';
 export {
   NODE_PREFIX,
   isNodeKey,
