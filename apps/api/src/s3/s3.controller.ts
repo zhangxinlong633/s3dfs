@@ -1,9 +1,11 @@
 import { Controller, All, Req, Res } from '@nestjs/common';
+import { randomBytes } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { ControlError } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
 import { handleS3, type S3Options } from './handle';
 import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
+import { RequestMetrics } from './metrics';
 import { MultipartUploads } from './multipart';
 import { errorXml } from './s3.xml';
 
@@ -24,6 +26,7 @@ function sendServiceError(res: Response, err: unknown): boolean {
 @Controller()
 export class S3Controller {
   private uploads?: MultipartUploads;
+  private readonly metrics = new RequestMetrics();
 
   constructor(private readonly engine: EngineService) {}
 
@@ -51,17 +54,28 @@ export class S3Controller {
   @All('{*splat}')
   async handle(@Req() req: RawReq, @Res() res: Response): Promise<void> {
     const url = new URL(req.originalUrl || req.url, 'http://127.0.0.1');
-    if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
-      const ok = await this.engine.index().ping();
-      res.status(ok ? 200 : 503).json({ ok });
-      return;
-    }
-    if (url.pathname === '/_s3dfs' || url.pathname.startsWith('/_s3dfs/')) {
-      res.status(404).end();
-      return;
-    }
-
+    const requestId = randomBytes(8).toString('hex');
+    const started = Date.now();
+    res.setHeader('x-amz-request-id', requestId);
+    let status = 500;
     try {
+      if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
+        const ok = await this.engine.index().ping();
+        status = ok ? 200 : 503;
+        res.status(status).json({ ok });
+        return;
+      }
+      if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {
+        status = 200;
+        res.status(status).json(this.metrics.snapshot());
+        return;
+      }
+      if (url.pathname === '/_s3dfs' || url.pathname.startsWith('/_s3dfs/')) {
+        status = 404;
+        res.status(status).end();
+        return;
+      }
+
       const out = await handleS3(
         {
           method: req.method,
@@ -78,7 +92,8 @@ export class S3Controller {
       for (const [name, value] of Object.entries(out.headers)) {
         res.setHeader(name, value);
       }
-      res.status(out.status);
+      status = out.status;
+      res.status(status);
       if (out.body.length === 0) {
         res.end();
         return;
@@ -88,6 +103,18 @@ export class S3Controller {
       if (!sendServiceError(res, err)) {
         throw err;
       }
+      status = 503;
+    } finally {
+      this.metrics.record(status);
+      console.log(
+        JSON.stringify({
+          requestId,
+          method: req.method,
+          path: url.pathname,
+          status,
+          ms: Date.now() - started,
+        }),
+      );
     }
   }
 }

@@ -48,8 +48,9 @@
 - `S3DFS_DOMAIN`：虚拟主机后缀，例如 `localhost`，则 `bucket.localhost` 是桶名
 - `S3DFS_SSE_KEY`：服务端加密口令。请求带 `x-amz-server-side-encryption: AES256` 时用它派生 AES-256-GCM 密钥
 - `S3DFS_INDEX_URLS`：dleveldb 索引节点，逗号分隔，默认 `http://127.0.0.1:9800`
-- `S3DFS_BLOCK_NODES`：block 节点种子列表，`nodeId=host:port`，逗号分隔，默认 `block1=127.0.0.1:9100`
+- `S3DFS_BLOCK_NODES`：block 节点种子列表，`nodeId=host:port`，可用 `@zone` 标故障域，例如 `b1=10.0.0.1:9100@rack-a`。逗号分隔，默认 `block1=127.0.0.1:9100`
 - `S3DFS_DATA_REPLICAS`：对象正文副本数，默认 3。有效值不超过当前存活的 block 节点数
+- `S3DFS_WRITE_QUORUM`：这次写入至少成功几份才写索引。默认是有效副本数的多数（3 份要 2 份）。不足的份由后台修复补上。单机只有 1 个 block 时法定人数是 1，这不是高可用部署
 - `S3DFS_HEALTH_INTERVAL_MS`：对 block 节点做健康检查的间隔，默认 5000
 - `S3DFS_REPAIR_INTERVAL_MS`：后台补齐对象副本的间隔，默认 30000；设为 0 则关闭定时任务，仍可 `POST /_s3dfs/repair`
 

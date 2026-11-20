@@ -7,6 +7,8 @@ export interface BlockNodeInfo {
   status: BlockNodeStatus;
   lastSeenMs: number;
   lastError?: string;
+  /** Failure domain. Placement takes one node from a zone before using that zone again. */
+  zone?: string;
 }
 
 export interface BlockStats {

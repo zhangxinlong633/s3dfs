@@ -8,6 +8,7 @@ import { ControlError } from './types.js';
 export interface SeedNode {
   nodeId: string;
   address: string;
+  zone?: string;
 }
 
 export class NodeRegistry {
@@ -18,11 +19,12 @@ export class NodeRegistry {
     seeds: SeedNode[] = [],
   ) {
     for (const seed of seeds) {
-      this.nodes.set(seed.nodeId, {
+        this.nodes.set(seed.nodeId, {
         nodeId: seed.nodeId,
         address: seed.address,
         status: 'unknown',
         lastSeenMs: 0,
+        zone: seed.zone,
       });
     }
   }
@@ -67,6 +69,7 @@ export class NodeRegistry {
           status: (parsed.status as BlockNodeStatus) ?? prev?.status ?? 'unknown',
           lastSeenMs: parsed.lastSeenMs ?? prev?.lastSeenMs ?? 0,
           lastError: parsed.lastError,
+          zone: parsed.zone ?? prev?.zone,
         });
       }
     } catch {
@@ -90,6 +93,7 @@ export class NodeRegistry {
             address: health.address || node.address,
             status: 'up',
             lastSeenMs: Date.now(),
+            zone: node.zone,
           }
         : {
             ...node,
@@ -116,9 +120,28 @@ export class NodeRegistry {
     const want = Math.max(1, Math.min(n, live.length));
     const digest = createHash('sha1').update(objectKey).digest();
     const start = digest.readUInt32BE(0) % live.length;
+    const ring = Array.from({ length: live.length }, (_, i) => live[(start + i) % live.length]!);
     const out: BlockNodeInfo[] = [];
-    for (let i = 0; i < live.length && out.length < want; i++) {
-      out.push(live[(start + i) % live.length]!);
+    const usedZones = new Set<string>();
+    for (const node of ring) {
+      if (out.length >= want) {
+        break;
+      }
+      if (node.zone && usedZones.has(node.zone)) {
+        continue;
+      }
+      out.push(node);
+      if (node.zone) {
+        usedZones.add(node.zone);
+      }
+    }
+    for (const node of ring) {
+      if (out.length >= want) {
+        break;
+      }
+      if (!out.includes(node)) {
+        out.push(node);
+      }
     }
     return out;
   }
@@ -135,13 +158,21 @@ export function parseBlockNodes(raw: string | undefined): SeedNode[] {
       continue;
     }
     const eq = item.indexOf('=');
+    const rawAddress = eq > 0 ? item.slice(eq + 1).trim() : item;
+    const at = rawAddress.lastIndexOf('@');
+    const zone = at > 0 ? rawAddress.slice(at + 1).trim() : '';
+    const address = at > 0 && zone && !zone.includes(':') ? rawAddress.slice(0, at) : rawAddress;
     if (eq > 0) {
-      out.push({ nodeId: item.slice(0, eq).trim(), address: item.slice(eq + 1).trim() });
+      out.push({ nodeId: item.slice(0, eq).trim(), address, zone: zone && address !== rawAddress ? zone : undefined });
       continue;
     }
-    const colon = item.lastIndexOf(':');
-    const host = colon > 0 ? item.slice(0, colon) : item;
-    out.push({ nodeId: host.replace(/[^A-Za-z0-9._-]+/g, '_') || `block${out.length}`, address: item });
+    const colon = address.lastIndexOf(':');
+    const host = colon > 0 ? address.slice(0, colon) : address;
+    out.push({
+      nodeId: host.replace(/[^A-Za-z0-9._-]+/g, '_') || `block${out.length}`,
+      address,
+      zone: address !== rawAddress ? zone : undefined,
+    });
   }
   return out;
 }

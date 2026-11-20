@@ -1,22 +1,20 @@
 # 离生产级还差什么
 
-和 RustFS 的对照在 [diff/rustfs.md](diff/rustfs.md)。下面只记还不能放到不可信网络、不能当唯一副本的缺口。纠删码、Helm、Swift、SFTP 不是这条产品的生产门槛。
+和 RustFS 的对照在 [diff/rustfs.md](diff/rustfs.md)。高可用部署标准在 [diff/mainstream.md](diff/mainstream.md)，步骤在 [deploy.md](deploy.md)。下面只记还不能当唯一副本的缺口。纠删码、Helm、Swift、SFTP 不是这条产品的生产门槛。
 
 ## 数据不能少写
 
 - 单次 Put 和分片完成不要在 API 进程里攒下整个对象。引擎已有 `putChunks`，HTTP 入口仍先把 body 收进一个 Buffer。
 - 未完成分片的正文改存 block。索引只留清单。现在分片正文直接进 dleveldb。C 网关的分片还在进程内存里，重启就丢。
 - C 网关还没有校验 aws-chunked 的分块签名。请求头和预签名已经和 Nest API 用同一套 SigV4。
-- dleveldb 新节点追平历史 key。控制面只会在配置的地址之间切换。
+- dleveldb 新节点追平历史 key。控制面只会在配置的地址之间切换。索引主不可达时写入失败。
 
 ## 对外之前要能拒绝陌生人
 
-- 进程监听地址和「没配密钥就完全开放」要在部署说明里写死。公网入口必须配密钥，TLS 由前面的反向代理做。
 - C 网关只认 `x-amz-date`。只有 `Date`、没有 `x-amz-date` 的请求会被拒绝。
 
 ## 能看出来它是不是活着
 
-- 请求日志里带上已经返回的 `RequestId`，并有一个不需要控制台的计数接口。
 - 在多机上补一轮小对象和大对象的数字，写进 benchmarks。本机数字不能当上线结论。
 
 ## 明确不是当前生产门槛

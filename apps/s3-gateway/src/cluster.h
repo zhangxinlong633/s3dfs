@@ -25,6 +25,7 @@ typedef struct {
     char host[256];
     int port;
     char status[16]; /* up, down, unknown */
+    char zone[64];
     uint64_t last_seen_ms;
     char last_error[128];
 } block_node_t;

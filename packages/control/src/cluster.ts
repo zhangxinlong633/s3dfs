@@ -7,6 +7,20 @@ import type { NodeRegistry } from './registry.js';
 import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
 import { ControlError } from './types.js';
 
+/** Majority of the copies selected for this write. S3DFS_WRITE_QUORUM overrides it, clamped to that copy count. */
+export function writeQuorum(copies: number): number {
+  const majority = Math.floor(Math.max(1, copies) / 2) + 1;
+  const raw = process.env.S3DFS_WRITE_QUORUM;
+  if (!raw) {
+    return Math.min(copies, majority);
+  }
+  const configured = Number(raw);
+  if (!Number.isInteger(configured) || configured < 1) {
+    return Math.min(copies, majority);
+  }
+  return Math.min(copies, configured);
+}
+
 export interface RepairReport {
   scanned: number;
   alreadyOk: number;
@@ -29,6 +43,7 @@ export interface ClusterStats {
   fsyncs: number;
   dataReplicas: number;
   effectiveDataReplicas: number;
+  writeQuorum: number;
   indexUrls: string[];
   indexOk: boolean;
   blockNodes: BlockHealth[];
@@ -72,7 +87,7 @@ export class ObjectCluster {
         });
       }
     }
-    if (accepted.length !== targets.length) {
+    if (accepted.length < writeQuorum(targets.length)) {
       throw new ControlError(
         'BLOCK_UNAVAILABLE',
         `wrote ${accepted.length} of ${targets.length} replicas for ${objectKey}`,
@@ -376,6 +391,7 @@ export class ObjectCluster {
       fsyncs: 0,
       dataReplicas: this.dataReplicas,
       effectiveDataReplicas: Math.min(this.dataReplicas, Math.max(1, this.registry.live().length)),
+      writeQuorum: writeQuorum(Math.min(this.dataReplicas, Math.max(1, this.registry.live().length))),
       indexUrls: this.kv.endpoints,
       indexOk,
       blockNodes,

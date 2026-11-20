@@ -425,8 +425,18 @@ static int parse_seeds(cluster_t *c, const char *raw)
             *eq = '\0';
             snprintf(node.node_id, sizeof(node.node_id), "%s", item);
             snprintf(node.address, sizeof(node.address), "%s", eq + 1);
+        char *at = strrchr(node.address, '@');
+        if (at && at[1] && !strchr(at, ':')) {
+            snprintf(node.zone, sizeof(node.zone), "%s", at + 1);
+            *at = '\0';
+        }
         } else {
             snprintf(node.address, sizeof(node.address), "%s", item);
+            char *at = strrchr(node.address, '@');
+            if (at && at[1] && !strchr(at, ':')) {
+                snprintf(node.zone, sizeof(node.zone), "%s", at + 1);
+                *at = '\0';
+            }
             const char *colon = strrchr(item, ':');
             const char *host = item;
             char hostbuf[256];
@@ -483,6 +493,7 @@ static int load_from_index(cluster_t *c)
         snprintf(node.status, sizeof(node.status), "%s", st[0] ? st : "unknown");
         json_get_u64(r.body, r.body_len, "lastSeenMs", &node.last_seen_ms);
         json_get_string(r.body, r.body_len, "lastError", node.last_error, sizeof(node.last_error));
+        json_get_string(r.body, r.body_len, "zone", node.zone, sizeof(node.zone));
         parse_address(node.address, node.host, sizeof(node.host), &node.port);
         pthread_rwlock_wrlock(&c->lock);
         /* keep previous status if index omitted it and we already know the node */
@@ -491,6 +502,9 @@ static int load_from_index(cluster_t *c)
             snprintf(node.status, sizeof(node.status), "%s", prev->status);
             if (!node.last_seen_ms) {
                 node.last_seen_ms = prev->last_seen_ms;
+            }
+            if (!node.zone[0] && prev->zone[0]) {
+                snprintf(node.zone, sizeof(node.zone), "%s", prev->zone);
             }
         }
         upsert_node(c, &node);
@@ -514,6 +528,10 @@ static int persist_node(cluster_t *c, const block_node_t *n)
     if (n->last_error[0]) {
         buf_append_str(&body, ",\"lastError\":");
         json_escape(n->last_error, &body);
+    }
+    if (n->zone[0]) {
+        buf_append_str(&body, ",\"zone\":");
+        json_escape(n->zone, &body);
     }
     buf_append_str(&body, "}");
     int rc = kv_put(c, key, body.data, body.len);
@@ -553,6 +571,9 @@ int cluster_refresh(cluster_t *c)
             health = snapshot[i];
             snprintf(health.status, sizeof(health.status), "down");
             snprintf(health.last_error, sizeof(health.last_error), "health check failed");
+        }
+        if (!health.zone[0]) {
+            snprintf(health.zone, sizeof(health.zone), "%s", snapshot[i].zone);
         }
         pthread_rwlock_wrlock(&c->lock);
         /* write against the original nodeId in case health returns a new id */
@@ -702,6 +723,33 @@ static int is_down(cluster_t *c, const char *node_id)
     return down;
 }
 
+static int write_quorum(int copies)
+{
+    int majority = copies / 2 + 1;
+    const char *raw = getenv("S3DFS_WRITE_QUORUM");
+    if (!raw || !raw[0]) {
+        return majority < copies ? majority : copies;
+    }
+    int configured = atoi(raw);
+    if (configured < 1) {
+        return majority < copies ? majority : copies;
+    }
+    return configured < copies ? configured : copies;
+}
+
+static int zone_used(const block_node_t *picked, int n, const char *zone)
+{
+    if (!zone || !zone[0]) {
+        return 0;
+    }
+    for (int i = 0; i < n; i++) {
+        if (picked[i].zone[0] && strcmp(picked[i].zone, zone) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int pick_nodes(cluster_t *c, const char *object_key_str, int want, block_node_t *out, int *n_out)
 {
     block_node_t live[MAX_BLOCK_NODES];
@@ -717,7 +765,24 @@ static int pick_nodes(cluster_t *c, const char *object_key_str, int want, block_
     uint32_t start = sha1_u32be(object_key_str, strlen(object_key_str)) % (uint32_t)nlive;
     int got = 0;
     for (int i = 0; i < nlive && got < need; i++) {
-        out[got++] = live[(start + (uint32_t)i) % (uint32_t)nlive];
+        block_node_t *node = &live[(start + (uint32_t)i) % (uint32_t)nlive];
+        if (zone_used(out, got, node->zone)) {
+            continue;
+        }
+        out[got++] = *node;
+    }
+    for (int i = 0; i < nlive && got < need; i++) {
+        block_node_t *node = &live[(start + (uint32_t)i) % (uint32_t)nlive];
+        int seen = 0;
+        for (int j = 0; j < got; j++) {
+            if (strcmp(out[j].node_id, node->node_id) == 0) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen) {
+            out[got++] = *node;
+        }
     }
     *n_out = got;
     return S3DFS_OK;
@@ -806,7 +871,7 @@ int cluster_put(cluster_t *c, const char *bucket, const char *key, const void *v
         }
     }
     free(packed);
-    if (na != nt) {
+    if (na < write_quorum(nt)) {
         return S3DFS_ERR_UNAVAILABLE;
     }
     buf_t js = {0};
