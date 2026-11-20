@@ -15,6 +15,7 @@ import {
 import { IndexConfigStore, IndexUploadStore } from '../s3/index-store';
 import { MultipartUploads } from '../s3/multipart';
 import { applyLifecycle } from '../s3/product';
+import { deliverCare, emptyCareState, markCareDelivered, reviewCare, type CareIncident, type CareState } from '../s3/care';
 import {
   acquireScaleLease,
   emptyScaleMemory,
@@ -25,6 +26,15 @@ import {
   writeScaleMemory,
   type ScaleMemory,
 } from '../s3/scaler';
+
+function publicApiBase(): string {
+  const configured = process.env.S3DFS_PUBLIC_API_URL;
+  if (configured) {
+    return configured.replace(/\/$/, '');
+  }
+  const addr = process.env.S3DFS_ADVERTISE_ADDR ?? `127.0.0.1:${process.env.S3DFS_API_PORT ?? 9000}`;
+  return addr.startsWith('http') ? addr.replace(/\/$/, '') : `http://${addr}`;
+}
 
 @Injectable()
 export class EngineService implements OnModuleInit, OnModuleDestroy {
@@ -40,6 +50,8 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   private putLatency: number[] = [];
   private apiLatency: number[] = [];
   private scaleMemory: ScaleMemory = emptyScaleMemory();
+  private careState: CareState = emptyCareState();
+  private readonly incidents = new Map<string, CareIncident>();
 
   async onModuleInit(): Promise<void> {
     const urls = parseIndexUrls(process.env.S3DFS_INDEX_URLS ?? 'http://127.0.0.1:9800');
@@ -66,7 +78,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
         this.repairing = true;
         void this.cluster
           .repair()
-          .then(() => this.applyLifecycle())
+          .then(async (report) => {
+            await this.applyLifecycle();
+            await this.reviewCare(report.lost);
+          })
           .finally(() => {
             this.repairing = false;
           });
@@ -124,6 +139,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   lostCount(): number {
     return this.cluster.lostCount();
+  }
+
+  incident(id: string): CareIncident | undefined {
+    return this.incidents.get(id);
   }
 
   objectKey(bucket: string, key?: string): string {
@@ -319,6 +338,54 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
       }
     }
     return 'incomplete';
+  }
+
+  private async reviewCare(repairLost: number): Promise<void> {
+    const layout = this.layout();
+    const indexOk = await this.index().ping();
+    const lost = Math.max(this.lostCount(), repairLost);
+    const config = loadScaleConfig();
+    const draining = this.scaleMemory.draining;
+    const reviewed = reviewCare(this.careState, {
+      now: Date.now(),
+      indexOk,
+      layoutOk: layout.ok,
+      strict: layout.strict,
+      lost,
+      buckets: [],
+      draining: draining ? { role: draining.role, nodeId: draining.nodeId } : null,
+      cooldownMs: config.cooldownMs,
+      contact: process.env.S3DFS_SUPPORT_CONTACT ?? '',
+      publicBase: publicApiBase(),
+      tried: ['已运行对象副本修复', '索引追平由 dleveldb 按较新的 mtime 完成', '扩缩容仍由评估器调用外部脚本'],
+    });
+    this.careState = reviewed.state;
+    for (const incident of reviewed.pending) {
+      this.incidents.set(incident.id, incident);
+      const webhookUrls = await this.webhookUrls(incident.scope);
+      const delivered = await deliverCare(incident, {
+        alertUrl: process.env.S3DFS_ALERT_URL,
+        webhookUrls,
+        post: async (url, body) => {
+          const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+          return res.ok;
+        },
+        log: (line) => {
+          console.log(JSON.stringify({ care: true, delivered: false, text: line }));
+        },
+      });
+      if (delivered && incident.severity === 'action_needed') {
+        this.careState = markCareDelivered(this.careState, incident.id);
+      }
+    }
+  }
+
+  private async webhookUrls(scope: string): Promise<string[]> {
+    if (!scope || scope === 'cluster' || scope.includes(':')) {
+      return [];
+    }
+    const config = await new IndexConfigStore(this.kv).get(scope);
+    return config.notifyUrl ? [config.notifyUrl] : [];
   }
 
   private async indexCopiesMatch(): Promise<boolean> {

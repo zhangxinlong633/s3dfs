@@ -74,6 +74,17 @@ export class S3Controller {
         res.status(status).json(this.metrics.snapshot());
         return;
       }
+      if (url.pathname.startsWith('/_s3dfs/incidents/') && req.method === 'GET') {
+        const id = decodeURIComponent(url.pathname.slice('/_s3dfs/incidents/'.length));
+        const incident = this.engine.incident(id);
+        status = incident ? 200 : 404;
+        if (!incident) {
+          res.status(status).end();
+          return;
+        }
+        res.status(status).json(incident);
+        return;
+      }
       if (url.pathname === '/_s3dfs' || url.pathname.startsWith('/_s3dfs/')) {
         status = 404;
         res.status(status).end();

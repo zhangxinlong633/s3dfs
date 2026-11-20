@@ -126,3 +126,15 @@
 | `S3DFS_API_NODES` | `1` | 当前 API 进程数，供缩容时保留最后一台 |
 
 脚本退出码非 0 只记日志，不记入冷却时间。block 仍有 locator、故障域不足、索引少于 3 台或达不到法定人数、API 仍有在途请求时，不执行缩容脚本。设计说明见 [自动扩缩容](superpowers/specs/2026-11-20-autoscaling-design.md)。
+
+## 8. 省心告警
+
+修复周期结束之后，如果健康检查仍会是 503、出现 `lost`，或节点排空超过冷却时间仍迁不走，API 生成一条故障事件。同一种事件在恢复前只通知一次，恢复后再发一条已恢复。
+
+| 变量 | 含义 |
+| --- | --- |
+| `S3DFS_ALERT_URL` | 集群故障的接收地址。未设置时只写日志 |
+| `S3DFS_SUPPORT_CONTACT` | 写进每条消息的找人方式 |
+| `S3DFS_PUBLIC_API_URL` | 详情链接的前缀。未设置时用 `S3DFS_ADVERTISE_ADDR` |
+
+能对应到桶时，同一份说明再发到该桶的 webhook。`GET /_s3dfs/incidents/<id>` 返回给 AI 的 JSON。设计说明见 [上线之后省心](superpowers/specs/2026-11-20-care-design.md)。
