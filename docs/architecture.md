@@ -1,11 +1,11 @@
-# s3dfs 架构
+# S3DFS 架构
 
 | | |
 | --- | --- |
 | 读者 | 需要理解进程边界和数据落点的人 |
 | 本文回答 | 控制台、API、索引、block、引擎各管什么，一次对象如何被定位 |
 
-s3dfs 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的核心在 C 引擎里，通过 N-API 暴露给 Node。对象索引和对象正文分开扩容：
+S3DFS 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的核心在 C 引擎里，通过 N-API 暴露给 Node。对象索引和对象正文分开扩容：
 
 - **索引**落在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群里，一般 **3–5 台**就够。S3 API 只是这个集群的客户端，自己不加入 dleveldb 的环。
 - **正文**落在大量只跑 packed-block 引擎的 **block 机器**上，机器数可以远多于索引节点。block 进程不再维护本地 LevelDB。

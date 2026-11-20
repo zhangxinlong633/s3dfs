@@ -1,20 +1,37 @@
-# s3dfs
+# S3DFS
 
 [English](README.md) | **中文**
 
-S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js），落盘引擎是 C。对象索引和对象正文分开扩容，面向大量小对象。
+<img src="docs/assets/s3dfs-logo.jpg" alt="S3DFS" width="480">
 
-| | |
-| --- | --- |
-| 索引 | 独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群，通常 3–5 台 |
-| 正文 | 只跑 packed-block 引擎的 block 机器，按容量增加 |
-| 副本 | 默认 3 份。达到多数即对外成功，其余由修复补齐 |
-| 主路径 | S3 API。目录挂载是兼容层，不代表存储性能 |
-| 自带 AI | 巡检进程随仓库提供。规则执行有利的维护，模型把各模块状态写成中文结论 |
+S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js），落盘引擎是 C。对象索引和对象正文分开扩容，面向大量小对象。仓库目录、命令和 `/_s3dfs/` 路径仍用小写。
+
+索引放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群上，通常 3 到 5 台就够。正文放在只跑 packed-block 引擎的 block 机器上，机器按容量增加。默认保存 3 份副本，达到多数就对客户端成功，没写上的一份由修复补齐。日常入口是 S3 API。把一个桶挂成本地目录只是兼容层，挂载速度不代表存储性能。
 
 对象打进约 1 GiB 的 `.blk`，在内存里攒批后再 `write` + `fsync`。inode 和 IOPS 跟数据文件数走，不跟对象数走。定位信息是 dleveldb 里的 locator。写入前默认用 zstd；压不小则按原文落盘，并把 `compressType` 记成 `none`。
 
 系统自带巡检 AI，进程是 `apps/patrol`，不在写入路径上。它每天看索引、block、布局、修复、API、扩缩和告警。活副本不足、空洞过高、写缓冲未落盘，或负载持续高且已配置扩容脚本时，由规则直接做修复、compact、flush 或扩容。模型只把这些数字和已经执行的动作写成给值班人看的中文结论，不读对象正文，也不删除、重启或缩容。默认连本机 LM Studio 的 Gemma 4 26B。`S3DFS_PATROL_MODEL=off` 时仍做规则巡检。结论在 `GET /_s3dfs/decisions`。
+
+## 功能
+
+完整变量和行为见 [能力](docs/capabilities.md)。
+
+| 功能 | 现在能做什么 |
+| --- | --- |
+| 索引与正文分离 | 索引在 dleveldb，正文在可扩展的 block 机器上 |
+| 打包与压缩 | 对象追加进约 1 GiB 的 `.blk`。默认 zstd，压不小则存原文 |
+| 副本与故障域 | 默认 3 份，多数成功即提交。`@zone` 把副本分到不同故障域。节点或故障域不够时拒绝写入 |
+| 索引提交 | locator 逐条写入。任一条失败则删掉本次已经写下的 locator |
+| 对象接口 | Put / Get / Head / Delete / List、单个 Range、拷贝、预签名、条件请求、用户元数据、批量删除 |
+| 桶 | 建桶、删除空桶、JSON 桶策略、单密钥 AES256、版本与删除标记、生命周期、webhook |
+| 分片 | 清单在索引，正文在 block。API 重启后分片仍在。ETag 为 CRC32 |
+| 签名与 CLI | 两个密钥都在时校验 SigV4。官方 AWS CLI 用路径风格和 `--endpoint-url` 直连 |
+| 健康与修复 | 活副本不足时补齐。没有任何活副本记为 `lost`，健康检查返回 503 |
+| 空间与扩缩 | 删除后 compact 回收空洞。配置脚本后按容量和延迟扩缩索引、block 或 API |
+| 控制台与挂载 | 控制台看统计、桶和节点。`s3dfs-fuse` 把一个桶挂成本地目录 |
+| 自带巡检 AI | 规则执行修复、compact、flush 和已配置的扩容。模型按七个模块写中文结论 |
+
+尚未提供：单次 Put 的有界缓冲、目标集群上的容量数字，以及纠删码、站点复制、Object Lock、配额、审计、多用户 IAM 和 KMS。清单见 [待办](docs/todo.md)。
 
 ## 文档
 
@@ -128,12 +145,6 @@ bun scripts/test-split.mjs
 | 1 MiB，N=1，不可压缩 | 208 ops/s | 409 ops/s |
 
 当时 N=3 的三台 block 都在线，三份都会写完。当前代码在多数成功后即提交，不再等待最慢的一份。
-
-## 边界
-
-已经提供 Put / Get / Head / Delete / List、Range、拷贝、预签名、条件请求、用户元数据、批量删除、桶策略、单密钥 AES256、版本、生命周期、webhook、分片（正文在 block）、多数写入、故障域、副本补齐，以及 `lost` 反映到健康检查。
-
-尚未提供单次 Put 的有界缓冲、目标集群上的容量数字，以及纠删码、站点复制、Object Lock、配额、审计、多用户 IAM 和 KMS。清单见 [待办](docs/todo.md)。
 
 ## 运行环境
 

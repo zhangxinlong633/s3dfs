@@ -1,4 +1,4 @@
-# s3dfs C S3 gateway
+# S3DFS C S3 gateway
 
 | | |
 | --- | --- |

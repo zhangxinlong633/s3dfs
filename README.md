@@ -1,20 +1,37 @@
-# s3dfs
+# S3DFS
 
 **English** | [中文](README.zh-CN.md)
 
-S3-compatible object storage. The control plane is TypeScript (Nest.js / Next.js). The on-disk engine is C. The index and the object body scale separately. The layout is aimed at large numbers of small objects.
+<img src="docs/assets/s3dfs-logo.jpg" alt="S3DFS" width="480">
 
-| | |
-| --- | --- |
-| Index | A standalone [dleveldb](https://github.com/zhangxinlong633/dleveldb) cluster, usually 3–5 machines |
-| Body | Block machines that only run the packed-block engine |
-| Replicas | 3 by default. A majority is enough to acknowledge the write; repair fills the rest |
-| Primary path | The S3 API. A directory mount is a compatibility layer and is not a performance path |
-| Built-in AI | The patrol process ships in the repo. Rules run useful maintenance. The model writes a conclusion from each module |
+S3DFS is S3-compatible object storage. The control plane is TypeScript (Nest.js / Next.js). The on-disk engine is C. The index and the object body scale separately. The layout is aimed at large numbers of small objects. The repository path, commands, and `/_s3dfs/` URLs stay lowercase.
+
+The index is a standalone [dleveldb](https://github.com/zhangxinlong633/dleveldb) cluster, usually 3–5 machines. Object bytes live on block machines that only run the packed-block engine, and those machines are added as capacity grows. The default is 3 copies. A majority is enough to acknowledge the write, and repair fills the copy that did not land. The everyday entry is the S3 API. Mounting a bucket as a directory is a compatibility layer, and mount speed is not storage performance.
 
 Objects are packed into ~1 GiB `.blk` files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files. Placement lives in dleveldb locators. The control plane compresses with zstd by default and stores the original bytes, with `compressType=none`, when compression does not shrink the value.
 
-The store ships with a patrol AI, `apps/patrol`. It is not on the write path. Once a day it reads the index, block nodes, layout, repair, API, scaling, and alerts. Rules repair short replicas, compact a hole-heavy node, flush a dirty buffer, and scale up when load stays high and a script is configured. The model turns those numbers and the actions already taken into a conclusion for the operator. It does not read object bytes, and it does not delete data, restart processes, or scale down. The default model is Gemma 4 26B in local LM Studio. `S3DFS_PATROL_MODEL=off` keeps the rule patrol. The conclusion is `GET /_s3dfs/decisions`.
+S3DFS ships with a patrol AI, `apps/patrol`. It is not on the write path. Once a day it reads the index, block nodes, layout, repair, API, scaling, and alerts. Rules repair short replicas, compact a hole-heavy node, flush a dirty buffer, and scale up when load stays high and a script is configured. The model turns those numbers and the actions already taken into a conclusion for the operator. It does not read object bytes, and it does not delete data, restart processes, or scale down. The default model is Gemma 4 26B in local LM Studio. `S3DFS_PATROL_MODEL=off` keeps the rule patrol. The conclusion is `GET /_s3dfs/decisions`.
+
+## Features
+
+Behavior and environment variables are in [Capabilities](docs/capabilities.md).
+
+| Feature | What it does today |
+| --- | --- |
+| Separate index and body | Locators live in dleveldb. Object bytes live on block machines that can be added |
+| Packing and compression | Objects append into ~1 GiB `.blk` files. zstd by default; the original bytes are stored when compression does not shrink them |
+| Replicas and failure domains | 3 copies by default. A majority is enough to commit. `@zone` spreads copies. A write is refused when live nodes or zones are short |
+| Index commit | Locators are written one by one. Any failure deletes the locators already written for that object |
+| Object API | Put / Get / Head / Delete / List, one Range, copy, presign, conditional requests, user metadata, multi-object delete |
+| Buckets | Create, delete when empty, one JSON policy, one-key AES256, versioning and delete markers, lifecycle, webhooks |
+| Multipart | The manifest stays in the index and part bytes stay in the block store across an API restart. The ETag is CRC32 |
+| Signing and the CLI | SigV4 when both keys are set. The official AWS CLI connects with path-style addressing and `--endpoint-url` |
+| Health and repair | Short replica sets are repaired. An object with no live copy is `lost`, and health returns 503 |
+| Space and scale | Compaction reclaims space after deletes. With operator scripts, index, block, and API scale on capacity and latency |
+| Console and mount | The console shows stats, buckets, and nodes. `s3dfs-fuse` mounts one bucket as a directory |
+| Built-in patrol AI | Rules run repair, compact, flush, and a configured scale-up. The model writes a conclusion for the seven modules |
+
+Not provided yet: a bounded buffer on a single Put, capacity numbers from the target cluster, erasure coding, site replication, Object Lock, quotas, audit logs, multi-user IAM, and KMS. See [Todo](docs/todo.md).
 
 ## Documents
 
@@ -122,12 +139,6 @@ Measured on 17 Nov 2026 on one MacBook Pro (Apple M5 Pro, 48 GB), over localhost
 | 1 MiB, N=1, incompressible | 208 ops/s | 409 ops/s |
 
 That N=3 run had all three block processes up, so all three copies were written. Current code publishes after a majority and does not wait for the slowest copy.
-
-## Boundary
-
-Provided today: Put / Get / Head / Delete / List, Range, copy, presign, conditional requests, user metadata, multi-object delete, one bucket policy, one-key AES256, versioning, lifecycle, webhooks, multipart with part bytes in the block store, majority writes, failure domains, replica repair, and a health check that returns 503 after `lost`.
-
-Not provided: a bounded buffer on a single Put, capacity numbers from the target cluster, erasure coding, site replication, Object Lock, quotas, audit logs, multi-user IAM, and KMS. See [Todo](docs/todo.md).
 
 ## Runtime
 
