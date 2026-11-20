@@ -69,6 +69,6 @@ C 网关使用同一对密钥和同一套法定人数、故障域规则。它认
 
 ## 6. 巡检
 
-巡检是单独的 TypeScript 进程，用 `pnpm patrol` 启动。API 和巡检进程配置同一个 `S3DFS_PATROL_TOKEN`。未配置时，模块快照和决定接口返回 401。
+巡检 AI 随仓库提供，是单独的 TypeScript 进程，用 `pnpm patrol` 启动，不放在写入路径上。规则负责维护动作，模型负责把模块状态写成中文结论。API 和巡检进程配置同一个 `S3DFS_PATROL_TOKEN`。未配置时，模块快照和决定接口返回 401。
 
 进程默认每天跑一次。`S3DFS_PATROL_INTERVAL_MS=0` 只跑一轮。模型默认是本机 LM Studio 的 Gemma 4 26B。`S3DFS_PATROL_MODEL=off` 时只留下规则结论。变量、动作边界和 2026-11-20 的第一次运行见 [能力](capabilities.md#9-模块巡检) 与 [从自启到巡检结论](milestones/2026-11-20-first-patrol.md)。

@@ -24,7 +24,7 @@ s3dfs 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的�
 - **索引集群**（独立的 dleveldb 进程，默认 :9800）：只存很小的 locator JSON 和 `$node/{nodeId}` 注册信息，不存对象正文。
 - **block 节点**（`apps/block`，默认 :9100 起）：每台机器跑 C 引擎，对象打进追加式 1GB block 文件。进程按 `recId` 查本地内存表，再读到文件里的物理位置。
 - **存储引擎**（`packages/engine`）：C 实现追加式 block 文件。记录是带校验的 TLV 帧，方便以后加字段；也可以扫描全部 `.blk` 重建索引。
-- **巡检**（`apps/patrol`，TypeScript）：读取 API 上的模块快照。规则决定是否修复、compact、flush 或扩容。配置了模型时，由 Deep Agents 把发现写成中文结论。它不保存对象正文。说明见 [能力](capabilities.md#9-模块巡检)。
+- **巡检 AI**（`apps/patrol`，TypeScript，随仓库提供）：不在写入路径上。规则根据模块快照执行修复、compact、flush 或扩容。Deep Agents 把发现和已执行的动作写成中文结论，不读对象正文，不删除、不重启、不缩容。说明见 [能力](capabilities.md#9-模块巡检)。
 
 对象值写在各 block 节点 `data/blocks/` 下的大文件里，默认每块 1GB（`S3DFS_BLOCK_SIZE`），写满再切新文件。
 

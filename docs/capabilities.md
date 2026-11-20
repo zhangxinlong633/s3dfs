@@ -141,7 +141,13 @@
 
 ## 9. 模块巡检
 
-巡检进程是 TypeScript 包 `@s3dfs/patrol`，用 `pnpm patrol` 启动。它使用请求头 `x-s3dfs-patrol-token`，不使用对象读写密钥，也读不到对象正文。API 按索引、block、布局、修复、API、扩缩、告警七个模块生成带数字的发现。活副本不足时修复，空洞比例达到阈值时 compact，写缓冲有未落盘字节时 flush，负载持续高且已配置扩容脚本时扩容。缩容、删除和重启只出现在决定里。
+系统自带巡检 AI。进程是 `@s3dfs/patrol`，用 `pnpm patrol` 启动，使用请求头 `x-s3dfs-patrol-token`，不使用对象读写密钥。
+
+| 谁 | 作用 |
+| --- | --- |
+| 规则 | 读索引、block、布局、修复、API、扩缩、告警的数字。活副本不足时修复，空洞比例达到阈值时 compact，写缓冲有未落盘字节时 flush，负载持续高且已配置扩容脚本时扩容 |
+| 模型 | 按这七个模块把数字和已经执行的动作写成给值班人看的中文结论。默认是本机 LM Studio 的 Gemma 4 26B |
+| 模型不做 | 不读对象正文，不删除对象，不重启进程，不执行缩容。`S3DFS_PATROL_MODEL=off` 时结论改用规则摘要 |
 
 `GET /_s3dfs/decisions` 返回最近一次发现和决定。默认由本机 LM Studio 的 Gemma 4 26B（`google/gemma-4-26b-a4b`，`http://127.0.0.1:1234/v1`）逐个模块写中文结论。2026-11-20 的第一次完整运行记在 [从自启到巡检结论](milestones/2026-11-20-first-patrol.md)。变量见 [模块巡检助手](superpowers/specs/2026-11-20-patrol-design.md)。
 

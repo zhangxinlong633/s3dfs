@@ -10,8 +10,11 @@ S3-compatible object storage. The control plane is TypeScript (Nest.js / Next.js
 | Body | Block machines that only run the packed-block engine |
 | Replicas | 3 by default. A majority is enough to acknowledge the write; repair fills the rest |
 | Primary path | The S3 API. A directory mount is a compatibility layer and is not a performance path |
+| Built-in AI | The patrol process ships in the repo. Rules run useful maintenance. The model writes a conclusion from each module |
 
 Objects are packed into ~1 GiB `.blk` files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files. Placement lives in dleveldb locators. The control plane compresses with zstd by default and stores the original bytes, with `compressType=none`, when compression does not shrink the value.
+
+The store ships with a patrol AI, `apps/patrol`. It is not on the write path. Once a day it reads the index, block nodes, layout, repair, API, scaling, and alerts. Rules repair short replicas, compact a hole-heavy node, flush a dirty buffer, and scale up when load stays high and a script is configured. The model turns those numbers and the actions already taken into a conclusion for the operator. It does not read object bytes, and it does not delete data, restart processes, or scale down. The default model is Gemma 4 26B in local LM Studio. `S3DFS_PATROL_MODEL=off` keeps the rule patrol. The conclusion is `GET /_s3dfs/decisions`.
 
 ## Documents
 
