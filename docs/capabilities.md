@@ -20,11 +20,15 @@
 - 管理接口：`GET /_s3dfs/stats|cluster|buckets`，`POST /_s3dfs/flush|compact|repair`
 - 控制台查看统计、桶、block 节点状态，并触发 flush。删除先出票，空闲或手动 compact 再回收空洞（`POST /_s3dfs/flush|compact`，以及 block 上的 `POST /_s3dfs/block/compact`）
 - 独立挂载程序 `apps/fuse`（`s3dfs-fuse`）：把一个桶挂成本地目录，给改不了 S3 接口的程序用。路径对应对象 key，内容仍走 S3 API 再进 block；写入是关闭时整文件上传，每个文件一次完整 Put。Linux 走 `/dev/fuse`；本机没有 FUSE 时，macOS 会再经过本机 WebDAV 和 `mount_webdav`，会更慢。挂载尤其是大量小文件时，明显慢于直接调用 S3 API，不要用这些数字代表引擎或集群性能。说明见 [FUSE 方案](design-fuse.md)
+- AWS CLI 默认上传：解开 `aws-chunked`（含 chunk signature 和校验和 trailer），按 `x-amz-decoded-content-length` 核对后再落盘
+- 分片上传：`POST ?uploads`、`PUT ?partNumber&uploadId`、`POST ?uploadId`、`DELETE ?uploadId`。分片暂存在 API 进程内存里，拼完再写入 block；API 重启后未完成的上传会丢。最终对象的 ETag 仍是整段正文的 CRC32
+- 删除空桶（`DELETE /bucket`）。桶里还有对象时返回 `BucketNotEmpty`
 
 ## 还不做的
 
 - 完整 AWS SigV4 鉴权（环境变量里的 access/secret 尚未生效）
-- 流式上传 / 下载；S3 分片上传（Multipart）
+- 流式上传 / 下载。HTTP 层仍会把整个 body 读进进程内存；分片完成时也是一次整对象写入
+- C S3 网关上的 `aws-chunked`、分片上传和删桶。上面三条目前只在 Nest S3 API（默认 :9000）
 - 纠删码
 - 把对象值放进 dleveldb；索引里只有 locator JSON，正文始终在 block 文件里
 - 退役失效的数据 locator，以及在没有活副本时把对象救回来；故障时哪些还能继续，见 [故障与恢复](design-recovery.md)

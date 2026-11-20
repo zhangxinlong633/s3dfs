@@ -194,6 +194,18 @@ export class ObjectCluster {
     return true;
   }
 
+  async deleteBucket(bucket: string): Promise<'ok' | 'missing' | 'notempty'> {
+    if (!(await this.bucketExists(bucket))) {
+      return 'missing';
+    }
+    const listed = await this.list(bucket, '', undefined, 1);
+    if (listed.objects.length > 0 || listed.prefixes.length > 0 || listed.truncated) {
+      return 'notempty';
+    }
+    await this.kv.delete(this.objectKey(bucket));
+    return 'ok';
+  }
+
   async createBucket(bucket: string): Promise<void> {
     const marker = this.objectKey(bucket);
     if (!(await this.kv.head(marker))) {

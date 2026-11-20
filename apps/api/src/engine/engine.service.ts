@@ -87,6 +87,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     await this.cluster.createBucket(bucket);
   }
 
+  async deleteBucket(bucket: string): Promise<'ok' | 'missing' | 'notempty'> {
+    return this.cluster.deleteBucket(bucket);
+  }
+
   async bucketExists(bucket: string): Promise<boolean> {
     return this.cluster.bucketExists(bucket);
   }

@@ -84,3 +84,24 @@ export function listObjectsXml(opts: {
 export function etagFromCrc(crc: number): string {
   return `"${crc.toString(16).padStart(8, '0')}"`;
 }
+
+export function initiateMultipartXml(bucket: string, key: string, uploadId: string): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>${xmlEscape(bucket)}</Bucket>
+  <Key>${xmlEscape(key)}</Key>
+  <UploadId>${xmlEscape(uploadId)}</UploadId>
+</InitiateMultipartUploadResult>
+`;
+}
+
+export function completeMultipartXml(opts: { location: string; bucket: string; key: string; etag: string }): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>${xmlEscape(opts.location)}</Location>
+  <Bucket>${xmlEscape(opts.bucket)}</Bucket>
+  <Key>${xmlEscape(opts.key)}</Key>
+  <ETag>${xmlEscape(opts.etag)}</ETag>
+</CompleteMultipartUploadResult>
+`;
+}
