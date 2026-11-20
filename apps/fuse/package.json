@@ -4,8 +4,8 @@
   "private": true,
   "description": "FUSE / mount client for a s3dfs bucket",
   "scripts": {
-    "build": "go build -o s3dfs-fuse .",
-    "test": "go test ./...",
+    "build": "make",
+    "test": "make test",
     "typecheck": "node -e \"process.exit(0)\""
   }
 }

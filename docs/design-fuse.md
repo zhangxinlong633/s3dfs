@@ -2,7 +2,7 @@
 
 这套方案的**第一期已经落地**。它是对象存储上的兼容层，不是更快的写入路径。能直接使用 S3 API 的应用应当走 Put / Get，不要为了性能去挂载。独立进程 `apps/fuse`（`s3dfs-fuse`）把一个桶映射成本地目录，给只认路径和 `open` / `read` / `write` 的程序用。不改 packed-block 引擎，也不把 POSIX 语义做进 `.blk` 或 dleveldb。
 
-已经做的：S3 List 支持 `delimiter=/` 和 CommonPrefixes；GET/HEAD 支持单个 `Range`（HTTP 206）。挂载层采用关闭时整文件上传，目录是对象前缀。Linux 上通过 `/dev/fuse`（`go-fuse`）挂载。本机没有 FUSE 内核接口时（例如未安装 macFUSE 的 macOS），同一进程会在本机开一个 WebDAV，再用系统的 `mount_webdav` 挂上，语义与第一期约定相同，但会多一层协议，通常更慢。流式传输、分片上传、服务端 Copy、完整签名，以及 macFUSE / FUSE-T 仍属于后续阶段。
+已经做的：S3 List 支持 `delimiter=/` 和 CommonPrefixes；GET/HEAD 支持单个 `Range`（HTTP 206）。挂载层采用关闭时整文件上传，目录是对象前缀。Linux 上没有 libfuse 时直接对 `/dev/fuse` 说话；装了 libfuse 或 macFUSE 时走 libfuse。本机没有 FUSE 内核接口时（例如未安装 macFUSE 的 macOS），同一进程会在本机开一个 WebDAV，再用系统的 `mount_webdav` 挂上，语义与第一期约定相同，但会多一层协议，通常更慢。流式传输、分片上传、服务端 Copy、完整签名，以及 FUSE-T 仍属于后续阶段。
 
 FUSE 本身不是网络文件系统协议。远程访问靠客户端本机跑一个挂载进程，再通过 HTTP 访问集群的 S3 API。看起来像本地目录，底下仍是对象的 Put / Get。每个文件在关闭时都是一次完整对象上传，再叠加 FUSE 或 WebDAV 的元数据请求，所以大量小文件会明显慢于直接调用 S3 API。不要用挂载目录上测到的文件数/秒去代表引擎或集群性能。Linux 上上传发生在 FUSE 的 `Release` 里，`Flush` 目前是空操作，应用侧的 `close` 可能在对象对 API 可见之前就返回；这和「关闭成功后应当能马上读到自己写的内容」还有差距。
 
@@ -28,7 +28,7 @@ FUSE 本身不是网络文件系统协议。远程访问靠客户端本机跑一
 
 可选的后路是：S3 再补齐后，也可以直接用 s3fs、goofys 去挂。先自研一层，是因为当时 API 还缺 delimiter 列举和 Range；这两项现在已经有了，但还没有 Multipart、流式读写和完整签名，现成工具仍不一定好用。等 S3 更完整之后，也可以把自研 FUSE 换成这些工具，集群不用再改。产品主路径仍然是把 S3 协议做好。
 
-语言上用 Go（`go-fuse`）做一个小二进制，而不是在 Nest/TypeScript 里做 FUSE。Linux 对接 `/dev/fuse`（当前不依赖 fuse3）；macOS 若没有 macFUSE，则走本机 WebDAV。
+语言上是一个 C 程序，而不是 Go，也不是在 Nest/TypeScript 里做 FUSE。Linux 没装 libfuse 时直接对接 `/dev/fuse`；有 libfuse 或 macFUSE 时用 libfuse 的高层接口。macOS 若没有 macFUSE，则走本机 WebDAV。
 
 ## 路径怎么对应
 
@@ -155,12 +155,12 @@ s3dfs-fuse --endpoint http://127.0.0.1:9000 --bucket mybucket /mnt/s3dfs
 
 ```
 cd apps/fuse
-go build -o s3dfs-fuse .
+make
 mkdir -p /mnt/s3dfs
 ./s3dfs-fuse --endpoint http://127.0.0.1:9000 --bucket mybucket /mnt/s3dfs
 ```
 
-需要 Go 1.22 或更新。二进制 `apps/fuse/s3dfs-fuse` 已加入 gitignore。Linux 上直接走 `/dev/fuse`。在未安装 macFUSE 的 macOS 上，进程会打印正在改用本机 WebDAV，然后调用 `mount_webdav`。结束时 Ctrl-C 会卸载。
+需要 C 编译器。`make test` 用内置的假 S3 服务检查关闭时上传、列目录、改名和 Range。二进制 `apps/fuse/s3dfs-fuse` 已加入 gitignore。这台机器如果装了 macFUSE（`/usr/local/include/fuse`），会链 libfuse；否则 macOS 打印正在改用本机 WebDAV，然后调用 `mount_webdav`。Linux 上若没有 libfuse 开发包，则直接对 `/dev/fuse`。结束时 Ctrl-C 会卸载。
 
 ## 成功标准（第一期）
 

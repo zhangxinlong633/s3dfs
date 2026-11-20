@@ -26,3 +26,10 @@ packages/dleveldb/**
 !packages/dleveldb/README.md
 
 apps/fuse/s3dfs-fuse
+apps/fuse/s3dfs-fuse-test
+apps/fuse/*.dSYM
+
+apps/s3-gateway/s3dfs-s3-gateway
+apps/s3-gateway/*.o
+apps/s3-gateway/src/*.o
+apps/s3-gateway/vendor/*.o
