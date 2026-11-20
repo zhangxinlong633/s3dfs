@@ -13,6 +13,19 @@ export {
 export { NodeRegistry, parseBlockNodes, parseIndexUrls, type SeedNode } from './registry.js';
 export { ObjectCluster, assessLayout, serviceHealthy, strictLayoutEnabled, writeQuorum, type ClusterStats, type LayoutReport, type RepairReport } from './cluster.js';
 export {
+  apiStopAllowed,
+  blockStopAllowed,
+  decideScale,
+  indexStopAllowed,
+  loadScaleConfig,
+  type RoleLoad,
+  type ScaleConfig,
+  type ScaleDecision,
+  type ScaleLoads,
+  type ScaleReason,
+  type ScaleRole,
+} from './scale.js';
+export {
   NODE_PREFIX,
   isNodeKey,
   isReplicaLocatorKey,

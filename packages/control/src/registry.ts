@@ -34,12 +34,21 @@ export class NodeRegistry {
   }
 
   live(): BlockNodeInfo[] {
-    const up = this.list().filter((n) => n.status === 'up');
+    const candidates = this.list().filter((node) => !node.draining);
+    const up = candidates.filter((n) => n.status === 'up');
     if (up.length > 0) {
       return up;
     }
     // Before the first health pass, allow seeds so a put can still proceed.
-    return this.list().filter((n) => n.status === 'unknown');
+    return candidates.filter((n) => n.status === 'unknown');
+  }
+
+  noteDraining(nodeId: string, draining: boolean): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) {
+      return;
+    }
+    this.nodes.set(nodeId, { ...node, draining });
   }
 
   get(nodeId: string): BlockNodeInfo | undefined {
@@ -94,6 +103,7 @@ export class NodeRegistry {
             status: 'up',
             lastSeenMs: Date.now(),
             zone: node.zone,
+            draining: node.draining,
           }
         : {
             ...node,

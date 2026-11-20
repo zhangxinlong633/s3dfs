@@ -57,6 +57,7 @@ export class S3Controller {
     const requestId = randomBytes(8).toString('hex');
     const started = Date.now();
     res.setHeader('x-amz-request-id', requestId);
+    this.engine.beginRequest();
     let status = 500;
     try {
       if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
@@ -65,7 +66,7 @@ export class S3Controller {
         const lost = this.engine.lostCount();
         const ok = serviceHealthy(indexOk, layout, lost);
         status = ok ? 200 : 503;
-        res.status(status).json({ ok, indexOk, lost, ...layout });
+        res.status(status).json({ indexOk, lost, ...layout, ok });
         return;
       }
       if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {
@@ -108,6 +109,7 @@ export class S3Controller {
       }
       status = 503;
     } finally {
+      this.engine.finishRequest(req.method ?? 'GET', Date.now() - started);
       this.metrics.record(status);
       console.log(
         JSON.stringify({

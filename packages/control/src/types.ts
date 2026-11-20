@@ -9,6 +9,8 @@ export interface BlockNodeInfo {
   lastError?: string;
   /** Failure domain. Placement takes one node from a zone before using that zone again. */
   zone?: string;
+  /** New writes skip this node until a scale-down finishes or is cancelled. */
+  draining?: boolean;
 }
 
 export interface BlockStats {

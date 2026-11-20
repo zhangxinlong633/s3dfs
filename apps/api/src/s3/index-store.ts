@@ -57,7 +57,7 @@ export class IndexUploadStore implements UploadStore {
     };
     const parts = new Map<number, StoredPart>();
     for (const [num, part] of Object.entries(meta.parts)) {
-      const body = await this.objects.get(meta.bucket, partKey(id, num));
+      const body = await this.objects.get(meta.bucket, partKey(id, Number(num)));
       if (!body) {
         continue;
       }

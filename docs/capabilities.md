@@ -43,6 +43,7 @@
 | --- | --- |
 | 健康检查 | 定期探测 block。Get / Put 跳过 down 节点。Get 在本次请求内尝试剩余副本 |
 | 副本补齐 | 活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役 down 的 locator。`POST /_s3dfs/repair`，后台默认 30 秒。没有任何活副本记为 `lost`，健康检查 503 |
+| 自动扩缩 | 配置 `S3DFS_SCALE_UP_CMD` 与 `S3DFS_SCALE_DOWN_CMD` 后，API 按容量和延迟决定增减索引、block 或 API。缩容前先排空。未配置脚本时不动作。变量见 [自动扩缩](#7-自动扩缩) |
 | 管理接口 | `GET /_s3dfs/stats\|cluster\|buckets\|health\|metrics`，`POST /_s3dfs/flush\|compact\|repair` |
 | 控制台 | 查看统计、桶、节点，并触发 flush |
 | 重启 | 优先读 `recmap.s3m`，再补扫新数据。快照不可用则扫描全部 `.blk` |
@@ -103,3 +104,25 @@
 - 列举跳过 `key:1`、`key:2` 这类副本后缀、`$node/` 注册项，以及路径中含 `/$` 的内部对象。对象 key 不要以 `:数字` 结尾。
 - 多节点语义见 [索引与 block 集群](design-replication.md)。dleveldb 自己的 KV 复制见该仓库文档。
 - 大文件与 Range 见 [大文件跨 block 存放](design-large-object.md)。HTTP Put 仍把整个 body 读进 API 进程。
+
+## 7. 自动扩缩
+
+评估器在 API 进程内，默认 30 秒一次。只有同时配置了扩容或缩容脚本才会运行。多台 API 通过索引租约保证同一时刻只有一台做决定。
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `S3DFS_SCALE_INTERVAL_MS` | `30000` | 评估间隔。`0` 关闭 |
+| `S3DFS_SCALE_UP_CMD` | 未设置 | 扩容脚本。环境变量 `S3DFS_SCALE_ROLE`、`S3DFS_SCALE_REASON` |
+| `S3DFS_SCALE_DOWN_CMD` | 未设置 | 缩容脚本。另有 `S3DFS_SCALE_NODE_ID`、`S3DFS_SCALE_ADDRESS` |
+| `S3DFS_SCALE_HIGH_RATIO` / `S3DFS_SCALE_LOW_RATIO` | `0.80` / `0.40` | 容量高低阈值 |
+| `S3DFS_SCALE_HIGH_LATENCY_MS` / `S3DFS_SCALE_LOW_LATENCY_MS` | `200` / `50` | 延迟 p99 高低阈值 |
+| `S3DFS_SCALE_HIGH_STREAK` | `3` | 连续超阈值多少个周期才扩容 |
+| `S3DFS_SCALE_COOLDOWN_MS` | `300000` | 同一角色两次动作的最短间隔 |
+| `S3DFS_BLOCK_CAPACITY_BYTES` | 未设置 | 单台 block 容量。未设置时 block 只按写入延迟扩缩 |
+| `S3DFS_INDEX_CAPACITY_BYTES` | 未设置 | 单台索引的容量分母 |
+| `S3DFS_INDEX_USED_BYTES` | `0` | 当前索引已用字节。未设置时索引按 key 数量和写入延迟判断 |
+| `S3DFS_INDEX_MAX_KEYS` | `100000000` | 索引 key 数量上限 |
+| `S3DFS_API_MAX_INFLIGHT` | `128` | API 在途请求上限 |
+| `S3DFS_API_NODES` | `1` | 当前 API 进程数，供缩容时保留最后一台 |
+
+脚本退出码非 0 只记日志，不记入冷却时间。block 仍有 locator、故障域不足、索引少于 3 台或达不到法定人数、API 仍有在途请求时，不执行缩容脚本。设计说明见 [自动扩缩容](superpowers/specs/2026-11-20-autoscaling-design.md)。

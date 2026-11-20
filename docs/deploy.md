@@ -54,6 +54,10 @@ S3DFS_SECRET_KEY=...
 
 客户端使用官方 AWS CLI，把 `--endpoint-url` 指到负载均衡后面的 API，并设置 `addressing_style = path`。密钥与 API 相同。ETag 是 CRC32，不是 MD5。命令见仓库 README 的「用 AWS CLI 接入」。
 
+## 5. 自动扩缩
+
+容量和延迟由 API 里的评估器判断。真正开机、关机执行 `S3DFS_SCALE_UP_CMD` 和 `S3DFS_SCALE_DOWN_CMD`。脚本未配置时，这一层不运行。阈值和排空条件见 [能力](capabilities.md) 的自动扩缩一节。
+
 C 网关使用同一对密钥和同一套法定人数、故障域规则。它认 `x-amz-date`，不认只有 `Date` 的请求。默认上线入口是 Nest API。AWS CLI 应指向 Nest API。
 
 ## 4. 单机
