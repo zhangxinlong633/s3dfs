@@ -27,6 +27,7 @@ export interface BlockStats {
   indexSlots: number;
   deadBytes?: number;
   tickets?: number;
+  unflushedBytes?: number;
 }
 
 export interface BlockHealth extends BlockNodeInfo {

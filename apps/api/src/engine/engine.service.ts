@@ -16,6 +16,7 @@ import { IndexConfigStore, IndexUploadStore } from '../s3/index-store';
 import { MultipartUploads } from '../s3/multipart';
 import { applyLifecycle } from '../s3/product';
 import { deliverCare, emptyCareState, markCareDelivered, reviewCare, type CareIncident, type CareState } from '../s3/care';
+import { compactSnapshot, executePatrol, reviewPatrol, type PatrolReport, type PatrolSnapshot } from '../s3/patrol';
 import {
   acquireScaleLease,
   emptyScaleMemory,
@@ -52,6 +53,14 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   private scaleMemory: ScaleMemory = emptyScaleMemory();
   private careState: CareState = emptyCareState();
   private readonly incidents = new Map<string, CareIncident>();
+  private lastRepair: RepairReport | null = null;
+  private patrolReport: PatrolReport = {
+    findings: [],
+    decisions: [],
+    apply: [],
+    summary: '',
+    truncated: false,
+  };
 
   async onModuleInit(): Promise<void> {
     const urls = parseIndexUrls(process.env.S3DFS_INDEX_URLS ?? 'http://127.0.0.1:9800');
@@ -76,8 +85,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
           return;
         }
         this.repairing = true;
-        void this.cluster
-          .repair()
+        void this.repair()
           .then(async (report) => {
             await this.applyLifecycle();
             await this.reviewCare(report.lost);
@@ -202,7 +210,107 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   }
 
   async repair(): Promise<RepairReport> {
-    return this.cluster.repair();
+    const report = await this.cluster.repair();
+    this.lastRepair = report;
+    return report;
+  }
+
+  decisions(): PatrolReport {
+    return this.patrolReport;
+  }
+
+  notePatrolSummary(summary: string): PatrolReport {
+    this.patrolReport = { ...this.patrolReport, summary: summary.slice(0, 4000) };
+    return this.patrolReport;
+  }
+
+  async moduleSnapshot(): Promise<PatrolSnapshot> {
+    const stats = await this.stats();
+    const layout = this.layout();
+    const config = loadScaleConfig();
+    const memory = this.scaleMemory;
+    const streak = Math.max(memory.streak.index, memory.streak.block, memory.streak.api);
+    const lastActionMs = Math.max(memory.lastActionMs.index, memory.lastActionMs.block, memory.lastActionMs.api);
+    const counts = await this.locatorCounts();
+    let indexLatency = 0;
+    const started = Date.now();
+    try {
+      await this.kv.put('$patrol/probe', Buffer.from(String(started)));
+      indexLatency = Date.now() - started;
+    } catch {
+      indexLatency = config.highLatencyMs + 1;
+    }
+    const wants = streak >= config.highStreak ? 'up' : memory.draining ? 'down' : 'none';
+    return compactSnapshot({
+      now: Date.now(),
+      index: {
+        ok: await this.kv.ping(),
+        keys: stats.objects,
+        latencyP99Ms: indexLatency,
+        copiesMatch: await this.indexCopiesMatch(),
+      },
+      block: {
+        nodes: stats.blockNodes.map((node) => ({
+          nodeId: node.nodeId,
+          up: node.status === 'up',
+          zone: node.zone,
+          bytesOnDisk: node.stats?.bytesOnDisk ?? 0,
+          deadBytes: node.stats?.deadBytes ?? 0,
+          locators: counts === 'incomplete' ? 1 : (counts.get(node.nodeId) ?? 0),
+          draining: Boolean(node.draining),
+          unflushedBytes: node.stats?.unflushedBytes ?? 0,
+        })),
+      },
+      layout: {
+        ok: layout.ok,
+        strict: layout.strict,
+        dataReplicas: layout.dataReplicas,
+        liveBlocks: layout.liveBlocks,
+        failureDomains: layout.failureDomains,
+      },
+      repair: {
+        lost: this.lostCount(),
+        shortCopies: (this.lastRepair?.repaired ?? 0) + (this.lastRepair?.failed ?? 0),
+      },
+      api: {
+        inflight: this.inflight,
+        latencyP99Ms: percentile99(this.apiLatency),
+        maxInflight: config.apiMaxInflight,
+      },
+      scale: {
+        wants,
+        upConfigured: Boolean(process.env.S3DFS_SCALE_UP_CMD),
+        streak,
+        highStreak: config.highStreak,
+        lastActionMs,
+        cooldownMs: config.cooldownMs,
+        draining: Boolean(memory.draining),
+      },
+      care: { open: Object.keys(this.careState.open).length },
+      compactDeadRatio: Number(process.env.S3DFS_COMPACT_DEAD_RATIO ?? 0.2) || 0.2,
+      highLatencyMs: config.highLatencyMs,
+    });
+  }
+
+  async patrol(): Promise<PatrolReport> {
+    const report = reviewPatrol(await this.moduleSnapshot());
+    await executePatrol(report, {
+      repair: () => this.repair().then(() => undefined),
+      compact: () => this.compact(),
+      flush: () => this.flush(),
+      scaleUp: async () => {
+        const cmd = process.env.S3DFS_SCALE_UP_CMD;
+        if (!cmd) {
+          return;
+        }
+        const role = (['index', 'block', 'api'] as const).reduce((best, item) =>
+          this.scaleMemory.streak[item] > this.scaleMemory.streak[best] ? item : best,
+        );
+        await runScaleCommand(cmd, { S3DFS_SCALE_ROLE: role, S3DFS_SCALE_REASON: 'patrol' });
+      },
+    });
+    this.patrolReport = report;
+    return report;
   }
 
   async applyLifecycle(): Promise<void> {
@@ -391,7 +499,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   private async indexCopiesMatch(): Promise<boolean> {
     const urls = this.kv.endpoints;
     if (urls.length < 2) {
-      return false;
+      return true;
     }
     try {
       const page = await this.kv.scan({ prefix: '', maxKeys: 20 });

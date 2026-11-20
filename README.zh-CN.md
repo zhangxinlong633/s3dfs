@@ -25,6 +25,7 @@ S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js），落�
 | [索引与 block](docs/design-replication.md) | 区分两套副本的人 | 放置、健康检查、法定人数 |
 | [基准](docs/benchmarks.md) | 引用数字的人 | 2026-11-17 本机测量的完整表格 |
 | [待办](docs/todo.md) | 排期的人 | 尚未关闭的事项 |
+| [第一次巡检](docs/milestones/2026-11-20-first-patrol.md) | 想看系统第一次自己跑通的人 | 2026-11-20 从自启到本机模型结论 |
 
 ## 一次写入
 
@@ -48,6 +49,7 @@ flowchart LR
 apps/api         Nest.js 12，S3 API，默认 :9000
 apps/web         Next.js 16 控制台，默认 :9001
 apps/block       packed-block 节点，默认 :9100
+apps/patrol      巡检进程，TypeScript 的 Deep Agents
 packages/engine  C 引擎与 N-API 绑定
 packages/control 索引客户端、放置、健康检查
 docs/            产品与设计文档
@@ -57,7 +59,7 @@ docs/            产品与设计文档
 
 ## 开始使用
 
-需要 Node 26、pnpm 9、Bun 1.4+、Python 3、C/C++ 编译器，以及旁边的 dleveldb 仓库（默认 `../dleveldb`）。
+需要 Node 26、pnpm 9、Bun 1.4+、C/C++ 编译器，以及旁边的 dleveldb 仓库（默认 `../dleveldb`）。产品代码只有 TypeScript 和 C。编译引擎时 node-gyp 可能调用本机 Python，那不是产品语言。约束见 [架构](docs/architecture.md#语言)。
 
 ```bash
 git clone https://github.com/zhangxinlong633/dleveldb.git
@@ -70,9 +72,10 @@ pnpm dev:index    # http://127.0.0.1:9800
 pnpm dev:block    # http://127.0.0.1:9100
 pnpm dev:api      # http://127.0.0.1:9000
 pnpm dev:web      # http://127.0.0.1:9001
+S3DFS_PATROL_TOKEN=本机凭证 S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
 ```
 
-`pnpm dev:api` 把副本设为 1 并关闭严格布局，供单机开发。生产部署见 [部署](docs/deploy.md)。
+`pnpm dev:api` 把副本设为 1 并关闭严格布局，供单机开发。巡检进程和 API 使用同一个 `S3DFS_PATROL_TOKEN`。生产部署见 [部署](docs/deploy.md)。第一次从自启到模型结论的记录见 [里程碑](docs/milestones/2026-11-20-first-patrol.md)。
 
 ## 用 AWS CLI 接入
 

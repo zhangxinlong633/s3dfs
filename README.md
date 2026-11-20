@@ -26,6 +26,7 @@ Design documents are in Chinese.
 | [Recovery](docs/design-recovery.md) | Someone judging failure impact | Which requests continue |
 | [Benchmarks](docs/benchmarks.md) | Someone citing numbers | Full tables from the 2026-11-17 single-host run |
 | [Todo](docs/todo.md) | Someone scheduling work | Items that are still open |
+| [First patrol](docs/milestones/2026-11-20-first-patrol.md) | Someone looking for the first end-to-end run | 2026-11-20, from process start to the local model's conclusion |
 
 ## One write
 
@@ -49,6 +50,7 @@ Install and compile with pnpm 9+ and Node.js 26+. Node processes run on Bun 1.4+
 apps/api         Nest.js 12 S3 API, default :9000
 apps/web         Next.js 16 console, default :9001
 apps/block       packed-block node, default :9100
+apps/patrol      patrol process, Deep Agents in TypeScript
 packages/engine  C engine and N-API binding
 packages/control index client, placement, health checks
 docs/            product and design documents
@@ -58,7 +60,7 @@ The in-tree `packages/dleveldb` directory is historical and is not part of the b
 
 ## Start
 
-Requires Node 26, pnpm 9, Bun 1.4+, Python 3, a C/C++ compiler, and a dleveldb checkout at `../dleveldb`.
+Requires Node 26, pnpm 9, Bun 1.4+, a C/C++ compiler, and a dleveldb checkout at `../dleveldb`. Product code is TypeScript and C. node-gyp may call a local Python while compiling the engine; that Python is not a product language. The constraint is in [Architecture](docs/architecture.md).
 
 ```bash
 git clone https://github.com/zhangxinlong633/dleveldb.git
@@ -71,9 +73,10 @@ pnpm dev:index
 pnpm dev:block
 pnpm dev:api
 pnpm dev:web
+S3DFS_PATROL_TOKEN=local-token S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
 ```
 
-`pnpm dev:api` sets one replica and turns strict layout off, for a single machine. Production layout is in [Deploy](docs/deploy.md).
+`pnpm dev:api` sets one replica and turns strict layout off, for a single machine. The patrol process and the API share `S3DFS_PATROL_TOKEN`. Production layout is in [Deploy](docs/deploy.md). The first boot-to-conclusion run is in [First patrol](docs/milestones/2026-11-20-first-patrol.md).
 
 ## Connect with the AWS CLI
 

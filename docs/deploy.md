@@ -51,6 +51,9 @@ S3DFS_SECRET_KEY=...
 | --- | --- |
 | `GET /_s3dfs/health` | 索引不可达、严格布局不成立，或本进程修复记过 `lost` 时返回 503，响应含 `lost`。进程重启后该计数从 0 重新累加 |
 | `GET /_s3dfs/metrics` | 自进程启动以来的状态码计数，不经过控制台 |
+| `GET /_s3dfs/modules` | 七个模块的内部数字。请求头 `x-s3dfs-patrol-token` 必须与 `S3DFS_PATROL_TOKEN` 一致 |
+| `GET /_s3dfs/decisions` | 最近一次巡检的发现、决定和中文结论 |
+| `POST /_s3dfs/patrol` | 按规则生成决定，并执行有利的维护动作 |
 
 客户端使用官方 AWS CLI，把 `--endpoint-url` 指到负载均衡后面的 API，并设置 `addressing_style = path`。密钥与 API 相同。ETag 是 CRC32，不是 MD5。命令见仓库 README 的「用 AWS CLI 接入」。
 
@@ -63,3 +66,9 @@ C 网关使用同一对密钥和同一套法定人数、故障域规则。它认
 ## 4. 单机
 
 一条索引、一台 block、一台 API 即可运行。数据目录、端口和启动命令以仓库 README 为准。单机布局用于开发和验证，不按第 1 节称为可承接业务的部署。
+
+## 6. 巡检
+
+巡检是单独的 TypeScript 进程，用 `pnpm patrol` 启动。API 和巡检进程配置同一个 `S3DFS_PATROL_TOKEN`。未配置时，模块快照和决定接口返回 401。
+
+进程默认每天跑一次。`S3DFS_PATROL_INTERVAL_MS=0` 只跑一轮。模型默认是本机 LM Studio 的 Gemma 4 26B。`S3DFS_PATROL_MODEL=off` 时只留下规则结论。变量、动作边界和 2026-11-20 的第一次运行见 [能力](capabilities.md#9-模块巡检) 与 [从自启到巡检结论](milestones/2026-11-20-first-patrol.md)。

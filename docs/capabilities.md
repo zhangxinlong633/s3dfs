@@ -44,7 +44,7 @@
 | 健康检查 | 定期探测 block。Get / Put 跳过 down 节点。Get 在本次请求内尝试剩余副本 |
 | 副本补齐 | 活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役 down 的 locator。`POST /_s3dfs/repair`，后台默认 30 秒。没有任何活副本记为 `lost`，健康检查 503 |
 | 自动扩缩 | 配置 `S3DFS_SCALE_UP_CMD` 与 `S3DFS_SCALE_DOWN_CMD` 后，API 按容量和延迟决定增减索引、block 或 API。缩容前先排空。未配置脚本时不动作。变量见 [自动扩缩](#7-自动扩缩) |
-| 管理接口 | `GET /_s3dfs/stats\|cluster\|buckets\|health\|metrics`，`POST /_s3dfs/flush\|compact\|repair` |
+| 管理接口 | `GET /_s3dfs/stats\|cluster\|buckets\|health\|metrics`，`POST /_s3dfs/flush\|compact\|repair`。巡检另有 `GET /_s3dfs/modules\|decisions` 和 `POST /_s3dfs/patrol`，见 [模块巡检](#9-模块巡检) |
 | 控制台 | 查看统计、桶、节点，并触发 flush |
 | 重启 | 优先读 `recmap.s3m`，再补扫新数据。快照不可用则扫描全部 `.blk` |
 | 空间回收 | 删除先出票。空闲或手动 compact 回收空洞，保留原 `recId`，不必改索引 |
@@ -138,3 +138,19 @@
 | `S3DFS_PUBLIC_API_URL` | 详情链接的前缀。未设置时用 `S3DFS_ADVERTISE_ADDR` |
 
 能对应到桶时，同一份说明再发到该桶的 webhook。`GET /_s3dfs/incidents/<id>` 返回给 AI 的 JSON。设计说明见 [上线之后省心](superpowers/specs/2026-11-20-care-design.md)。
+
+## 9. 模块巡检
+
+巡检进程是 TypeScript 包 `@s3dfs/patrol`，用 `pnpm patrol` 启动。它使用请求头 `x-s3dfs-patrol-token`，不使用对象读写密钥，也读不到对象正文。API 按索引、block、布局、修复、API、扩缩、告警七个模块生成带数字的发现。活副本不足时修复，空洞比例达到阈值时 compact，写缓冲有未落盘字节时 flush，负载持续高且已配置扩容脚本时扩容。缩容、删除和重启只出现在决定里。
+
+`GET /_s3dfs/decisions` 返回最近一次发现和决定。默认由本机 LM Studio 的 Gemma 4 26B（`google/gemma-4-26b-a4b`，`http://127.0.0.1:1234/v1`）逐个模块写中文结论。2026-11-20 的第一次完整运行记在 [从自启到巡检结论](milestones/2026-11-20-first-patrol.md)。变量见 [模块巡检助手](superpowers/specs/2026-11-20-patrol-design.md)。
+
+| 变量 | 默认 | 含义 |
+| --- | --- | --- |
+| `S3DFS_PATROL_TOKEN` | 未设置 | 巡检查看凭证。API 与 `pnpm patrol` 使用同一个值。未设置时相关接口返回 401 |
+| `S3DFS_PATROL_API_URL` | `http://127.0.0.1:9000` | 巡检进程访问的 API |
+| `S3DFS_PATROL_MODEL` | `google/gemma-4-26b-a4b` | LM Studio 模型。`off` 时只跑规则 |
+| `S3DFS_PATROL_BASE_URL` | `http://127.0.0.1:1234/v1` | LM Studio 的 OpenAI 兼容地址 |
+| `S3DFS_PATROL_API_KEY` | `lm-studio` | LM Studio 不校验密钥时的占位值 |
+| `S3DFS_PATROL_MODEL_PARAMS` | `26000000000` | 小于 260 亿则不调用模型 |
+| `S3DFS_PATROL_INTERVAL_MS` | `86400000` | 巡检进程的间隔。`0` 表示只跑一次 |

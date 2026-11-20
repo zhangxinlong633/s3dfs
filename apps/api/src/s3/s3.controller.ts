@@ -7,6 +7,7 @@ import { handleS3, type S3Options } from './handle';
 import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
 import { RequestMetrics } from './metrics';
 import { MultipartUploads } from './multipart';
+import { patrolAuthorized } from './patrol';
 import { errorXml } from './s3.xml';
 
 type RawReq = Request & { rawBody?: Buffer };
@@ -72,6 +73,47 @@ export class S3Controller {
       if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {
         status = 200;
         res.status(status).json(this.metrics.snapshot());
+        return;
+      }
+      if (url.pathname === '/_s3dfs/modules' && req.method === 'GET') {
+        if (!patrolAuthorized(req.header('x-s3dfs-patrol-token'), process.env)) {
+          status = 401;
+          res.status(status).end();
+          return;
+        }
+        status = 200;
+        res.status(status).json(await this.engine.moduleSnapshot());
+        return;
+      }
+      if (url.pathname === '/_s3dfs/decisions' && req.method === 'GET') {
+        if (!patrolAuthorized(req.header('x-s3dfs-patrol-token'), process.env)) {
+          status = 401;
+          res.status(status).end();
+          return;
+        }
+        status = 200;
+        res.status(status).json(this.engine.decisions());
+        return;
+      }
+      if (url.pathname === '/_s3dfs/patrol' && req.method === 'POST') {
+        if (!patrolAuthorized(req.header('x-s3dfs-patrol-token'), process.env)) {
+          status = 401;
+          res.status(status).end();
+          return;
+        }
+        status = 200;
+        res.status(status).json(await this.engine.patrol());
+        return;
+      }
+      if (url.pathname === '/_s3dfs/patrol/summary' && req.method === 'POST') {
+        if (!patrolAuthorized(req.header('x-s3dfs-patrol-token'), process.env)) {
+          status = 401;
+          res.status(status).end();
+          return;
+        }
+        const body = JSON.parse((req.rawBody ?? Buffer.alloc(0)).toString('utf8') || '{}') as { summary?: string };
+        status = 200;
+        res.status(status).json(this.engine.notePatrolSummary(body.summary ?? ''));
         return;
       }
       if (url.pathname.startsWith('/_s3dfs/incidents/') && req.method === 'GET') {

@@ -3137,6 +3137,7 @@ void s3dfs_get_stats(s3dfs_store *s, s3dfs_stats *out)
     pthread_mutex_lock(&s->mu);
     s->stats.dead_bytes = s->dead_bytes;
     s->stats.tickets = s->tickets;
+    s->stats.unflushed_bytes = s->buf_used;
     *out = s->stats;
     pthread_mutex_unlock(&s->mu);
 }

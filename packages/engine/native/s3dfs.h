@@ -47,6 +47,7 @@ typedef struct s3dfs_stats {
     uint64_t index_slots;
     uint64_t dead_bytes;
     uint64_t tickets;
+    uint64_t unflushed_bytes;
 } s3dfs_stats;
 
 /* Optional attributes written as TLV tags so a later index rebuild can

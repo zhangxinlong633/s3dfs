@@ -13,6 +13,10 @@ s3dfs 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的�
 
 细节见 [索引与 block 集群](design-replication.md)。
 
+## 语言
+
+产品代码只有 TypeScript 和 C。控制台、S3 API、block 进程、控制库和巡检进程用 TypeScript。落盘引擎、可选的 S3 网关和 `s3dfs-fuse` 用 C。不把 Python、Go 或其他语言加进产品进程。编译 `packages/engine` 时 node-gyp 可能调用本机 Python，那只属于编译工具链。
+
 ## 分层
 
 - **控制台**（`apps/web`，Next.js，默认 :9001）：看统计、桶、block 节点状态，触发 flush。空间回收走管理接口或 block 上的 compact，见下方。
@@ -20,10 +24,11 @@ s3dfs 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的�
 - **索引集群**（独立的 dleveldb 进程，默认 :9800）：只存很小的 locator JSON 和 `$node/{nodeId}` 注册信息，不存对象正文。
 - **block 节点**（`apps/block`，默认 :9100 起）：每台机器跑 C 引擎，对象打进追加式 1GB block 文件。进程按 `recId` 查本地内存表，再读到文件里的物理位置。
 - **存储引擎**（`packages/engine`）：C 实现追加式 block 文件。记录是带校验的 TLV 帧，方便以后加字段；也可以扫描全部 `.blk` 重建索引。
+- **巡检**（`apps/patrol`，TypeScript）：读取 API 上的模块快照。规则决定是否修复、compact、flush 或扩容。配置了模型时，由 Deep Agents 把发现写成中文结论。它不保存对象正文。说明见 [能力](capabilities.md#9-模块巡检)。
 
 对象值写在各 block 节点 `data/blocks/` 下的大文件里，默认每块 1GB（`S3DFS_BLOCK_SIZE`），写满再切新文件。
 
-单机开发时起三个进程即可：一台 dleveldb、一台 block、一台 S3 API。这时有效数据副本是 1。
+单机开发时起三个进程即可：一台 dleveldb、一台 block、一台 S3 API。这时有效数据副本是 1。巡检进程可以之后再起，不参与写入路径。
 
 ## 记录格式（TLV）
 

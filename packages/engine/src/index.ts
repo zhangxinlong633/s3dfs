@@ -78,6 +78,7 @@ export interface StoreStats {
   indexSlots: number;
   deadBytes: number;
   tickets: number;
+  unflushedBytes: number;
 }
 
 interface NativeStore {

@@ -496,6 +496,7 @@ private:
         o.Set("indexSlots", Napi::Number::New(env, (double)st.index_slots));
         o.Set("deadBytes", Napi::Number::New(env, (double)st.dead_bytes));
         o.Set("tickets", Napi::Number::New(env, (double)st.tickets));
+        o.Set("unflushedBytes", Napi::Number::New(env, (double)st.unflushed_bytes));
         return o;
     }
 
