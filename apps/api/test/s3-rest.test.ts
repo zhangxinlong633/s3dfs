@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test';
 import { crc32 } from '@s3dfs/control';
 import { handleS3, type S3Backend, type S3Request } from '../src/s3/handle';
 import { MemoryUploadStore, MultipartUploads } from '../src/s3/multipart';
-import { MemoryConfigStore, MemoryVersionStore, sseKeyFromSecret } from '../src/s3/product';
+import { MemoryConfigStore, MemoryObjectMeta, MemoryVersionStore, sseKeyFromSecret } from '../src/s3/product';
 import { signRequest, type SigV4Identity } from '../src/s3/sigv4';
 
 const identity: SigV4Identity = { accessKeyId: 'AKID', secretAccessKey: 'secret' };
@@ -261,5 +261,327 @@ describe('s3 surface that was still open', () => {
     await backend.put('logs', 'a.txt', Buffer.from('abcd'));
     const usage = await call(backend, { method: 'GET', path: '/logs?usage' });
     expect(JSON.parse(usage.body.toString())).toEqual({ objects: 1, bytes: 4 });
+  });
+
+  test('removes a delete marker once it is the only version', async () => {
+    const backend = new MemBackend();
+    const versions = new MemoryVersionStore();
+    const config = new MemoryConfigStore();
+    const options = { config, versions };
+    await versions.put('logs', 'gone.txt', { id: 'marker', body: null, deleteMarker: true, mtimeMs: 1 });
+    const xml =
+      '<LifecycleConfiguration><Rule><Prefix></Prefix><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule></LifecycleConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?lifecycle', body: Buffer.from(xml) }, options);
+    const ran = await call(backend, { method: 'POST', path: '/logs?lifecycle', now: 10 }, options);
+    expect(JSON.parse(ran.body.toString()).deleteMarkers).toBe(1);
+    expect(await versions.get('logs', 'gone.txt', 'marker')).toBeNull();
+  });
+
+  test('retention blocks delete until the date, and governance can be bypassed', async () => {
+    const backend = new MemBackend();
+    const meta = new MemoryObjectMeta();
+    await call(backend, { method: 'PUT', path: '/logs/keep.txt', body: Buffer.from('keep') }, { meta });
+    const until = new Date(Date.now() + 86_400_000).toISOString();
+    const xml = `<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>${until}</RetainUntilDate></Retention>`;
+    const put = await call(backend, { method: 'PUT', path: '/logs/keep.txt?retention', body: Buffer.from(xml) }, { meta });
+    expect(put.status).toBe(200);
+    const blocked = await call(backend, { method: 'DELETE', path: '/logs/keep.txt' }, { meta });
+    expect(blocked.status).toBe(403);
+    expect(backend.objects.has('logs/keep.txt')).toBe(true);
+    const bypass = await call(
+      backend,
+      { method: 'DELETE', path: '/logs/keep.txt', headers: { 'x-amz-bypass-governance-retention': 'true' } },
+      { meta },
+    );
+    expect(bypass.status).toBe(204);
+    expect(backend.objects.has('logs/keep.txt')).toBe(false);
+  });
+
+  test('legal hold blocks delete until it is turned off', async () => {
+    const backend = new MemBackend();
+    const meta = new MemoryObjectMeta();
+    await call(backend, { method: 'PUT', path: '/logs/hold.txt', body: Buffer.from('hold') }, { meta });
+    const on = await call(
+      backend,
+      { method: 'PUT', path: '/logs/hold.txt?legal-hold', body: Buffer.from('<LegalHold><Status>ON</Status></LegalHold>') },
+      { meta },
+    );
+    expect(on.status).toBe(200);
+    const blocked = await call(
+      backend,
+      { method: 'DELETE', path: '/logs/hold.txt', headers: { 'x-amz-bypass-governance-retention': 'true' } },
+      { meta },
+    );
+    expect(blocked.status).toBe(403);
+    await call(
+      backend,
+      { method: 'PUT', path: '/logs/hold.txt?legal-hold', body: Buffer.from('<LegalHold><Status>OFF</Status></LegalHold>') },
+      { meta },
+    );
+    const removed = await call(backend, { method: 'DELETE', path: '/logs/hold.txt' }, { meta });
+    expect(removed.status).toBe(204);
+  });
+
+  test('a website index document is returned for a directory request', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const xml = '<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>';
+    const put = await call(backend, { method: 'PUT', path: '/logs?website', body: Buffer.from(xml) }, { config });
+    expect(put.status).toBe(200);
+    await call(backend, { method: 'PUT', path: '/logs/index.html', body: Buffer.from('home') }, { config });
+    await call(backend, { method: 'PUT', path: '/logs/docs/index.html', body: Buffer.from('docs') }, { config });
+    const root = await call(backend, { method: 'GET', path: '/logs/' }, { config });
+    expect(root.status).toBe(200);
+    expect(root.body.toString()).toBe('home');
+    const nested = await call(backend, { method: 'GET', path: '/logs/docs/' }, { config });
+    expect(nested.body.toString()).toBe('docs');
+  });
+
+  test('a tagged lifecycle rule leaves objects that do not have the tag', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const meta = new MemoryObjectMeta();
+    const options = { config, meta };
+    const xml =
+      '<LifecycleConfiguration><Rule><Filter><Prefix>old/</Prefix><Tag><Key>expire</Key><Value>yes</Value></Tag></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?lifecycle', body: Buffer.from(xml) }, options);
+    await call(backend, { method: 'PUT', path: '/logs/old/keep.txt', body: Buffer.from('keep') }, options);
+    await call(backend, { method: 'PUT', path: '/logs/old/drop.txt', body: Buffer.from('drop') }, options);
+    await call(
+      backend,
+      { method: 'PUT', path: '/logs/old/drop.txt?tagging', body: Buffer.from('<Tagging><TagSet><Tag><Key>expire</Key><Value>yes</Value></Tag></TagSet></Tagging>') },
+      options,
+    );
+    backend.objects.get('logs/old/keep.txt')!.mtimeMs = 1;
+    backend.objects.get('logs/old/drop.txt')!.mtimeMs = 1;
+    const ran = await call(backend, { method: 'POST', path: '/logs?lifecycle', now: 3 * 86_400_000 }, options);
+    expect(JSON.parse(ran.body.toString()).expired).toBe(1);
+    expect(backend.objects.has('logs/old/keep.txt')).toBe(true);
+    expect(backend.objects.has('logs/old/drop.txt')).toBe(false);
+  });
+
+  test('inventory writes a csv of the current objects', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const xml =
+      '<InventoryConfiguration><Id>daily</Id><Destination><S3BucketDestination><Prefix>reports/</Prefix><Format>CSV</Format></S3BucketDestination></Destination></InventoryConfiguration>';
+    const put = await call(backend, { method: 'PUT', path: '/logs?inventory&id=daily', body: Buffer.from(xml) }, { config });
+    expect(put.status).toBe(200);
+    await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('abcd') }, { config });
+    const ran = await call(backend, { method: 'POST', path: '/logs?inventory&id=daily' }, { config });
+    expect(ran.status).toBe(200);
+    const report = await backend.get('logs', 'reports/daily.csv');
+    expect(report?.value.toString()).toContain('a.txt');
+    expect(report?.value.toString()).toContain('4');
+  });
+
+  test('a notification sends only the events it lists', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const events: unknown[] = [];
+    const options = {
+      config,
+      fetchImpl: (async (_url: string, init?: { body?: string }) => {
+        events.push(JSON.parse(init?.body ?? '{}'));
+        return new Response('ok');
+      }) as typeof fetch,
+    };
+    await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs?notification',
+        body: Buffer.from(JSON.stringify({ url: 'http://hook.local/s3', events: ['s3:ObjectRemoved:*'] })),
+      },
+      options,
+    );
+    await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('a') }, options);
+    expect(events).toHaveLength(0);
+    await call(backend, { method: 'DELETE', path: '/logs/a.txt' }, options);
+    expect(events).toHaveLength(1);
+    expect((events[0] as { event: string }).event).toBe('s3:ObjectRemoved:Delete');
+  });
+
+  test('block public policy rejects an allow-all bucket policy', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const block =
+      '<PublicAccessBlockConfiguration><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>';
+    const put = await call(backend, { method: 'PUT', path: '/logs?publicAccessBlock', body: Buffer.from(block) }, { config });
+    expect(put.status).toBe(200);
+    const policy = await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs?policy',
+        body: Buffer.from(JSON.stringify({ Statement: [{ Effect: 'Allow', Action: 's3:*', Resource: '*' }] })),
+      },
+      { config },
+    );
+    expect(policy.status).toBe(403);
+    const saved = await config.get('logs');
+    expect(saved.policy).toBeUndefined();
+  });
+
+  test('bucket location is stored and a missing website object returns the error page', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const location = await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs?location',
+        body: Buffer.from('<CreateBucketConfiguration><LocationConstraint>rack-a</LocationConstraint></CreateBucketConfiguration>'),
+      },
+      { config },
+    );
+    expect(location.status).toBe(200);
+    const got = await call(backend, { method: 'GET', path: '/logs?location' }, { config });
+    expect(got.body.toString()).toContain('rack-a');
+
+    const website =
+      '<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><ErrorDocument><Key>error.html</Key></ErrorDocument></WebsiteConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?website', body: Buffer.from(website) }, { config });
+    await call(backend, { method: 'PUT', path: '/logs/error.html', body: Buffer.from('missing-page') }, { config });
+    const missing = await call(backend, { method: 'GET', path: '/logs/no-such.txt' }, { config });
+    expect(missing.status).toBe(404);
+    expect(missing.body.toString()).toBe('missing-page');
+  });
+
+  test('a website routing rule redirects a key prefix', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const xml =
+      '<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument><RoutingRules><RoutingRule><Condition><KeyPrefixEquals>docs/</KeyPrefixEquals></Condition><Redirect><ReplaceKeyPrefixWith>archive/</ReplaceKeyPrefixWith><HttpRedirectCode>302</HttpRedirectCode></Redirect></RoutingRule></RoutingRules></WebsiteConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?website', body: Buffer.from(xml) }, { config });
+    const moved = await call(backend, { method: 'GET', path: '/logs/docs/a.txt' }, { config });
+    expect(moved.status).toBe(302);
+    expect(moved.headers.Location).toBe('/logs/archive/a.txt');
+    const stay = await call(backend, { method: 'GET', path: '/logs/other.txt' }, { config });
+    expect(stay.status).toBe(404);
+  });
+
+  test('copy can take a byte range and replace metadata and tags', async () => {
+    const backend = new MemBackend();
+    const meta = new MemoryObjectMeta();
+    await call(backend, { method: 'PUT', path: '/logs/src.txt', body: Buffer.from('abcdefgh'), headers: { 'x-amz-meta-color': 'blue' } }, { meta });
+    await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs/src.txt?tagging',
+        body: Buffer.from('<Tagging><TagSet><Tag><Key>kind</Key><Value>log</Value></Tag></TagSet></Tagging>'),
+      },
+      { meta },
+    );
+    const copy = await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs/dst.txt',
+        headers: {
+          'x-amz-copy-source': '/logs/src.txt',
+          'x-amz-copy-source-range': 'bytes=0-3',
+          'x-amz-metadata-directive': 'REPLACE',
+          'x-amz-meta-color': 'red',
+          'x-amz-tagging-directive': 'REPLACE',
+          'x-amz-tagging': 'kind=copy',
+        },
+      },
+      { meta },
+    );
+    expect(copy.status).toBe(200);
+    const got = await call(backend, { method: 'GET', path: '/logs/dst.txt' }, { meta });
+    expect(got.body.toString()).toBe('abcd');
+    const head = await call(backend, { method: 'HEAD', path: '/logs/dst.txt' }, { meta });
+    expect(head.headers['x-amz-meta-color']).toBe('red');
+    const tags = await call(backend, { method: 'GET', path: '/logs/dst.txt?tagging' }, { meta });
+    expect(tags.body.toString()).toContain('<Value>copy</Value>');
+    expect(tags.body.toString()).not.toContain('<Value>log</Value>');
+  });
+
+  test('time conditions and upload-part copy', async () => {
+    const backend = new MemBackend();
+    await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('abcdefgh') });
+    const fresh = await call(backend, { method: 'GET', path: '/logs/a.txt', headers: { 'if-modified-since': 'Thu, 01 Jan 1970 00:00:02 GMT' } });
+    expect(fresh.status).toBe(304);
+    const stale = await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('nope'), headers: { 'if-unmodified-since': 'Thu, 01 Jan 1970 00:00:00 GMT' } });
+    expect(stale.status).toBe(412);
+    expect(backend.objects.get('logs/a.txt')?.body.toString()).toBe('abcdefgh');
+
+    const uploads = new MultipartUploads();
+    const created = await call(backend, { method: 'POST', path: '/logs/part.bin?uploads' }, { uploads });
+    const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(created.body.toString())?.[1] ?? '';
+    const part = await call(
+      backend,
+      {
+        method: 'PUT',
+        path: `/logs/part.bin?partNumber=1&uploadId=${uploadId}`,
+        headers: { 'x-amz-copy-source': '/logs/a.txt', 'x-amz-copy-source-range': 'bytes=1-4' },
+      },
+      { uploads },
+    );
+    expect(part.status).toBe(200);
+    expect(part.body.toString()).toContain('<ETag>');
+    const complete = `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${/<ETag>([^<]+)<\/ETag>/.exec(part.body.toString())?.[1] ?? ''}</ETag></Part></CompleteMultipartUpload>`;
+    const done = await call(backend, { method: 'POST', path: `/logs/part.bin?uploadId=${uploadId}`, body: Buffer.from(complete) }, { uploads });
+    expect(done.status).toBe(200);
+    const got = await call(backend, { method: 'GET', path: '/logs/part.bin' });
+    expect(got.body.toString()).toBe('bcde');
+  });
+
+  test('copy refuses a source that fails if-match or if-unmodified-since', async () => {
+    const backend = new MemBackend();
+    await call(backend, { method: 'PUT', path: '/logs/src.txt', body: Buffer.from('abcdefgh') });
+    const etag = `"${crc32(Buffer.from('abcdefgh')).toString(16).padStart(8, '0')}"`;
+    const wrong = await call(backend, {
+      method: 'PUT',
+      path: '/logs/dst.txt',
+      headers: { 'x-amz-copy-source': '/logs/src.txt', 'x-amz-copy-source-if-match': '"00000000"' },
+    });
+    expect(wrong.status).toBe(412);
+    expect(backend.objects.has('logs/dst.txt')).toBe(false);
+    const old = await call(backend, {
+      method: 'PUT',
+      path: '/logs/dst.txt',
+      headers: { 'x-amz-copy-source': '/logs/src.txt', 'x-amz-copy-source-if-unmodified-since': 'Thu, 01 Jan 1970 00:00:00 GMT' },
+    });
+    expect(old.status).toBe(412);
+    const ok = await call(backend, {
+      method: 'PUT',
+      path: '/logs/dst.txt',
+      headers: { 'x-amz-copy-source': '/logs/src.txt', 'x-amz-copy-source-if-match': etag },
+    });
+    expect(ok.status).toBe(200);
+    expect(backend.objects.get('logs/dst.txt')?.body.toString()).toBe('abcdefgh');
+  });
+
+  test('lists open multipart uploads and keeps a retained object in a batch delete', async () => {
+    const backend = new MemBackend();
+    const meta = new MemoryObjectMeta();
+    const uploads = new MultipartUploads();
+    const created = await call(backend, { method: 'POST', path: '/logs/big.bin?uploads' }, { uploads });
+    const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(created.body.toString())?.[1] ?? '';
+    const listed = await call(backend, { method: 'GET', path: '/logs?uploads' }, { uploads });
+    expect(listed.status).toBe(200);
+    expect(listed.body.toString()).toContain('<Key>big.bin</Key>');
+    expect(listed.body.toString()).toContain(`<UploadId>${uploadId}</UploadId>`);
+
+    await call(backend, { method: 'PUT', path: '/logs/keep.txt', body: Buffer.from('keep') }, { meta });
+    const until = new Date(Date.now() + 86_400_000).toISOString();
+    await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs/keep.txt?retention',
+        body: Buffer.from(`<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>${until}</RetainUntilDate></Retention>`),
+      },
+      { meta },
+    );
+    const xml = '<Delete><Object><Key>keep.txt</Key></Object></Delete>';
+    const removed = await call(backend, { method: 'POST', path: '/logs?delete', body: Buffer.from(xml) }, { meta });
+    expect(removed.status).toBe(200);
+    expect(removed.body.toString()).toContain('<Code>AccessDenied</Code>');
+    expect(backend.objects.has('logs/keep.txt')).toBe(true);
   });
 });

@@ -63,18 +63,19 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 
 ## 源码里有、s3dfs 还没有
 
-`handle.ts` 只认 `policy`、`versioning`、`lifecycle`、`notification` 四个桶配置查询。生命周期是按前缀的天数过期，通知是一个 webhook。RustFS 在 `rustfs/src/server/http.rs` 里为下面这些查询名接了 PUT。其中访问日志和所有权控制，RustFS 自己写明还在计划中；ACL 的 XML grant 返回 `NotImplemented`。其余几项在 `rustfs/src/app` 或 `crates/` 里有对应模块。
+下面按 `rustfs/src/server/http.rs` 里的配置查询对照。访问日志和所有权控制，RustFS 自己写明还在计划中；ACL 的 XML grant 返回 `NotImplemented`。其余几项在 `rustfs/src/app` 或 `crates/` 里有对应模块。
 
 | 查询名 | RustFS 源码 | s3dfs |
 | --- | --- | --- |
 | tagging | `rustfs/src/app/object_meta/tagging.rs`，桶和对象标签 | `?tagging` 读写桶标签和对象标签。对象标签存在索引 `$tags/`，不进 `.blk` |
 | cors | `rustfs/src/server/cors.rs`，`rustfs/src/app/bucket_usecase.rs` 的 cors 模块 | `?cors` 保存规则。`OPTIONS` 按来源和方法回预检头 |
-| website | `rustfs/src/app/website.rs` | 没有 |
+| website | `rustfs/src/app/website.rs` | `?website` 保存索引、错误页和按前缀重定向。目录请求返回索引。对象不存在时返回错误页，状态仍是 404。命中前缀时返回配置的跳转状态和 `Location` |
 | replication | `crates/replication`，桶复制配置 | 没有。`sendChanges` 只把变更送到另一套集群，默认不调用，也没有 S3 复制配置 |
-| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | 没有 |
+| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | 对象 `?retention` 支持 GOVERNANCE 和 COMPLIANCE。`?legal-hold` 为 ON 时拒绝删除，治理模式的绕过头也不生效。没有桶级 Object Lock 开关 |
 | encryption | `crates/kms`：SSE-S3、SSE-KMS、SSE-C，后端可以是本地、Vault KV2、Vault Transit | 桶上的一把 AES-256-GCM。没有 KMS，也没有按对象换密钥 |
-| inventory | `rustfs/src/connect/inventory` | 没有 |
-| requestPayment、accelerate、intelligent-tiering、analytics、metrics、publicAccessBlock | 路由接了这些查询名 | 没有 |
+| inventory | `rustfs/src/connect/inventory` | `?inventory` 保存一份 CSV 配置。`POST` 立刻把当前对象写成 `前缀/id.csv`。没有按天调度 |
+| requestPayment、accelerate、intelligent-tiering、analytics、metrics | 路由接了这些查询名 | 没有 |
+| publicAccessBlock | 路由接了这个查询名 | `?publicAccessBlock` 打开后，拒绝资源为 `*` 或 `/*` 的 Allow 策略 |
 | logging、ownershipControls | 路由接了；README 写明还在计划中 | 没有 |
 | acl | 路由接了；授权故意不做，XML grant 返回 `NotImplemented` | 没有 |
 
@@ -86,12 +87,12 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | OIDC | README 标可用，认证走 IAM 旁边的登录 | 没有 |
 | Keystone | `crates/keystone` | 没有 |
 | 桶配额 | README 标可用；用量在 `crates/data-usage`、`crates/object-capacity` | 管理接口可以设 `quotaBytes`。没有 S3 的桶配额查询 |
-| 生命周期分层 | `crates/lifecycle` 含转移到远端 S3 的准入；scanner 负责到期和转移 | 按前缀过期删除，并按 `NoncurrentDays` 删掉非当前版本。不把对象转到远端。`GET ?usage` 返回对象个数和字节 |
+| 生命周期分层 | `crates/lifecycle` 含转移到远端 S3 的准入；scanner 负责到期和转移 | 按前缀和标签过期删除，按 `NoncurrentDays` 删掉非当前版本，并在删除标记成为唯一版本后清掉它。不把对象转到远端。`GET ?usage` 返回对象个数和字节 |
 | 站点复制 | `crates/replication` 与 `.docker/test/site-replication` | 没有 |
 | S3 Select | `crates/s3select-api`、`crates/s3select-query`。README 写明只收未压缩输入 | 没有 |
 | 审计 | `crates/audit` | 没有。访问日志是每个响应一行 JSON |
 | 可观测性 | `crates/obs`、`crates/io-metrics` | `GET /_s3dfs/metrics` 只计本进程状态码 |
-| 事件通知 | `crates/notify` | 一个 webhook URL |
+| 事件通知 | `crates/notify` | 一个 webhook URL。`events` 里可以用具体事件名或 `s3:ObjectRemoved:*` 这种前缀。不配事件时仍发送全部 |
 | 多租户 | README 标可用 | 没有 |
 | Swift | `crates/protocols` 的 swift，编译 feature，默认不进 | 没有 |
 | FTPS、WebDAV | 默认 feature：`ftps`、`webdav` | 没有。挂载是自带的 `s3dfs-fuse` |

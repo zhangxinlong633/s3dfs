@@ -181,10 +181,10 @@ export class IndexVersionStore implements VersionStore {
     return out;
   }
 
-  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number }[]> {
+  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]> {
     const prefix = `$ver/${bucket}/`;
     const scanned = await this.kv.scan({ prefix, maxKeys: 10_000 });
-    const out: { key: string; id: string; mtimeMs: number }[] = [];
+    const out: { key: string; id: string; mtimeMs: number; deleteMarker: boolean }[] = [];
     for (const obj of scanned.objects) {
       if (obj.key.endsWith('/list')) {
         continue;
@@ -198,12 +198,13 @@ export class IndexVersionStore implements VersionStore {
       if (!raw) {
         continue;
       }
-      const meta = JSON.parse(raw.value.toString('utf8')) as { mtimeMs: number };
+      const meta = JSON.parse(raw.value.toString('utf8')) as { mtimeMs: number; deleteMarker?: boolean };
       out.push({
         bucket,
         key: decodeURIComponent(rest.slice(0, slash)),
         id: rest.slice(slash + 1),
         mtimeMs: meta.mtimeMs,
+        deleteMarker: meta.deleteMarker === true,
       });
     }
     return out;
@@ -229,7 +230,7 @@ export class IndexObjectMeta implements ObjectUserMeta {
   async save(bucket: string, key: string, meta: Record<string, string>): Promise<void> {
     if (Object.keys(meta).length === 0) {
       try {
-        await this.remove(bucket, key);
+        await this.kv.delete(this.key(bucket, key));
       } catch {
         // Clearing metadata that was never stored must not fail the object put.
       }
@@ -249,6 +250,8 @@ export class IndexObjectMeta implements ObjectUserMeta {
   async remove(bucket: string, key: string): Promise<void> {
     await this.kv.delete(this.key(bucket, key));
     await this.removeTags(bucket, key);
+    await this.saveRetention(bucket, key, null);
+    await this.saveLegalHold(bucket, key, 'OFF');
   }
 
   private tagKey(bucket: string, objectKey: string): string {
@@ -273,5 +276,45 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async removeTags(bucket: string, key: string): Promise<void> {
     await this.kv.delete(this.tagKey(bucket, key));
+  }
+
+  private lockKey(bucket: string, objectKey: string): string {
+    return `$lock/${bucket}/${encodeURIComponent(objectKey)}`;
+  }
+
+  async saveRetention(bucket: string, key: string, retention: { mode: 'GOVERNANCE' | 'COMPLIANCE'; untilMs: number } | null): Promise<void> {
+    if (!retention) {
+      await this.kv.delete(this.lockKey(bucket, key));
+      return;
+    }
+    await this.kv.put(this.lockKey(bucket, key), Buffer.from(JSON.stringify(retention)));
+  }
+
+  async loadRetention(bucket: string, key: string): Promise<{ mode: 'GOVERNANCE' | 'COMPLIANCE'; untilMs: number } | null> {
+    const raw = await this.kv.get(this.lockKey(bucket, key));
+    if (!raw) {
+      return null;
+    }
+    return JSON.parse(raw.value.toString('utf8')) as { mode: 'GOVERNANCE' | 'COMPLIANCE'; untilMs: number };
+  }
+
+  private holdKey(bucket: string, objectKey: string): string {
+    return `$hold/${bucket}/${encodeURIComponent(objectKey)}`;
+  }
+
+  async saveLegalHold(bucket: string, key: string, status: 'ON' | 'OFF'): Promise<void> {
+    if (status === 'OFF') {
+      await this.kv.delete(this.holdKey(bucket, key));
+      return;
+    }
+    await this.kv.put(this.holdKey(bucket, key), Buffer.from(status));
+  }
+
+  async loadLegalHold(bucket: string, key: string): Promise<'ON' | 'OFF' | null> {
+    const raw = await this.kv.get(this.holdKey(bucket, key));
+    if (!raw) {
+      return null;
+    }
+    return raw.value.toString('utf8') === 'ON' ? 'ON' : 'OFF';
   }
 }

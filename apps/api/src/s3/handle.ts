@@ -9,9 +9,19 @@ import {
   openObject,
   matchCors,
   parseCors,
+  parsePublicAccessBlock,
+  policyIsPublic,
+  parseInventory,
+  parseLocation,
+  parseLegalHold,
   parseLifecycle,
+  parseWebsite,
+  websiteRedirect,
+  parseRetention,
   parseTags,
   parseVersioningStatus,
+  retentionBlocks,
+  retentionXml,
   tagsXml,
   postEvent,
   sealObject,
@@ -204,7 +214,11 @@ function isBucketAdmin(req: S3Request): boolean {
     req.query.has('notification') ||
     req.query.has('tagging') ||
     req.query.has('cors') ||
-    req.query.has('usage')
+    req.query.has('usage') ||
+    req.query.has('website') ||
+    req.query.has('inventory') ||
+    req.query.has('publicAccessBlock') ||
+    req.query.has('location')
   );
 }
 
@@ -214,6 +228,25 @@ function etagHeaders(crc: number): Record<string, string> {
 
 function stripEtag(value: string): string {
   return value.trim().replaceAll('"', '').toLowerCase();
+}
+
+function parseAmzTagging(raw: string | undefined): Record<string, string> {
+  const tags: Record<string, string> = {};
+  if (!raw) {
+    return tags;
+  }
+  for (const part of raw.split('&')) {
+    if (!part) {
+      continue;
+    }
+    const eq = part.indexOf('=');
+    const key = decodeURIComponent(eq < 0 ? part : part.slice(0, eq));
+    const value = decodeURIComponent(eq < 0 ? '' : part.slice(eq + 1));
+    if (key) {
+      tags[key] = value;
+    }
+  }
+  return tags;
 }
 
 function userMeta(headers: S3Request['headers']): Record<string, string> {
@@ -243,7 +276,9 @@ async function assertPreconditions(
 ): Promise<S3Response | null> {
   const match = header(headers, 'if-match');
   const none = header(headers, 'if-none-match');
-  if (!match && !none) {
+  const modifiedSince = header(headers, 'if-modified-since');
+  const unmodifiedSince = header(headers, 'if-unmodified-since');
+  if (!match && !none && !modifiedSince && !unmodifiedSince) {
     return null;
   }
   const meta = await backend.head(bucket, key);
@@ -259,6 +294,49 @@ async function assertPreconditions(
   }
   if (none && method !== 'PUT' && meta && (none.trim() === '*' || stripEtag(none) === etag)) {
     return empty(304, etagHeaders(meta.crc));
+  }
+  if (method !== 'PUT' && modifiedSince && meta) {
+    const since = Date.parse(modifiedSince);
+    if (!Number.isNaN(since) && meta.mtimeMs <= since) {
+      return empty(304, etagHeaders(meta.crc));
+    }
+  }
+  if (unmodifiedSince && meta) {
+    const since = Date.parse(unmodifiedSince);
+    if (!Number.isNaN(since) && meta.mtimeMs > since) {
+      return xml(412, errorXml('PreconditionFailed', 'If-Unmodified-Since failed', `/${bucket}/${key}`));
+    }
+  }
+  return null;
+}
+
+function copySourcePrecondition(
+  meta: { crc: number; mtimeMs: number },
+  headers: S3Request['headers'],
+  resource: string,
+): S3Response | null {
+  const match = header(headers, 'x-amz-copy-source-if-match');
+  const none = header(headers, 'x-amz-copy-source-if-none-match');
+  const modifiedSince = header(headers, 'x-amz-copy-source-if-modified-since');
+  const unmodifiedSince = header(headers, 'x-amz-copy-source-if-unmodified-since');
+  const etag = stripEtag(etagFromCrc(meta.crc));
+  if (match && match.trim() !== '*' && stripEtag(match) !== etag) {
+    return xml(412, errorXml('PreconditionFailed', 'Copy source If-Match failed', resource));
+  }
+  if (none && (none.trim() === '*' || stripEtag(none) === etag)) {
+    return xml(412, errorXml('PreconditionFailed', 'Copy source If-None-Match failed', resource));
+  }
+  if (modifiedSince) {
+    const since = Date.parse(modifiedSince);
+    if (!Number.isNaN(since) && meta.mtimeMs <= since) {
+      return xml(412, errorXml('PreconditionFailed', 'Copy source If-Modified-Since failed', resource));
+    }
+  }
+  if (unmodifiedSince) {
+    const since = Date.parse(unmodifiedSince);
+    if (!Number.isNaN(since) && meta.mtimeMs > since) {
+      return xml(412, errorXml('PreconditionFailed', 'Copy source If-Unmodified-Since failed', resource));
+    }
   }
   return null;
 }
@@ -375,6 +453,51 @@ async function handleBucket(
       return empty(204);
     }
   }
+  if (req.query.has('website') && configStore) {
+    if (method === 'GET') {
+      const config = await configStore.get(bucket);
+      const suffix = config.website?.index ?? '';
+      const error = config.website?.error ? `<ErrorDocument><Key>${config.website.error}</Key></ErrorDocument>` : '';
+      const rules = (config.website?.redirects ?? [])
+        .map(
+          (rule) =>
+            `<RoutingRule><Condition><KeyPrefixEquals>${rule.prefix}</KeyPrefixEquals></Condition><Redirect><ReplaceKeyPrefixWith>${rule.replace}</ReplaceKeyPrefixWith>${rule.code ? `<HttpRedirectCode>${rule.code}</HttpRedirectCode>` : ''}</Redirect></RoutingRule>`,
+        )
+        .join('');
+      const body = suffix
+        ? `<?xml version="1.0" encoding="UTF-8"?><WebsiteConfiguration><IndexDocument><Suffix>${suffix}</Suffix></IndexDocument>${error}${rules ? `<RoutingRules>${rules}</RoutingRules>` : ''}</WebsiteConfiguration>`
+        : `<?xml version="1.0" encoding="UTF-8"?><WebsiteConfiguration/>`;
+      return xml(200, body);
+    }
+    if (method === 'PUT') {
+      const config = await configStore.get(bucket);
+      config.website = parseWebsite(req.body.toString('utf8'));
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+    if (method === 'DELETE') {
+      const config = await configStore.get(bucket);
+      delete config.website;
+      await configStore.put(bucket, config);
+      return empty(204);
+    }
+  }
+  if (req.query.has('location') && configStore) {
+    if (method === 'GET') {
+      const config = await configStore.get(bucket);
+      const location = config.location ?? '';
+      const body = location
+        ? `<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${location}</LocationConstraint>`
+        : `<?xml version="1.0" encoding="UTF-8"?><LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`;
+      return xml(200, body);
+    }
+    if (method === 'PUT') {
+      const config = await configStore.get(bucket);
+      config.location = parseLocation(req.body.toString('utf8'));
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+  }
   if (req.query.has('versioning') && configStore) {
     if (method === 'GET') {
       const config = await configStore.get(bucket);
@@ -403,11 +526,15 @@ async function handleBucket(
     if (method === 'PUT') {
       const parsed = JSON.parse(req.body.toString('utf8')) as { Statement?: { Effect: 'Allow' | 'Deny'; Action: string; Resource: string }[] };
       const config = await configStore.get(bucket);
-      config.policy = (parsed.Statement ?? []).map((s) => ({
+      const statements = (parsed.Statement ?? []).map((s) => ({
         effect: s.Effect,
         action: s.Action,
         resource: s.Resource,
       }));
+      if (config.blockPublicPolicy && policyIsPublic(statements)) {
+        return xml(403, errorXml('AccessDenied', 'Public bucket policies are blocked', bucket));
+      }
+      config.policy = statements;
       await configStore.put(bucket, config);
       return empty(204);
     }
@@ -434,11 +561,31 @@ async function handleBucket(
       };
     }
   }
+  if (req.query.has('publicAccessBlock') && configStore) {
+    if (method === 'PUT') {
+      const config = await configStore.get(bucket);
+      config.blockPublicPolicy = parsePublicAccessBlock(req.body.toString('utf8'));
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+    if (method === 'GET') {
+      const config = await configStore.get(bucket);
+      const value = config.blockPublicPolicy ? 'true' : 'false';
+      return xml(200, `<?xml version="1.0" encoding="UTF-8"?><PublicAccessBlockConfiguration><BlockPublicPolicy>${value}</BlockPublicPolicy></PublicAccessBlockConfiguration>`);
+    }
+    if (method === 'DELETE') {
+      const config = await configStore.get(bucket);
+      delete config.blockPublicPolicy;
+      await configStore.put(bucket, config);
+      return empty(204);
+    }
+  }
   if (req.query.has('notification') && configStore) {
     if (method === 'PUT') {
-      const parsed = JSON.parse(req.body.toString('utf8')) as { url?: string };
+      const parsed = JSON.parse(req.body.toString('utf8')) as { url?: string; events?: string[] };
       const config = await configStore.get(bucket);
       config.notifyUrl = parsed.url;
+      config.notifyEvents = parsed.events;
       await configStore.put(bucket, config);
       return empty(200);
     }
@@ -447,8 +594,13 @@ async function handleBucket(
     const { applyLifecycle } = await import('./product');
     const config = await configStore.get(bucket);
     const listed = await backend.list(bucket, '', undefined, 10_000, '');
+    const objects = [];
+    for (const object of listed.objects) {
+      const tags = options.meta ? await options.meta.loadTags(bucket, object.key) : {};
+      objects.push({ bucket, key: object.key, mtimeMs: object.mtimeMs, tags });
+    }
     const result = await applyLifecycle({
-      objects: listed.objects.map((o) => ({ bucket, key: o.key, mtimeMs: o.mtimeMs })),
+      objects,
       rules: config.lifecycle ?? [],
       now: req.now ?? Date.now(),
       deleteObject: (b, k) => backend.delete(b, k).then(() => undefined),
@@ -463,16 +615,58 @@ async function handleBucket(
       body: Buffer.from(JSON.stringify(result)),
     };
   }
+  if (req.query.has('inventory') && configStore) {
+    const id = req.query.get('id') ?? '';
+    if (method === 'PUT') {
+      const next = parseInventory(req.body.toString('utf8'), id);
+      const config = await configStore.get(bucket);
+      config.inventories = [...(config.inventories ?? []).filter((item) => item.id !== next.id), next];
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+    if (method === 'POST') {
+      const config = await configStore.get(bucket);
+      const inventory = (config.inventories ?? []).find((item) => item.id === id);
+      if (!inventory) {
+        return xml(404, errorXml('NoSuchConfiguration', 'The inventory configuration does not exist', bucket));
+      }
+      const listed = await backend.list(bucket, '', undefined, 10_000, '');
+      const lines = ['key,size'];
+      for (const object of listed.objects) {
+        if (object.key.startsWith(inventory.prefix)) {
+          continue;
+        }
+        lines.push(`${object.key},${object.size}`);
+      }
+      const key = `${inventory.prefix}${inventory.id}.csv`;
+      await backend.put(bucket, key, Buffer.from(`${lines.join('\n')}\n`));
+      return {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: Buffer.from(JSON.stringify({ key, objects: lines.length - 1 })),
+      };
+    }
+  }
   if (req.query.has('delete') && method === 'POST') {
     const body = req.body.toString('utf8');
     const keys = [...body.matchAll(/<Key>\s*([^<]*?)\s*<\/Key>/gi)].map((match) => match[1] ?? '').filter((key) => key.length > 0);
     const quiet = /<Quiet>\s*true\s*<\/Quiet>/i.test(body);
     const rows: string[] = [];
+    const bypass = (header(req.headers, 'x-amz-bypass-governance-retention') ?? '').toLowerCase() === 'true';
     for (const objectKey of keys) {
+      const shown = objectKey.replaceAll('&', '&amp;').replaceAll('<', '&lt;');
+      if (options.meta) {
+        const retention = await options.meta.loadRetention(bucket, objectKey);
+        const held = retentionBlocks(retention, req.now ?? Date.now(), bypass) || (await options.meta.loadLegalHold(bucket, objectKey)) === 'ON';
+        if (held) {
+          rows.push(`<Error><Key>${shown}</Key><Code>AccessDenied</Code><Message>Object is retained or under a legal hold</Message></Error>`);
+          continue;
+        }
+      }
       await backend.delete(bucket, objectKey);
       await options.meta?.remove(bucket, objectKey);
       if (!quiet) {
-        rows.push(`<Deleted><Key>${objectKey.replaceAll('&', '&amp;').replaceAll('<', '&lt;')}</Key></Deleted>`);
+        rows.push(`<Deleted><Key>${shown}</Key></Deleted>`);
       }
     }
     return xml(200, `<?xml version="1.0" encoding="UTF-8"?><DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${rows.join('')}</DeleteResult>`);
@@ -490,6 +684,30 @@ async function handleBucket(
       return xml(409, errorXml('BucketNotEmpty', 'The bucket you tried to delete is not empty', bucket));
     }
     return empty(204);
+  }
+  if (req.query.has('uploads') && method === 'GET') {
+    const prefix = req.query.get('prefix') ?? '';
+    const rows = (await uploads.store.list())
+      .filter((upload) => upload.bucket === bucket && upload.key.startsWith(prefix))
+      .map((upload) => {
+        const key = upload.key.replaceAll('&', '&amp;').replaceAll('<', '&lt;');
+        return `<Upload><Key>${key}</Key><UploadId>${upload.id}</UploadId><Initiated>${new Date(upload.createdMs).toISOString()}</Initiated></Upload>`;
+      });
+    return xml(200, `<?xml version="1.0" encoding="UTF-8"?><ListMultipartUploadsResult><Bucket>${bucket}</Bucket>${rows.join('')}</ListMultipartUploadsResult>`);
+  }
+  if (method === 'GET' && req.path.endsWith('/') && configStore) {
+    const website = (await configStore.get(bucket)).website;
+    if (website) {
+      const page = await backend.get(bucket, website.index);
+      if (!page) {
+        return xml(404, errorXml('NoSuchKey', 'The website index does not exist', `/${bucket}/${website.index}`));
+      }
+      return {
+        status: 200,
+        headers: { 'Content-Type': 'text/html', 'Content-Length': String(page.value.length) },
+        body: page.value,
+      };
+    }
   }
   if (req.query.has('usage') && method === 'GET') {
     const listed = await backend.list(bucket, '', undefined, 10_000, '');
@@ -527,6 +745,21 @@ async function handleBucket(
     );
   }
   return xml(405, errorXml('MethodNotAllowed', 'Method not allowed', bucket));
+}
+
+async function missingObject(backend: S3Backend, bucket: string, key: string, config: { website?: { error?: string } }): Promise<S3Response> {
+  const errorKey = config.website?.error;
+  if (errorKey && errorKey !== key) {
+    const page = await backend.get(bucket, errorKey);
+    if (page) {
+      return {
+        status: 404,
+        headers: { 'Content-Type': 'text/html', 'Content-Length': String(page.value.length) },
+        body: page.value,
+      };
+    }
+  }
+  return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
 }
 
 async function maybeSeal(req: S3Request, body: Buffer, options: S3Options): Promise<Buffer> {
@@ -575,6 +808,29 @@ async function handleObject(
       return empty(204);
     }
   }
+  if (req.query.has('retention') && options.meta) {
+    if (method === 'GET') {
+      const retention = await options.meta.loadRetention(bucket, key);
+      if (!retention) {
+        return xml(404, errorXml('NoSuchObjectLockConfiguration', 'The object has no retention', `/${bucket}/${key}`));
+      }
+      return xml(200, retentionXml(retention));
+    }
+    if (method === 'PUT') {
+      await options.meta.saveRetention(bucket, key, parseRetention(req.body.toString('utf8')));
+      return empty(200);
+    }
+  }
+  if (req.query.has('legal-hold') && options.meta) {
+    if (method === 'GET') {
+      const status = (await options.meta.loadLegalHold(bucket, key)) ?? 'OFF';
+      return xml(200, `<?xml version="1.0" encoding="UTF-8"?><LegalHold><Status>${status}</Status></LegalHold>`);
+    }
+    if (method === 'PUT') {
+      await options.meta.saveLegalHold(bucket, key, parseLegalHold(req.body.toString('utf8')));
+      return empty(200);
+    }
+  }
   if (req.query.has('versions') && method === 'GET' && options.versions) {
     const versions = await options.versions.list(bucket, key);
     return xml(200, listVersionsXml(bucket, key, versions));
@@ -591,6 +847,32 @@ async function handleObject(
     const etag = etagFromCrc(stored.crc);
     await uploads.notePart(bucket, key, uploadId, partNumber, { etag, size: stored.size, mtimeMs: Date.now() });
     return empty(200, { ETag: etag });
+  }
+  if (uploadId && method === 'PUT' && header(req.headers, 'x-amz-copy-source')) {
+    const partNumber = Number(req.query.get('partNumber'));
+    const decoded = decodeURIComponent((header(req.headers, 'x-amz-copy-source') ?? '').replace(/^\//, ''));
+    const slash = decoded.indexOf('/');
+    if (slash <= 0) {
+      return xml(400, errorXml('InvalidArgument', 'x-amz-copy-source must be bucket/key'));
+    }
+    const src = await backend.get(decoded.slice(0, slash), decoded.slice(slash + 1));
+    if (!src) {
+      return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', decoded));
+    }
+    const failed = copySourcePrecondition(src, req.headers, decoded);
+    if (failed) {
+      return failed;
+    }
+    const range = parseByteRange(header(req.headers, 'x-amz-copy-source-range'), src.value.length);
+    if (range.kind === 'unsatisfiable') {
+      return empty(416);
+    }
+    const value = range.kind === 'partial' ? Buffer.from(src.value.subarray(range.start, range.end + 1)) : src.value;
+    const etag = await uploads.putPart(bucket, key, uploadId, partNumber, value);
+    return xml(
+      200,
+      `<?xml version="1.0" encoding="UTF-8"?><CopyPartResult><LastModified>${new Date(src.mtimeMs).toISOString()}</LastModified><ETag>${etag}</ETag></CopyPartResult>`,
+    );
   }
   if (uploadId && method === 'PUT') {
     const partNumber = Number(req.query.get('partNumber'));
@@ -643,22 +925,46 @@ async function handleObject(
       }
       const srcBucket = decoded.slice(0, slash);
       const srcKey = decoded.slice(slash + 1);
+      const srcMeta = await backend.head(srcBucket, srcKey);
+      if (!srcMeta) {
+        return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', copySource));
+      }
+      const sourceFailed = copySourcePrecondition(srcMeta, req.headers, copySource);
+      if (sourceFailed) {
+        return sourceFailed;
+      }
+      const metaDirective = (header(req.headers, 'x-amz-metadata-directive') ?? 'COPY').toUpperCase();
+      const tagDirective = (header(req.headers, 'x-amz-tagging-directive') ?? 'COPY').toUpperCase();
+      if (metaDirective !== 'COPY' && metaDirective !== 'REPLACE') {
+        return xml(400, errorXml('InvalidArgument', 'x-amz-metadata-directive must be COPY or REPLACE'));
+      }
+      if (tagDirective !== 'COPY' && tagDirective !== 'REPLACE') {
+        return xml(400, errorXml('InvalidArgument', 'x-amz-tagging-directive must be COPY or REPLACE'));
+      }
       await backend.createBucket(bucket);
-      const shared = backend.shareCopy ? await backend.shareCopy(srcBucket, srcKey, bucket, key) : false;
+      const rangeHeader = header(req.headers, 'x-amz-copy-source-range');
+      const shared = !rangeHeader && backend.shareCopy ? await backend.shareCopy(srcBucket, srcKey, bucket, key) : false;
       if (!shared) {
         const src = await backend.get(srcBucket, srcKey);
         if (!src) {
           return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', copySource));
         }
-        await backend.put(bucket, key, src.value);
+        const range = parseByteRange(rangeHeader, src.value.length);
+        if (range.kind === 'unsatisfiable') {
+          return empty(416);
+        }
+        const value = range.kind === 'partial' ? Buffer.from(src.value.subarray(range.start, range.end + 1)) : src.value;
+        await backend.put(bucket, key, value);
       }
       if (options.meta) {
-        await options.meta.save(bucket, key, await options.meta.load(decoded.slice(0, slash), decoded.slice(slash + 1)));
-        await options.meta.saveTags(bucket, key, await options.meta.loadTags(decoded.slice(0, slash), decoded.slice(slash + 1)));
+        const savedMeta = metaDirective === 'REPLACE' ? userMeta(req.headers) : await options.meta.load(srcBucket, srcKey);
+        const savedTags = tagDirective === 'REPLACE' ? parseAmzTagging(header(req.headers, 'x-amz-tagging')) : await options.meta.loadTags(srcBucket, srcKey);
+        await options.meta.save(bucket, key, savedMeta);
+        await options.meta.saveTags(bucket, key, savedTags);
       }
       const meta = await backend.head(bucket, key);
       const etag = meta ? etagFromCrc(meta.crc) : '"00000000"';
-      await postEvent(config.notifyUrl, { event: 's3:ObjectCreated:Copy', bucket, key }, options.fetchImpl);
+      await postEvent(config, { event: 's3:ObjectCreated:Copy', bucket, key }, options.fetchImpl);
       return xml(200, copyObjectXml(etag, new Date(meta?.mtimeMs ?? Date.now()).toISOString()), etagHeaders(meta?.crc ?? 0));
     }
     await backend.createBucket(bucket);
@@ -685,7 +991,7 @@ async function handleObject(
       if (options.meta) {
         await options.meta.save(bucket, key, userMeta(req.headers));
       }
-      await postEvent(config.notifyUrl, { event: 's3:ObjectCreated:Put', bucket, key, size: stored.size }, options.fetchImpl);
+      await postEvent(config, { event: 's3:ObjectCreated:Put', bucket, key, size: stored.size }, options.fetchImpl);
       return empty(200, headers);
     }
     const plain = payload(req);
@@ -712,8 +1018,25 @@ async function handleObject(
     if (options.meta) {
       await options.meta.save(bucket, key, userMeta(req.headers));
     }
-    await postEvent(config.notifyUrl, { event: 's3:ObjectCreated:Put', bucket, key, size: plain.length }, options.fetchImpl);
+    await postEvent(config, { event: 's3:ObjectCreated:Put', bucket, key, size: plain.length }, options.fetchImpl);
     return empty(200, headers);
+  }
+  if (method === 'GET' || method === 'HEAD') {
+    const redirect = websiteRedirect(config.website, key);
+    if (redirect) {
+      return empty(redirect.code, { Location: `/${bucket}/${redirect.key}` });
+    }
+  }
+  if ((method === 'GET' || method === 'HEAD') && key.endsWith('/') && config.website) {
+    const page = await backend.get(bucket, `${key}${config.website.index}`);
+    if (!page) {
+      return xml(404, errorXml('NoSuchKey', 'The website index does not exist', `/${bucket}/${key}${config.website.index}`));
+    }
+    return {
+      status: 200,
+      headers: { 'Content-Type': 'text/html', 'Content-Length': String(page.value.length) },
+      body: method === 'HEAD' ? Buffer.alloc(0) : page.value,
+    };
   }
   if (method === 'GET' || method === 'HEAD') {
     const versionId = req.query.get('versionId');
@@ -736,7 +1059,7 @@ async function handleObject(
     }
     const meta = await backend.head(bucket, key);
     if (!meta) {
-      return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
+      return missingObject(backend, bucket, key, config);
     }
     const failed = await assertPreconditions(backend, bucket, key, req.headers, method);
     if (failed) {
@@ -782,17 +1105,27 @@ async function handleObject(
     if (failed) {
       return failed;
     }
+    if (options.meta) {
+      const retention = await options.meta.loadRetention(bucket, key);
+      const bypass = (header(req.headers, 'x-amz-bypass-governance-retention') ?? '').toLowerCase() === 'true';
+      if (retentionBlocks(retention, req.now ?? Date.now(), bypass)) {
+        return xml(403, errorXml('AccessDenied', 'Object is retained until the configured date', `/${bucket}/${key}`));
+      }
+      if ((await options.meta.loadLegalHold(bucket, key)) === 'ON') {
+        return xml(403, errorXml('AccessDenied', 'Object is under a legal hold', `/${bucket}/${key}`));
+      }
+    }
     if (versioning) {
       const versionId = randomBytes(8).toString('hex');
       await versioning.put(bucket, key, { id: versionId, body: null, deleteMarker: true, mtimeMs: Date.now() });
       await backend.delete(bucket, key);
       await options.meta?.remove(bucket, key);
-      await postEvent(config.notifyUrl, { event: 's3:ObjectRemoved:DeleteMarkerCreated', bucket, key }, options.fetchImpl);
+      await postEvent(config, { event: 's3:ObjectRemoved:DeleteMarkerCreated', bucket, key }, options.fetchImpl);
       return empty(204, { 'x-amz-version-id': versionId, 'x-amz-delete-marker': 'true' });
     }
     await backend.delete(bucket, key);
     await options.meta?.remove(bucket, key);
-    await postEvent(config.notifyUrl, { event: 's3:ObjectRemoved:Delete', bucket, key }, options.fetchImpl);
+    await postEvent(config, { event: 's3:ObjectRemoved:Delete', bucket, key }, options.fetchImpl);
     return empty(204);
   }
   return xml(405, errorXml('MethodNotAllowed', 'Method not allowed', `/${bucket}/${key}`));

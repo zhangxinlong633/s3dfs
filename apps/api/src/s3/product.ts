@@ -12,6 +12,15 @@ export interface LifecycleRule {
   days?: number;
   abortDays?: number;
   noncurrentDays?: number;
+  /** 0 removes a lone delete marker immediately. A positive number waits that many days. */
+  deleteMarkerDays?: number;
+  tag?: { key: string; value: string };
+}
+
+export interface InventoryConfig {
+  id: string;
+  prefix: string;
+  format: 'CSV';
 }
 
 export interface CorsRule {
@@ -27,8 +36,13 @@ export interface BucketConfig {
   policy?: PolicyStatement[];
   lifecycle?: LifecycleRule[];
   notifyUrl?: string;
+  notifyEvents?: string[];
+  blockPublicPolicy?: boolean;
   tags?: Record<string, string>;
   cors?: CorsRule[];
+  website?: { index: string; error?: string; redirects?: { prefix: string; replace: string; code?: number }[] };
+  location?: string;
+  inventories?: InventoryConfig[];
 }
 
 export interface ConfigStore {
@@ -61,7 +75,7 @@ export interface VersionStore {
   put(bucket: string, key: string, version: ObjectVersion): Promise<void>;
   get(bucket: string, key: string, versionId: string): Promise<ObjectVersion | null>;
   list(bucket: string, key: string): Promise<ObjectVersion[]>;
-  listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number }[]>;
+  listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]>;
   remove(bucket: string, key: string, versionId: string): Promise<void>;
 }
 
@@ -83,16 +97,16 @@ export class MemoryVersionStore implements VersionStore {
     return this.versions.get(`${bucket}/${key}`) ?? [];
   }
 
-  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number }[]> {
+  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]> {
     const prefix = `${bucket}/`;
-    const out: { key: string; id: string; mtimeMs: number }[] = [];
+    const out: { key: string; id: string; mtimeMs: number; deleteMarker: boolean }[] = [];
     for (const [id, versions] of this.versions) {
       if (!id.startsWith(prefix)) {
         continue;
       }
       const key = id.slice(prefix.length);
       for (const version of versions) {
-        out.push({ bucket, key, id: version.id, mtimeMs: version.mtimeMs });
+        out.push({ bucket, key, id: version.id, mtimeMs: version.mtimeMs, deleteMarker: version.deleteMarker });
       }
     }
     return out;
@@ -184,21 +198,25 @@ export function actionFor(method: string, key: string | undefined, query: URLSea
 }
 
 export async function applyLifecycle(opts: {
-  objects: { bucket: string; key: string; mtimeMs: number }[];
+  objects: { bucket: string; key: string; mtimeMs: number; tags?: Record<string, string> }[];
   rules: LifecycleRule[];
   now: number;
   deleteObject: (bucket: string, key: string) => Promise<void>;
   uploads: { id: string; bucket: string; key: string; createdMs: number }[];
   abortUpload: (bucket: string, key: string, id: string) => Promise<void>;
-  versions?: { bucket: string; key: string; id: string; mtimeMs: number }[];
+  versions?: { bucket: string; key: string; id: string; mtimeMs: number; deleteMarker?: boolean }[];
   dropVersion?: (bucket: string, key: string, id: string) => Promise<void>;
-}): Promise<{ expired: number; aborted: number; noncurrent: number }> {
+}): Promise<{ expired: number; aborted: number; noncurrent: number; deleteMarkers: number }> {
   let expired = 0;
   let aborted = 0;
   let noncurrent = 0;
+  let deleteMarkers = 0;
   for (const object of opts.objects) {
     for (const rule of opts.rules) {
       if (rule.days === undefined || !object.key.startsWith(rule.prefix)) {
+        continue;
+      }
+      if (rule.tag && object.tags?.[rule.tag.key] !== rule.tag.value) {
         continue;
       }
       if (opts.now - object.mtimeMs >= rule.days * 86_400_000) {
@@ -220,7 +238,7 @@ export async function applyLifecycle(opts: {
       }
     }
   }
-  const groups = new Map<string, { bucket: string; key: string; id: string; mtimeMs: number }[]>();
+  const groups = new Map<string, { bucket: string; key: string; id: string; mtimeMs: number; deleteMarker?: boolean }[]>();
   for (const version of opts.versions ?? []) {
     const id = `${version.bucket}\0${version.key}`;
     const list = groups.get(id) ?? [];
@@ -241,19 +259,57 @@ export async function applyLifecycle(opts: {
         }
       }
     }
+    const only = list.length === 1 ? list[0] : undefined;
+    if (!only?.deleteMarker) {
+      continue;
+    }
+    for (const rule of opts.rules) {
+      if (rule.deleteMarkerDays === undefined || !only.key.startsWith(rule.prefix)) {
+        continue;
+      }
+      if (opts.now - only.mtimeMs >= rule.deleteMarkerDays * 86_400_000) {
+        await opts.dropVersion?.(only.bucket, only.key, only.id);
+        deleteMarkers++;
+        break;
+      }
+    }
   }
-  return { expired, aborted, noncurrent };
+  return { expired, aborted, noncurrent, deleteMarkers };
+}
+
+export function eventSelected(filters: string[] | undefined, name: string): boolean {
+  if (!filters || filters.length === 0) {
+    return true;
+  }
+  return filters.some((filter) => (filter.endsWith('*') ? name.startsWith(filter.slice(0, -1)) : filter === name));
+}
+
+export function policyIsPublic(statements: PolicyStatement[]): boolean {
+  return statements.some((statement) => {
+    if (statement.effect !== 'Allow') {
+      return false;
+    }
+    const resource = statement.resource.replace(/^arn:aws:s3:::/, '');
+    return resource === '*' || resource.endsWith('/*');
+  });
+}
+
+export function parsePublicAccessBlock(body: string): boolean {
+  return /<BlockPublicPolicy>\s*true\s*<\/BlockPublicPolicy>/i.test(body);
 }
 
 export async function postEvent(
-  url: string | undefined,
+  config: { notifyUrl?: string; notifyEvents?: string[] },
   event: Record<string, unknown>,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  if (!url) {
+  if (!config.notifyUrl) {
     return;
   }
-  await fetchImpl(url, {
+  if (!eventSelected(config.notifyEvents, String(event.event ?? ''))) {
+    return;
+  }
+  await fetchImpl(config.notifyUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(event),
@@ -364,6 +420,8 @@ export function parseLifecycle(body: string): LifecycleRule[] {
       days: rule.days,
       abortDays: rule.abortDays,
       noncurrentDays: rule.noncurrentDays,
+      deleteMarkerDays: rule.deleteMarkerDays,
+      tag: rule.tag,
     }));
   }
   const rules: LifecycleRule[] = [];
@@ -373,14 +431,29 @@ export function parseLifecycle(body: string): LifecycleRule[] {
     const days = /<Days>\s*(\d+)\s*<\/Days>/i.exec(xml)?.[1];
     const abort = /<AbortIncompleteMultipartUpload>[\s\S]*?<DaysAfterInitiation>\s*(\d+)/i.exec(xml)?.[1];
     const noncurrent = /<NoncurrentVersionExpiration>[\s\S]*?<NoncurrentDays>\s*(\d+)/i.exec(xml)?.[1];
+    const markerDays = /<DelMarkerExpiration>[\s\S]*?<Days>\s*(\d+)/i.exec(xml)?.[1];
+    const markerNow = /<ExpiredObjectDeleteMarker>\s*true\s*<\/ExpiredObjectDeleteMarker>/i.test(xml);
+    const tagKey = /<Tag>\s*<Key>\s*([^<]*?)\s*<\/Key>/i.exec(xml)?.[1];
+    const tagValue = /<Tag>[\s\S]*?<Value>\s*([^<]*?)\s*<\/Value>/i.exec(xml)?.[1];
     rules.push({
       prefix,
       days: days ? Number(days) : undefined,
       abortDays: abort ? Number(abort) : undefined,
       noncurrentDays: noncurrent ? Number(noncurrent) : undefined,
+      deleteMarkerDays: markerDays ? Number(markerDays) : markerNow ? 0 : undefined,
+      tag: tagKey ? { key: tagKey, value: tagValue ?? '' } : undefined,
     });
   }
   return rules;
+}
+
+export function parseInventory(body: string, fallbackId: string | null): InventoryConfig {
+  const id = /<Id>\s*([^<]+?)\s*<\/Id>/i.exec(body)?.[1] ?? fallbackId ?? '';
+  const prefix = /<Prefix>\s*([^<]*)\s*<\/Prefix>/i.exec(body)?.[1] ?? '';
+  if (!id) {
+    throw new S3HttpError(400, 'MalformedXML', 'Inventory configuration needs an Id');
+  }
+  return { id, prefix, format: 'CSV' };
 }
 
 export interface ObjectUserMeta {
@@ -390,6 +463,80 @@ export interface ObjectUserMeta {
   saveTags(bucket: string, key: string, tags: Record<string, string>): Promise<void>;
   loadTags(bucket: string, key: string): Promise<Record<string, string>>;
   removeTags(bucket: string, key: string): Promise<void>;
+  saveRetention(bucket: string, key: string, retention: ObjectRetention | null): Promise<void>;
+  loadRetention(bucket: string, key: string): Promise<ObjectRetention | null>;
+  saveLegalHold(bucket: string, key: string, status: 'ON' | 'OFF'): Promise<void>;
+  loadLegalHold(bucket: string, key: string): Promise<'ON' | 'OFF' | null>;
+}
+
+export function parseLegalHold(body: string): 'ON' | 'OFF' {
+  const status = /<Status>\s*(ON|OFF)\s*<\/Status>/i.exec(body)?.[1]?.toUpperCase();
+  if (status !== 'ON' && status !== 'OFF') {
+    throw new S3HttpError(400, 'MalformedXML', 'Legal hold status must be ON or OFF');
+  }
+  return status;
+}
+
+export function parseWebsite(body: string): { index: string; error?: string; redirects?: { prefix: string; replace: string; code?: number }[] } {
+  const index = /<Suffix>\s*([^<]+?)\s*<\/Suffix>/i.exec(body)?.[1];
+  if (!index) {
+    throw new S3HttpError(400, 'MalformedXML', 'Website configuration needs an index suffix');
+  }
+  const error = /<ErrorDocument>[\s\S]*?<Key>\s*([^<]+?)\s*<\/Key>/i.exec(body)?.[1];
+  const redirects: { prefix: string; replace: string; code?: number }[] = [];
+  for (const block of body.matchAll(/<RoutingRule\b[^>]*>([\s\S]*?)<\/RoutingRule>/gi)) {
+    const xml = block[1] ?? '';
+    const prefix = /<KeyPrefixEquals>\s*([^<]*?)\s*<\/KeyPrefixEquals>/i.exec(xml)?.[1] ?? '';
+    const replace = /<ReplaceKeyPrefixWith>\s*([^<]*?)\s*<\/ReplaceKeyPrefixWith>/i.exec(xml)?.[1] ?? '';
+    const code = /<HttpRedirectCode>\s*(\d+)\s*<\/HttpRedirectCode>/i.exec(xml)?.[1];
+    if (prefix) {
+      redirects.push({ prefix, replace, code: code ? Number(code) : undefined });
+    }
+  }
+  return { index, error, redirects: redirects.length > 0 ? redirects : undefined };
+}
+
+export function websiteRedirect(website: { redirects?: { prefix: string; replace: string; code?: number }[] } | undefined, key: string): { key: string; code: number } | null {
+  for (const rule of website?.redirects ?? []) {
+    if (rule.prefix && key.startsWith(rule.prefix)) {
+      return { key: `${rule.replace}${key.slice(rule.prefix.length)}`, code: rule.code ?? 301 };
+    }
+  }
+  return null;
+}
+
+export function parseLocation(body: string): string {
+  const location = /<LocationConstraint>\s*([^<]+?)\s*<\/LocationConstraint>/i.exec(body)?.[1];
+  if (!location) {
+    throw new S3HttpError(400, 'MalformedXML', 'Location constraint is required');
+  }
+  return location;
+}
+
+export interface ObjectRetention {
+  mode: 'GOVERNANCE' | 'COMPLIANCE';
+  untilMs: number;
+}
+
+export function parseRetention(body: string): ObjectRetention {
+  const mode = /<Mode>\s*(GOVERNANCE|COMPLIANCE)\s*<\/Mode>/i.exec(body)?.[1]?.toUpperCase();
+  const until = /<RetainUntilDate>\s*([^<]+)\s*<\/RetainUntilDate>/i.exec(body)?.[1];
+  const untilMs = until ? Date.parse(until) : Number.NaN;
+  if ((mode !== 'GOVERNANCE' && mode !== 'COMPLIANCE') || Number.isNaN(untilMs)) {
+    throw new S3HttpError(400, 'MalformedXML', 'Retention needs GOVERNANCE or COMPLIANCE and a RetainUntilDate');
+  }
+  return { mode, untilMs };
+}
+
+export function retentionXml(retention: ObjectRetention): string {
+  return `<?xml version="1.0" encoding="UTF-8"?><Retention xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Mode>${retention.mode}</Mode><RetainUntilDate>${new Date(retention.untilMs).toISOString()}</RetainUntilDate></Retention>`;
+}
+
+export function retentionBlocks(retention: ObjectRetention | null, now: number, bypassGovernance: boolean): boolean {
+  if (!retention || retention.untilMs <= now) {
+    return false;
+  }
+  return retention.mode === 'COMPLIANCE' || !bypassGovernance;
 }
 
 export class MemoryObjectMeta implements ObjectUserMeta {
@@ -404,9 +551,13 @@ export class MemoryObjectMeta implements ObjectUserMeta {
     return { ...(this.rows.get(`${bucket}/${key}`) ?? {}) };
   }
 
+  readonly retentionRows = new Map<string, ObjectRetention>();
+
   async remove(bucket: string, key: string): Promise<void> {
     this.rows.delete(`${bucket}/${key}`);
     this.tagRows.delete(`${bucket}/${key}`);
+    this.retentionRows.delete(`${bucket}/${key}`);
+    this.legalHoldRows.delete(`${bucket}/${key}`);
   }
 
   async saveTags(bucket: string, key: string, tags: Record<string, string>): Promise<void> {
@@ -419,5 +570,31 @@ export class MemoryObjectMeta implements ObjectUserMeta {
 
   async removeTags(bucket: string, key: string): Promise<void> {
     this.tagRows.delete(`${bucket}/${key}`);
+  }
+
+  async saveRetention(bucket: string, key: string, retention: ObjectRetention | null): Promise<void> {
+    if (!retention) {
+      this.retentionRows.delete(`${bucket}/${key}`);
+      return;
+    }
+    this.retentionRows.set(`${bucket}/${key}`, retention);
+  }
+
+  async loadRetention(bucket: string, key: string): Promise<ObjectRetention | null> {
+    return this.retentionRows.get(`${bucket}/${key}`) ?? null;
+  }
+
+  readonly legalHoldRows = new Map<string, 'ON' | 'OFF'>();
+
+  async saveLegalHold(bucket: string, key: string, status: 'ON' | 'OFF'): Promise<void> {
+    if (status === 'OFF') {
+      this.legalHoldRows.delete(`${bucket}/${key}`);
+      return;
+    }
+    this.legalHoldRows.set(`${bucket}/${key}`, status);
+  }
+
+  async loadLegalHold(bucket: string, key: string): Promise<'ON' | 'OFF' | null> {
+    return this.legalHoldRows.get(`${bucket}/${key}`) ?? null;
   }
 }
