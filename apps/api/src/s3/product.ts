@@ -125,6 +125,81 @@ export class MemoryVersionStore implements VersionStore {
 }
 
 const SSE_MAGIC = Buffer.from('S3E1');
+const SSE_KEYED = Buffer.from('S3K1');
+const SSE_FRAMES = Buffer.from('S3ES');
+
+export function sseKeyId(secret: string): string {
+  return createHash('sha256').update(secret).digest().subarray(0, 8).toString('hex');
+}
+
+export function sealObjectKeyed(secret: string, plain: Buffer): Buffer {
+  const id = Buffer.from(sseKeyId(secret));
+  const sealed = sealObject(sseKeyFromSecret(secret), plain);
+  const head = Buffer.alloc(5);
+  SSE_KEYED.copy(head, 0);
+  head[4] = id.length;
+  return Buffer.concat([head, id, sealed]);
+}
+
+export function openSealed(stored: Buffer, secrets: string[]): Buffer {
+  if (stored.length >= 4 && stored.subarray(0, 4).equals(SSE_FRAMES)) {
+    const parts: Buffer[] = [];
+    let offset = 4;
+    while (offset + 4 <= stored.length) {
+      const len = stored.readUInt32BE(offset);
+      offset += 4;
+      parts.push(openSealed(stored.subarray(offset, offset + len), secrets));
+      offset += len;
+    }
+    return Buffer.concat(parts);
+  }
+  if (stored.length >= 5 && stored.subarray(0, 4).equals(SSE_KEYED)) {
+    const len = stored[4] ?? 0;
+    const id = stored.subarray(5, 5 + len).toString('utf8');
+    const body = stored.subarray(5 + len);
+    const secret = secrets.find((item) => sseKeyId(item) === id) ?? secrets[0];
+    if (!secret) {
+      return stored;
+    }
+    return openObject(sseKeyFromSecret(secret), body);
+  }
+  if (isSealed(stored)) {
+    let last: unknown;
+    for (const secret of secrets) {
+      try {
+        return openObject(sseKeyFromSecret(secret), stored);
+      } catch (err) {
+        last = err;
+      }
+    }
+    if (last) {
+      throw last;
+    }
+  }
+  return stored;
+}
+
+export async function* sealFrames(chunks: AsyncIterable<Buffer>, secret: string): AsyncIterable<Buffer> {
+  yield SSE_FRAMES;
+  let pending = Buffer.alloc(0);
+  const emit = function* (block: Buffer): Generator<Buffer> {
+    const sealed = sealObjectKeyed(secret, block);
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(sealed.length);
+    yield len;
+    yield sealed;
+  };
+  for await (const chunk of chunks) {
+    pending = pending.length === 0 ? chunk : Buffer.concat([pending, chunk]);
+    while (pending.length >= 1024 * 1024) {
+      yield* emit(pending.subarray(0, 1024 * 1024));
+      pending = pending.subarray(1024 * 1024);
+    }
+  }
+  if (pending.length > 0) {
+    yield* emit(pending);
+  }
+}
 
 export function sseKeyFromSecret(secret: string): Buffer {
   return createHash('sha256').update(secret).digest();

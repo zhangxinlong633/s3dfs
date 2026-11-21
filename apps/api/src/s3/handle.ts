@@ -9,9 +9,10 @@ import {
   actionFor,
   checkPolicy,
   isCustomerSealed,
-  isSealed,
   openCustomer,
-  openObject,
+  openSealed,
+  sealFrames,
+  sealObjectKeyed,
   matchCors,
   parseCors,
   parseDefaultEncryption,
@@ -33,8 +34,6 @@ import {
   tagsXml,
   postEvent,
   sealCustomer,
-  sealObject,
-  sseKeyFromSecret,
   type AccessAccount,
   type ConfigStore,
   type ObjectUserMeta,
@@ -106,6 +105,8 @@ export interface S3Options {
   /** Virtual-hosted buckets are `{bucket}.{domain}`. */
   domain?: string;
   sseSecret?: string;
+  /** Previous AES secret. Objects sealed with it still open after the current key changes. */
+  ssePrevious?: string;
   config?: ConfigStore;
   versions?: VersionStore;
   meta?: ObjectUserMeta;
@@ -902,7 +903,7 @@ async function maybeSeal(req: S3Request, body: Buffer, options: S3Options, encry
   if (!options.sseSecret) {
     throw new S3HttpError(400, 'InvalidArgument', 'S3DFS_SSE_KEY is not configured');
   }
-  return sealObject(sseKeyFromSecret(options.sseSecret), body);
+  return sealObjectKeyed(options.sseSecret, body);
 }
 
 async function presentObject(stored: Buffer, options: S3Options, req: S3Request): Promise<Buffer> {
@@ -917,8 +918,12 @@ async function presentObject(stored: Buffer, options: S3Options, req: S3Request)
       throw new S3HttpError(403, 'InvalidRequest', 'SSE-C key does not match');
     }
   }
-  if (options.sseSecret && isSealed(stored)) {
-    return openObject(sseKeyFromSecret(options.sseSecret), stored);
+  const secrets = [options.sseSecret, options.ssePrevious].filter((item): item is string => Boolean(item));
+  if (secrets.length > 0) {
+    const opened = openSealed(stored, secrets);
+    if (opened !== stored) {
+      return opened;
+    }
   }
   return stored;
 }
@@ -1133,8 +1138,12 @@ async function handleObject(
       return xml(200, copyObjectXml(etag, new Date(meta?.mtimeMs ?? Date.now()).toISOString()), etagHeaders(meta?.crc ?? 0));
     }
     await backend.createBucket(bucket);
-    if (req.bodyStream && header(req.headers, 'x-amz-server-side-encryption')) {
-      return xml(400, errorXml('InvalidRequest', 'Server-side encryption is limited to the 1 MiB upload buffer'));
+    const sse = (header(req.headers, 'x-amz-server-side-encryption') ?? '').toUpperCase();
+    if (req.bodyStream && sse && sse !== 'AES256') {
+      return xml(400, errorXml('InvalidArgument', 'Only AES256 server-side encryption is supported'));
+    }
+    if (req.bodyStream && sse === 'AES256' && !options.sseSecret) {
+      return xml(400, errorXml('InvalidRequest', 'S3DFS_SSE_KEY is not configured'));
     }
     if (req.bodyStream && backend.putStream) {
       const failed = await assertPreconditions(backend, bucket, key, req.headers, 'PUT');
@@ -1144,7 +1153,8 @@ async function handleObject(
       const versionId = versioning ? randomBytes(8).toString('hex') : undefined;
       const extra = versionId ? `$ver/${encodeURIComponent(key)}/${versionId}` : undefined;
       const md5 = header(req.headers, 'content-md5');
-      const stream = md5 ? matchMd5(req.bodyStream, md5) : req.bodyStream;
+      const plain = md5 ? matchMd5(req.bodyStream, md5) : req.bodyStream;
+      const stream = sse === 'AES256' && options.sseSecret ? sealFrames(plain, options.sseSecret) : plain;
       const stored = await backend.putStream(bucket, key, stream, extra);
       if (versioning && versionId) {
         await versioning.put(bucket, key, { id: versionId, body: null, external: true, deleteMarker: false, mtimeMs: Date.now() });

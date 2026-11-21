@@ -200,7 +200,7 @@ describe('s3 surface that was still open', () => {
     expect(put.headers['x-amz-server-side-encryption']).toBe('AES256');
     expect(put.headers['x-amz-version-id']).toBeTruthy();
     const stored = backend.objects.get('logs/secret.txt')?.body;
-    expect(stored?.subarray(0, 4).toString()).toBe('S3E1');
+    expect(stored?.subarray(0, 4).toString()).toBe('S3K1');
     expect(sseKeyFromSecret('one-key')).toHaveLength(32);
     const read = await call(backend, { method: 'GET', path: '/logs/secret.txt' }, options);
     expect(read.body.toString()).toBe('plain');

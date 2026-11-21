@@ -111,6 +111,7 @@ export class S3Controller {
       iam: iamFromIndex(this.engine.index()),
       domain: process.env.S3DFS_DOMAIN,
       sseSecret: process.env.S3DFS_SSE_KEY,
+      ssePrevious: process.env.S3DFS_SSE_KEY_PREVIOUS,
       config: new IndexConfigStore(this.engine.index()),
       versions: new IndexVersionStore(this.engine.index(), {
         put: (bucket, key, value) => this.engine.put(bucket, key, value),
