@@ -107,6 +107,7 @@ typedef struct s3dfs_writer s3dfs_writer;
 /* Append extents so the object size is a uint64, not one uint32 value. */
 s3dfs_writer *s3dfs_write_begin(s3dfs_store *store, const char *key, uint32_t key_len, const s3dfs_put_meta *meta);
 int s3dfs_write(s3dfs_writer *writer, const void *data, uint32_t len);
+void s3dfs_write_set_meta(s3dfs_writer *writer, const s3dfs_put_meta *meta);
 int s3dfs_write_finish(s3dfs_writer *writer, s3dfs_locator *out);
 void s3dfs_write_abort(s3dfs_writer *writer);
 void s3dfs_free(void *p);

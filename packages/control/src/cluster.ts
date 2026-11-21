@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone } from './block-client.js';
+import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone, blockWriteBegin } from './block-client.js';
+import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
 import { isVisibleObjectKey, locatorKey } from './keys.js';
 import type { IndexClient } from './kv-client.js';
@@ -38,21 +39,26 @@ export interface LayoutReport {
   reasons: string[];
 }
 
-/** A configured replica count above 1 needs that many live nodes and that many distinct zones. */
+/** A full set must match the configured replica count and zones. One zone down still writes when the rest meet quorum. */
 export function assessLayout(
-  nodes: { zone?: string }[],
+  nodes: { zone?: string; status?: string }[],
   dataReplicas: number,
 ): LayoutReport {
   const reasons: string[] = [];
-  const zones = new Set(nodes.map((node) => node.zone).filter((zone): zone is string => Boolean(zone)));
-  if (nodes.length < dataReplicas) {
-    reasons.push(`live block nodes ${nodes.length} < configured replicas ${dataReplicas}`);
+  const quorum = writeQuorum(dataReplicas);
+  const present = nodes.filter((node) => node.status !== 'down');
+  const degraded = nodes.some((node) => node.status === 'down');
+  const zones = new Set(present.map((node) => node.zone).filter((zone): zone is string => Boolean(zone)));
+  const needNodes = degraded ? quorum : dataReplicas;
+  const needZones = degraded ? quorum : dataReplicas;
+  if (present.length < needNodes) {
+    reasons.push(`live block nodes ${present.length} < configured replicas ${dataReplicas}`);
   }
   if (dataReplicas > 1) {
-    if (nodes.some((node) => !node.zone)) {
+    if (present.some((node) => !node.zone)) {
       reasons.push('block nodes are missing a failure domain');
     }
-    if (zones.size < dataReplicas) {
+    if (zones.size < needZones) {
       reasons.push(`failure domains ${zones.size} < configured replicas ${dataReplicas}`);
     }
   }
@@ -60,7 +66,7 @@ export function assessLayout(
     ok: reasons.length === 0,
     strict: strictLayoutEnabled(),
     dataReplicas,
-    liveBlocks: nodes.length,
+    liveBlocks: present.length,
     failureDomains: zones.size,
     reasons,
   };
@@ -118,7 +124,7 @@ export class ObjectCluster {
   }
 
   async put(bucket: string, key: string, value: Buffer): Promise<void> {
-    const layout = assessLayout(this.registry.live(), this.dataReplicas);
+    const layout = assessLayout(this.registry.list(), this.dataReplicas);
     if (layout.strict && !layout.ok) {
       throw new ControlError('BLOCK_UNAVAILABLE', layout.reasons.join('; '));
     }
@@ -171,6 +177,83 @@ export class ObjectCluster {
           compressType: packed.compressType,
           crc: digest,
           mtimeMs: ev.mtimeMs,
+        };
+        const indexKey = locatorKey(objectKey, i);
+        await this.kv.put(indexKey, Buffer.from(JSON.stringify(loc)));
+        written.push(indexKey);
+      }
+    } catch (err) {
+      await Promise.all(written.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
+      throw err;
+    }
+  }
+
+  /**
+   * Stream an object in chunks. Copies land uncompressed so the API can drop each chunk.
+   * `extraKey` receives the same bytes, used for a version that must outlive the next overwrite.
+   */
+  async putStream(bucket: string, key: string, chunks: AsyncIterable<Buffer>, extraKey?: string): Promise<{ size: number; crc: number }> {
+    const layout = assessLayout(this.registry.list(), this.dataReplicas);
+    if (layout.strict && !layout.ok) {
+      throw new ControlError('BLOCK_UNAVAILABLE', layout.reasons.join('; '));
+    }
+    const keys = [key, ...(extraKey ? [extraKey] : [])];
+    const opened: { objectKey: string; nodeId: string; address: string; writer: Awaited<ReturnType<typeof blockWriteBegin>> }[] = [];
+    for (const one of keys) {
+      const objectKey = this.objectKey(bucket, one);
+      const targets = this.registry.pick(objectKey, this.dataReplicas);
+      for (const node of targets) {
+        opened.push({ objectKey, nodeId: node.nodeId, address: node.address, writer: await blockWriteBegin(node.address, objectKey) });
+      }
+    }
+    const relayed = await relayChunks(chunks, opened.map((item) => item.writer));
+    const byKey = new Map<string, { nodeId: string; address: string; loc: import('./types.js').ExtentLocator }[]>();
+    opened.forEach((item, index) => {
+      const loc = relayed.locs[index];
+      if (!loc) {
+        return;
+      }
+      const list = byKey.get(item.objectKey) ?? [];
+      list.push({ nodeId: item.nodeId, address: item.address, loc });
+      byKey.set(item.objectKey, list);
+    });
+    for (const one of keys) {
+      const objectKey = this.objectKey(bucket, one);
+      const accepted = byKey.get(objectKey) ?? [];
+      const targets = this.registry.pick(objectKey, this.dataReplicas);
+      if (accepted.length < writeQuorum(targets.length)) {
+        throw new ControlError('BLOCK_UNAVAILABLE', `wrote ${accepted.length} of ${targets.length} replicas for ${objectKey}`);
+      }
+      await this.commitLocators(objectKey, accepted, relayed.size, relayed.crc);
+    }
+    return { size: relayed.size, crc: relayed.crc };
+  }
+
+  private async commitLocators(
+    objectKey: string,
+    accepted: { nodeId: string; address: string; loc: import('./types.js').ExtentLocator }[],
+    size: number,
+    crc: number,
+  ): Promise<void> {
+    const written: string[] = [];
+    try {
+      for (let i = 0; i < accepted.length; i++) {
+        const ev = accepted[i]!;
+        const loc: ObjectLocator = {
+          v: 3,
+          replica: i,
+          replicaCount: accepted.length,
+          nodeId: ev.nodeId,
+          address: ev.address,
+          recId: ev.loc.recId,
+          chained: ev.loc.chained,
+          generation: ev.loc.generation,
+          extentCount: ev.loc.extentCount,
+          size,
+          storedSize: ev.loc.size,
+          compressType: 'none',
+          crc,
+          mtimeMs: ev.loc.mtimeMs,
         };
         const indexKey = locatorKey(objectKey, i);
         await this.kv.put(indexKey, Buffer.from(JSON.stringify(loc)));
@@ -329,20 +412,37 @@ export class ObjectCluster {
   }
 
   async listBuckets(): Promise<{ name: string; mtimeMs: number }[]> {
-    const listed = await this.kv.scan({ prefix: '', maxKeys: 10_000 });
     const map = new Map<string, number>();
-    for (const obj of listed.objects) {
-      if (!isVisibleObjectKey(obj.key)) {
-        continue;
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: '', startAfter, maxKeys: 1000 });
+      if (listed.objects.length === 0) {
+        break;
       }
-      const slash = obj.key.indexOf('/');
-      if (slash <= 0) {
-        continue;
+      for (const obj of listed.objects) {
+        if (!isVisibleObjectKey(obj.key)) {
+          continue;
+        }
+        const slash = obj.key.indexOf('/');
+        if (slash <= 0) {
+          continue;
+        }
+        const name = obj.key.slice(0, slash);
+        if (!map.has(name)) {
+          map.set(name, obj.mtimeMs);
+        }
       }
-      const name = obj.key.slice(0, slash);
-      const prev = map.get(name);
-      if (prev === undefined || obj.mtimeMs < prev) {
-        map.set(name, obj.mtimeMs);
+      const last = listed.objects[listed.objects.length - 1]!;
+      const slash = last.key.indexOf('/');
+      if (listed.truncated && slash > 0 && isVisibleObjectKey(last.key)) {
+        const name = last.key.slice(0, slash);
+        const bound = `${name}/\uffff`;
+        startAfter = last.key.startsWith(`${name}/`) && last.key < bound ? bound : last.key;
+      } else {
+        startAfter = last.key;
+      }
+      if (!listed.truncated) {
+        break;
       }
     }
     return [...map.entries()].map(([name, mtimeMs]) => ({ name, mtimeMs }));
@@ -435,7 +535,12 @@ export class ObjectCluster {
   }
 
   layout(): LayoutReport {
-    return assessLayout(this.registry.live(), this.dataReplicas);
+    return assessLayout(this.registry.list(), this.dataReplicas);
+  }
+
+  async probeLayout(): Promise<LayoutReport> {
+    await this.registry.checkAll();
+    return this.layout();
   }
 
   async flush(): Promise<void> {
@@ -493,9 +598,8 @@ export class ObjectCluster {
   }
 
   /**
-   * Top up objects that have fewer live data copies than
-   * min(configured replicas, live block nodes). Adds copies only; does not
-   * drop locators for down nodes, and cannot rebuild an object with no live source.
+   * Drop locators that point at a down node when a live copy remains, and add
+   * copies back up to the configured replica count once a node is live again.
    */
   async repair(opts: { maxObjects?: number } = {}): Promise<RepairReport> {
     await this.registry.checkAll();
@@ -513,7 +617,7 @@ export class ObjectCluster {
       }
       for (const obj of listed.objects) {
         startAfter = obj.key;
-        if (!isVisibleObjectKey(obj.key)) {
+        if (!isVisibleObjectKey(obj.key) && !obj.key.includes('/$ver/')) {
           continue;
         }
         report.scanned++;

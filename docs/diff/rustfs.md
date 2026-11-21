@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| 日期 | 2026-11-20 |
+| 日期 | 2026-11-21 |
 | 读者 | 需要逐项确认 S3 与运维能力差异的人 |
 | s3dfs | 以当时仓库的 [架构](../architecture.md)、[能力](../capabilities.md)、[网关](../design-s3-gateway.md) 为准 |
 | RustFS | 以公开材料为准，功能表会继续变化 |
@@ -33,7 +33,7 @@
 | 小对象 | 几千个 1 KiB 对象进同一个 `.blk`，不按对象建目录，block 上没有本地 LevelDB | 分片不超过预算时内联进该盘自己的 `xl.meta`。默认每片预算 `256 KiB / K`，上限 128 KiB；版本桶再除以 8。超过则仍是独立文件。官方建议数据盘用 XFS，inode 512 字节 |
 | 放置 | 按 key 哈希从存活 block 里挑 N 台，同一份字节写 N 份。默认 N=3，不超过存活节点数 | 对象哈希到某个纠删集，片在集内轮转。集之间不共享故障预算 |
 | 读 | 跳过健康检查标 down 的节点，按 `recId` 取，按 locator 上的 `compressType` 解压 | 读 quorum 选定元数据，校验 bitrot，至少 K 个片才能解出；缺片但读成功会排队 read-repair |
-| 写成功条件 | N 个目标 block 都写上，再把 locator 写入索引。配置了多个索引地址时，当前地址失败会改写下一个；新节点不会自动拿到历史 key | 达到写 quorum 才对外成功；低于 quorum 不报成功 |
+| 写成功条件 | 默认 3 副本里 2 份 block 成功即写索引，未写上的一份由修复补。任一条 locator 失败则删掉本次已写入的 locator。索引地址失败时改写下一条；节点回来后由 dleveldb 按较新的 mtime 追平 | 达到写 quorum 才对外成功；低于 quorum 不报成功 |
 | 扩容 | 加 block 机器扩正文；索引集群另算。新索引节点加入环后，由 dleveldb 按较新的 mtime 追平本机负责的 key | 多盘池只能在后面追加新 Pool，不能改已有池的端点和纠删集宽度。单盘部署不能原地扩成多盘，要新建集群再经 S3 迁数据 |
 | 挂载 | 自带 `s3dfs-fuse`（C）。Linux 没有 libfuse 时直接对 `/dev/fuse`；有 macFUSE / libfuse 时用 libfuse。没有 FUSE 时 macOS 走本机 WebDAV。关文件时整对象 Put，只是兼容层 | 不带 FUSE。用 s3fs、rclone mount 对 S3 端点挂 |
 
@@ -55,11 +55,11 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 - 一份桶策略（Allow / Deny）、单密钥 AES-256-GCM、版本和删除标记、按前缀的天数过期、一个 webhook URL
 - 按对象压缩、3 副本、宕机节点避让、活副本不足时补齐并退役 down 的 locator、没有活副本时记为 `lost`、墓碑、扫描重建 locator、空闲或手动 compact
 
-控制台仍是看统计、桶和 block 状态，并触发 flush。C S3 网关能解开 `aws-chunked`、做内存中的分片和删空桶；配了同一对密钥时校验请求头签名和预签名，不校验分块签名。未压缩对象的 Range 按偏移向 block 要那一段；压缩对象仍先整段解开。单次 Put 的 HTTP body 还是在 API 进程里攒齐。多数副本写成功就提交索引，种子上的 `@zone` 用来避开同一故障域。每个响应带 `x-amz-request-id`。
+控制台仍是看统计、桶和 block 状态，并触发 flush。C S3 网关能解开 `aws-chunked`、做内存中的分片和删空桶；配了同一对密钥时校验请求头签名和预签名，不校验分块签名。未压缩对象的 Range 按偏移向 block 要那一段；压缩对象仍先整段解开。超过 1 MiB 的原始 Put 按块进入 block。多数副本写成功就提交索引，种子上的 `@zone` 用来避开同一故障域。每个响应带 `x-amz-request-id`。
 
 这些和 RustFS 同名的能力，深度不一样。RustFS 的签名背后是 IAM，加密可以接到 Vault / AWS KMS，版本和生命周期是产品功能，通知、复制、配额、审计都在数据面上。s3dfs 这边是一条主路径加一组最小实现：一把密钥、一条策略、一个 webhook。Nest API 已有条件请求、用户元数据和批量删除。
 
-还没做的部分见 [todo.md](../todo.md)。和这次对照直接相关的缺口是：单次 Put 仍在 API 里缓冲整段 body、C 网关的分块签名、dleveldb 在目标集群上的演练、多机吞吐对照，以及纠删码、站点复制、远程分层、Object Lock、配额、审计、Helm、Swift / SFTP。
+还没做的部分见 [todo.md](../todo.md)。和这次对照直接相关的缺口是：分片完成仍在 API 里拼成一段、`aws-chunked` 仍整段缓冲、C 网关的分块签名、dleveldb 在目标集群上的演练、多机吞吐对照，以及纠删码、站点复制、远程分层、Object Lock、配额、审计、Helm、Swift / SFTP。
 
 ## 可靠性对照
 
@@ -68,7 +68,7 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | 静默损坏 | 记录带 CRC-32；Get 对副本做大小和 CRC 校验，不匹配就试下一份 | bitrot 保护；读时校验，缺片则在 K 个片够用时解码，并排队修复 |
 | 盘或节点挂了 | 健康检查后读写跳过 down 节点。后台或 `POST /_s3dfs/repair` 把不足的副本再写到空闲节点，并去掉已经 down 的 locator。没有任何活副本时记为 `lost`，补不回来 | healing / scanner。写、读都看 quorum |
 | 删和覆盖 | 立刻对用户不可见。盘上先留洞，墓碑防止扫描把已删对象救回来。compact 重写活记录并保留原 `recId`，不改索引 | 版本、Object Lock、生命周期是产品功能；对象文件由 scanner 和 ILM 管 |
-| 索引挂了 | 可以扫 `.blk` 重建 locator。多个索引地址时，当前地址失败会改写下一个。新节点不会自动拿到历史 key | 元数据和数据片在同一套盘上，没有单独的小索引集群 |
+| 索引挂了 | 可以扫 `.blk` 重建 locator。多个索引地址时，当前地址失败会改写下一条。剩余副本达到法定人数时 dleveldb 继续写入，节点回来后按较新的 mtime 追平 | 元数据和数据片在同一套盘上，没有单独的小索引集群 |
 
 ## 不照搬的部分
 

@@ -33,6 +33,7 @@ export interface StoredUpload {
 export interface UploadStore {
   create(id: string, bucket: string, key: string, createdMs: number): Promise<void>;
   putPart(id: string, partNumber: number, part: StoredPart): Promise<void>;
+  notePart?(id: string, partNumber: number, part: { etag: string; size: number; mtimeMs: number }): Promise<void>;
   get(id: string): Promise<StoredUpload | null>;
   remove(id: string): Promise<void>;
   list(): Promise<{ id: string; bucket: string; key: string; createdMs: number }[]>;
@@ -94,6 +95,20 @@ export class MultipartUploads {
     await this.store.putPart(uploadId, partNumber, { body, etag, mtimeMs: Date.now() });
     upload.parts.set(partNumber, { body, etag, mtimeMs: Date.now() });
     return etag;
+  }
+
+  async notePart(
+    bucket: string,
+    key: string,
+    uploadId: string,
+    partNumber: number,
+    part: { etag: string; size: number; mtimeMs: number },
+  ): Promise<void> {
+    await this.require(bucket, key, uploadId);
+    if (!this.store.notePart) {
+      throw new S3HttpError(500, 'InternalError', 'This upload store cannot record a streamed part');
+    }
+    await this.store.notePart(uploadId, partNumber, part);
   }
 
   async listParts(bucket: string, key: string, uploadId: string): Promise<{ partNumber: number; etag: string; size: number }[]> {

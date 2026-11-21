@@ -49,6 +49,7 @@ export interface S3Backend {
     delimiter: string,
   ): Promise<{ truncated: boolean; objects: ListedObject[]; prefixes: string[]; nextToken?: string }>;
   put(bucket: string, key: string, value: Buffer): Promise<void>;
+  putStream?(bucket: string, key: string, chunks: AsyncIterable<Buffer>, extraKey?: string): Promise<{ size: number; crc: number }>;
   head(bucket: string, key: string): Promise<Omit<ObjectValue, 'value'> | null>;
   get(bucket: string, key: string): Promise<ObjectValue | null>;
   getRange(
@@ -66,6 +67,7 @@ export interface S3Request {
   query: URLSearchParams;
   headers: Record<string, string | string[] | undefined>;
   body: Buffer;
+  bodyStream?: AsyncIterable<Buffer>;
   host?: string;
   now?: number;
 }
@@ -135,6 +137,17 @@ function payload(req: S3Request): Buffer {
     throw new S3HttpError(400, 'BadDigest', 'Content-MD5 does not match the body');
   }
   return body;
+}
+
+async function* matchMd5(source: AsyncIterable<Buffer>, md5: string): AsyncIterable<Buffer> {
+  const hash = createHash('md5');
+  for await (const chunk of source) {
+    hash.update(chunk);
+    yield chunk;
+  }
+  if (hash.digest('base64') !== md5.trim()) {
+    throw new S3HttpError(400, 'BadDigest', 'Content-MD5 does not match the body');
+  }
 }
 
 function resolveTarget(req: S3Request, domain: string | undefined): { bucket?: string; key?: string } {
@@ -449,6 +462,14 @@ async function handleObject(
     const id = await uploads.create(bucket, key);
     return xml(200, initiateMultipartXml(bucket, key, id));
   }
+  if (uploadId && method === 'PUT' && req.bodyStream && backend.putStream) {
+    const partNumber = Number(req.query.get('partNumber'));
+    const partKey = `$upload/${uploadId}/${partNumber}`;
+    const stored = await backend.putStream(bucket, partKey, req.bodyStream);
+    const etag = etagFromCrc(stored.crc);
+    await uploads.notePart(bucket, key, uploadId, partNumber, { etag, size: stored.size, mtimeMs: Date.now() });
+    return empty(200, { ETag: etag });
+  }
   if (uploadId && method === 'PUT') {
     const partNumber = Number(req.query.get('partNumber'));
     const body = payload(req);
@@ -508,6 +529,32 @@ async function handleObject(
       return xml(200, copyObjectXml(etag, new Date(meta?.mtimeMs ?? Date.now()).toISOString()), etagHeaders(meta?.crc ?? 0));
     }
     await backend.createBucket(bucket);
+    if (req.bodyStream && header(req.headers, 'x-amz-server-side-encryption')) {
+      return xml(400, errorXml('InvalidRequest', 'Server-side encryption is limited to the 1 MiB upload buffer'));
+    }
+    if (req.bodyStream && backend.putStream) {
+      const failed = await assertPreconditions(backend, bucket, key, req.headers, 'PUT');
+      if (failed) {
+        return failed;
+      }
+      const versionId = versioning ? randomBytes(8).toString('hex') : undefined;
+      const extra = versionId ? `$ver/${encodeURIComponent(key)}/${versionId}` : undefined;
+      const md5 = header(req.headers, 'content-md5');
+      const stream = md5 ? matchMd5(req.bodyStream, md5) : req.bodyStream;
+      const stored = await backend.putStream(bucket, key, stream, extra);
+      if (versioning && versionId) {
+        await versioning.put(bucket, key, { id: versionId, body: null, external: true, deleteMarker: false, mtimeMs: Date.now() });
+      }
+      const headers: Record<string, string> = etagHeaders(stored.crc);
+      if (versionId) {
+        headers['x-amz-version-id'] = versionId;
+      }
+      if (options.meta) {
+        await options.meta.save(bucket, key, userMeta(req.headers));
+      }
+      await postEvent(config.notifyUrl, { event: 's3:ObjectCreated:Put', bucket, key, size: stored.size }, options.fetchImpl);
+      return empty(200, headers);
+    }
     const plain = payload(req);
     assertObjectSize(plain, options.maxObjectBytes);
     const failed = await assertPreconditions(backend, bucket, key, req.headers, 'PUT');

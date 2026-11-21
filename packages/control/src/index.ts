@@ -12,6 +12,7 @@ export {
 } from './block-client.js';
 export { NodeRegistry, parseBlockNodes, parseIndexUrls, type SeedNode } from './registry.js';
 export { ObjectCluster, assessLayout, serviceHealthy, strictLayoutEnabled, writeQuorum, type ClusterStats, type LayoutReport, type RepairReport } from './cluster.js';
+export { PUT_CHUNK_BYTES, relayChunks } from './stream.js';
 export {
   apiStopAllowed,
   blockStopAllowed,

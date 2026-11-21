@@ -44,6 +44,21 @@ export class IndexUploadStore implements UploadStore {
     }
   }
 
+  async notePart(id: string, partNumber: number, part: { etag: string; size: number; mtimeMs: number }): Promise<void> {
+    const raw = await this.kv.get(`$upload/${id}`);
+    if (!raw) {
+      return;
+    }
+    const meta = JSON.parse(raw.value.toString('utf8')) as {
+      bucket: string;
+      key: string;
+      createdMs: number;
+      parts: Record<string, { etag: string; size: number; mtimeMs: number }>;
+    };
+    meta.parts[String(partNumber)] = part;
+    await this.kv.put(`$upload/${id}`, Buffer.from(JSON.stringify(meta)));
+  }
+
   async get(id: string): Promise<StoredUpload | null> {
     const raw = await this.kv.get(`$upload/${id}`);
     if (!raw) {
@@ -113,7 +128,14 @@ export class IndexConfigStore implements ConfigStore {
 }
 
 export class IndexVersionStore implements VersionStore {
-  constructor(private readonly kv: IndexClient) {}
+  constructor(
+    private readonly kv: IndexClient,
+    private readonly objects: PartObjects,
+  ) {}
+
+  private bodyKey(key: string, id: string): string {
+    return `$ver/${encodeURIComponent(key)}/${id}`;
+  }
 
   async put(bucket: string, key: string, version: ObjectVersion): Promise<void> {
     const base = `$ver/${bucket}/${encodeURIComponent(key)}`;
@@ -121,13 +143,14 @@ export class IndexVersionStore implements VersionStore {
     const ids = raw ? (JSON.parse(raw.value.toString('utf8')) as string[]) : [];
     ids.push(version.id);
     await this.kv.put(`${base}/list`, Buffer.from(JSON.stringify(ids)));
+    const hasBody = version.body !== null || version.external === true;
+    if (version.body) {
+      await this.objects.put(bucket, this.bodyKey(key, version.id), version.body);
+    }
     await this.kv.put(
       `${base}/${version.id}`,
-      Buffer.from(JSON.stringify({ deleteMarker: version.deleteMarker, mtimeMs: version.mtimeMs, hasBody: version.body !== null })),
+      Buffer.from(JSON.stringify({ deleteMarker: version.deleteMarker, mtimeMs: version.mtimeMs, hasBody })),
     );
-    if (version.body) {
-      await this.kv.put(`${base}/${version.id}/body`, version.body);
-    }
   }
 
   async get(bucket: string, key: string, versionId: string): Promise<ObjectVersion | null> {
@@ -137,8 +160,8 @@ export class IndexVersionStore implements VersionStore {
       return null;
     }
     const meta = JSON.parse(raw.value.toString('utf8')) as { deleteMarker: boolean; mtimeMs: number; hasBody: boolean };
-    const body = meta.hasBody ? ((await this.kv.get(`${base}/body`))?.value ?? null) : null;
-    return { id: versionId, body, deleteMarker: meta.deleteMarker, mtimeMs: meta.mtimeMs };
+    const stored = meta.hasBody ? await this.objects.get(bucket, this.bodyKey(key, versionId)) : null;
+    return { id: versionId, body: stored?.value ?? null, deleteMarker: meta.deleteMarker, mtimeMs: meta.mtimeMs };
   }
 
   async list(bucket: string, key: string): Promise<ObjectVersion[]> {
@@ -168,7 +191,11 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async save(bucket: string, key: string, meta: Record<string, string>): Promise<void> {
     if (Object.keys(meta).length === 0) {
-      await this.remove(bucket, key);
+      try {
+        await this.remove(bucket, key);
+      } catch {
+        // Clearing metadata that was never stored must not fail the object put.
+      }
       return;
     }
     await this.kv.put(this.key(bucket, key), Buffer.from(JSON.stringify(meta)));

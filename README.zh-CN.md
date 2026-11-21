@@ -31,7 +31,7 @@ S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js
 | 控制台与挂载 | 控制台看统计、桶和节点。`s3dfs-fuse` 把一个桶挂成本地目录 |
 | 自带巡检 AI | 规则执行修复、compact、flush 和已配置的扩容。简报含现状、相比上次、已执行和值班下一步，并写成 HTML。模型据此写中文结论 |
 
-尚未提供：单次 Put 的有界缓冲、目标集群上的容量数字，以及纠删码、站点复制、Object Lock、配额、审计、多用户 IAM 和 KMS。清单见 [待办](docs/todo.md)。
+尚未提供：目标集群上的容量数字，以及纠删码、站点复制、Object Lock、配额、审计、多用户 IAM 和 KMS。超过 1 MiB 的原始 Put 已按块转发，`aws-chunked` 仍整段缓冲。清单见 [待办](docs/todo.md)。
 
 ## 文档
 

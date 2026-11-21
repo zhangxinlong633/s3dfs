@@ -31,7 +31,7 @@ Behavior and environment variables are in [Capabilities](docs/capabilities.md).
 | Console and mount | The console shows stats, buckets, and nodes. `s3dfs-fuse` mounts one bucket as a directory |
 | Built-in patrol AI | Rules run repair, compact, flush, and a configured scale-up. The brief covers the current state, the change since last time, actions taken, and what to check next, and is written as HTML. The model writes from that brief |
 
-Not provided yet: a bounded buffer on a single Put, capacity numbers from the target cluster, erasure coding, site replication, Object Lock, quotas, audit logs, multi-user IAM, and KMS. See [Todo](docs/todo.md).
+Not provided yet: capacity numbers from the target cluster, erasure coding, site replication, Object Lock, quotas, audit logs, multi-user IAM, and KMS. A raw Put larger than 1 MiB is forwarded in chunks; `aws-chunked` bodies are still buffered. See [Todo](docs/todo.md).
 
 ## Documents
 

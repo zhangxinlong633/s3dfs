@@ -55,7 +55,7 @@
 
 | 事项 | 现状 |
 | --- | --- |
-| 单次 Put | HTTP body 仍在 API 进程内收齐再交给 block。引擎另有 `putChunks`，总长度可以超过 `uint32` |
+| 单次 Put | 不超过 1 MiB 的正文在 API 里压缩后一次写入。更大的原始 Put 按最多 1 MiB 一块进入 block，不在 API 里保留整段。`aws-chunked` 仍先收齐再解码 |
 | C 网关签名 | 不校验 aws-chunked 分块签名，也不接受只有 `Date`、没有 `x-amz-date` 的请求 |
 | 多机吞吐 | 尚无准备上线的机器和网络上的测量 |
 | 产品面以外 | 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP、多用户 IAM、KMS |
@@ -103,7 +103,7 @@
 
 - 列举跳过 `key:1`、`key:2` 这类副本后缀、`$node/` 注册项，以及路径中含 `/$` 的内部对象。对象 key 不要以 `:数字` 结尾。
 - 多节点语义见 [索引与 block 集群](design-replication.md)。dleveldb 自己的 KV 复制见该仓库文档。
-- 大文件与 Range 见 [大文件跨 block 存放](design-large-object.md)。HTTP Put 仍把整个 body 读进 API 进程。
+- 大文件与 Range 见 [大文件跨 block 存放](design-large-object.md)。超过 1 MiB 的原始 Put 按块进入 block。
 
 ## 7. 自动扩缩
 

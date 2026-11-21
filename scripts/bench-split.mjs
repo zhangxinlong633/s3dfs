@@ -13,6 +13,7 @@ const bun = process.env.BUN_BIN ?? 'bun';
 process.env.S3DFS_STRICT_LAYOUT ??= '0';
 const ops = Number(process.env.S3DFS_BENCH_OPS ?? 5000);
 const warmup = Number(process.env.S3DFS_BENCH_WARMUP ?? 500);
+const focus = process.env.S3DFS_BENCH_FOCUS ?? '';
 const outFile = process.env.S3DFS_BENCH_OUT ?? '/tmp/s3dfs-bench.json';
 
 if (!existsSync(dleveldbCli)) {
@@ -325,6 +326,48 @@ function layoutCheck(name, bodies, logicalBytes) {
     `${name.padEnd(42)} ${String(files.length).padStart(2)} files   disk ${onDisk} B   logical ${logical} B   ratio ${result.ratio.toFixed(2)}x   fsyncs ${stats.fsyncs}`,
   );
   return result;
+}
+
+if (focus === 'n3') {
+  const results = [];
+  const { cluster } = await startCluster(3, 3);
+  const kib = repeatedPayload(1024);
+  const mib = randomPayload(1024 * 1024);
+  await cluster.createBucket('bench');
+  results.push(
+    await measure('cluster put 1KiB  N=3  none', ops, async (i, warm) => {
+      await cluster.put('bench', `${warm ? 'w' : 'p'}-1k-${i}`, kib);
+    }),
+  );
+  results.push(
+    await measure('cluster get 1KiB  N=3  none', ops, async (i) => {
+      const got = await cluster.get('bench', `p-1k-${i}`);
+      if (!got || got.value.length !== kib.length) throw new Error('missing');
+    }),
+  );
+  results.push(
+    await measure('cluster put 1MiB  N=3  none', 40, async (i, warm) => {
+      await cluster.put('bench', `${warm ? 'w' : 'p'}-1m-${i}`, mib);
+    }, 4),
+  );
+  results.push(
+    await measure('cluster get 1MiB  N=3  none', 40, async (i) => {
+      const got = await cluster.get('bench', `p-1m-${i}`);
+      if (!got || got.value.length !== mib.length) throw new Error('missing');
+    }, 4),
+  );
+  await stopChildren();
+  const summary = {
+    at: new Date().toISOString(),
+    host: `${os.cpus()[0]?.model ?? ''} ${os.arch()}`,
+    bun: process.versions.bun,
+    note: 'localhost, three block processes on one machine, compress=none. Not a target-cluster capacity number.',
+    results,
+  };
+  writeFileSync(outFile, JSON.stringify(summary, null, 2));
+  console.log(`\nwrote ${outFile}`);
+  await cleanup();
+  process.exit(0);
 }
 
 const results = [];

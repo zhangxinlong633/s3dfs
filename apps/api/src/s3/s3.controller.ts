@@ -10,7 +10,7 @@ import { MultipartUploads } from './multipart';
 import { patrolAuthorized } from './patrol';
 import { errorXml } from './s3.xml';
 
-type RawReq = Request & { rawBody?: Buffer };
+type RawReq = Request & { rawBody?: Buffer; bodyStream?: AsyncIterable<Buffer> };
 
 function sendServiceError(res: Response, err: unknown): boolean {
   if (
@@ -46,7 +46,11 @@ export class S3Controller {
       domain: process.env.S3DFS_DOMAIN,
       sseSecret: process.env.S3DFS_SSE_KEY,
       config: new IndexConfigStore(this.engine.index()),
-      versions: new IndexVersionStore(this.engine.index()),
+      versions: new IndexVersionStore(this.engine.index(), {
+        put: (bucket, key, value) => this.engine.put(bucket, key, value),
+        get: (bucket, key) => this.engine.get(bucket, key),
+        delete: (bucket, key) => this.engine.delete(bucket, key),
+      }),
       meta: new IndexObjectMeta(this.engine.index()),
       maxObjectBytes: Number(process.env.S3DFS_MAX_OBJECT_BYTES ?? 1024 * 1024 * 1024),
     };
@@ -63,11 +67,11 @@ export class S3Controller {
     try {
       if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
         const indexOk = await this.engine.index().ping();
-        const layout = this.engine.layout();
+        const layout = await this.engine.probeLayout();
         const lost = this.engine.lostCount();
         const ok = serviceHealthy(indexOk, layout, lost);
         status = ok ? 200 : 503;
-        res.status(status).json({ indexOk, lost, ...layout, ok });
+        res.status(status).json({ indexOk, lost, ...layout, layout, ok });
         return;
       }
       if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {
@@ -140,6 +144,7 @@ export class S3Controller {
           query: url.searchParams,
           headers: req.headers,
           body: req.rawBody ?? Buffer.alloc(0),
+          bodyStream: req.bodyStream,
           host: req.headers.host,
         },
         this.engine,

@@ -165,3 +165,16 @@ The table below is a historical measurement of the previous design: each block p
 | cluster put 1 KiB, N=3, 32 in flight | 5,000 | 6,301 ops/s | 5,261 µs | 10,397 µs |
 
 A separate layout check of that older engine, writing 5,000 × 1 KiB objects and flushing, left 6 files in the data directory: one packed block (`blocks/00000000000000000001.blk`, 5,323,890 bytes) plus 5 LevelDB files. Logical size was 5,120,000 bytes, with 7 flush / fsync calls.
+
+## 2026-11-21 三副本补测
+
+同一台 MacBook Pro（Apple M5 Pro，Bun 1.4.2），三个 block 进程在本机，`compress=none`，后台 compact 关闭。1 KiB 预热 100 次、测量 1,000 次。1 MiB 预热 4 次、测量 40 次。这组数字填上了 1 MiB、3 副本这一格，仍然是 localhost，不是目标集群的容量。
+
+| 负载 | 吞吐 | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| put 1 KiB，N=3 | 2,567 ops/s | 360 µs | 876 µs |
+| get 1 KiB，N=3 | 3,967 ops/s | 238 µs | 481 µs |
+| put 1 MiB，N=3 | 160 ops/s（160 MiB/s） | 5.9 ms | 8.3 ms |
+| get 1 MiB，N=3 | 364 ops/s（364 MiB/s） | 2.7 ms | 3.4 ms |
+
+复现：`S3DFS_COMPACT_INTERVAL_MS=0 S3DFS_BENCH_FOCUS=n3 S3DFS_BENCH_OPS=1000 S3DFS_BENCH_WARMUP=100 bun scripts/bench-split.mjs`。原始结果在 [bench-2026-11-21-n3.json](bench-2026-11-21-n3.json)。

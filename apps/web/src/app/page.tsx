@@ -73,7 +73,7 @@ export default function Page() {
 
   async function post(path: string, label: string) {
     setMessage(null);
-    const r = await fetch(`${apiBase}/_s3dfs/${path}`, { method: 'POST' });
+    const r = await fetch(`/api/s3dfs/${path}`, { method: 'POST' });
     if (!r.ok) {
       setError(`${label} failed: ${r.status}`);
       return;

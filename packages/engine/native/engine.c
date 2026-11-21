@@ -1877,6 +1877,14 @@ int s3dfs_write(s3dfs_writer *w, const void *data, uint32_t len)
     return rc;
 }
 
+void s3dfs_write_set_meta(s3dfs_writer *w, const s3dfs_put_meta *meta)
+{
+    if (!w || !w->alive || !meta) {
+        return;
+    }
+    w->meta = *meta;
+}
+
 int s3dfs_write_finish(s3dfs_writer *w, s3dfs_locator *out)
 {
     if (!w || !w->alive || !out) {

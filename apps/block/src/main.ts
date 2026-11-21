@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import { IndexClient, nodeKey, parseIndexUrls, type BlockNodeInfo } from '@s3dfs/control';
@@ -71,6 +72,8 @@ function requestLocator(req: IncomingMessage, url: URL) {
   }
 }
 
+const writers = new Map<string, number>();
+
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
@@ -134,6 +137,53 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     const value = await readBody(req);
     const loc = store.put(key, value, requestMeta(req));
     sendJson(res, 200, loc);
+    return;
+  }
+  if (pathname === '/_s3dfs/block/write/begin' && method === 'POST') {
+    const key = requestKey(req, url);
+    if (!key) {
+      sendJson(res, 400, { error: 'missing x-s3dfs-key' });
+      return;
+    }
+    const id = randomBytes(8).toString('hex');
+    writers.set(id, store.writeBegin(key));
+    sendJson(res, 200, { id });
+    return;
+  }
+  if (pathname === '/_s3dfs/block/write/chunk' && method === 'POST') {
+    const header = req.headers['x-s3dfs-write'];
+    const id = Array.isArray(header) ? header[0] : header;
+    const native = id ? writers.get(id) : undefined;
+    if (native === undefined) {
+      sendJson(res, 404, { error: 'unknown writer' });
+      return;
+    }
+    store.write(native, await readBody(req));
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (pathname === '/_s3dfs/block/write/finish' && method === 'POST') {
+    const header = req.headers['x-s3dfs-write'];
+    const id = Array.isArray(header) ? header[0] : header;
+    const native = id ? writers.get(id) : undefined;
+    if (!id || native === undefined) {
+      sendJson(res, 404, { error: 'unknown writer' });
+      return;
+    }
+    writers.delete(id);
+    const loc = store.writeFinish(native, requestMeta(req));
+    sendJson(res, 200, loc);
+    return;
+  }
+  if (pathname === '/_s3dfs/block/write/abort' && method === 'POST') {
+    const header = req.headers['x-s3dfs-write'];
+    const id = Array.isArray(header) ? header[0] : header;
+    const native = id ? writers.get(id) : undefined;
+    if (id && native !== undefined) {
+      writers.delete(id);
+      store.writeAbort(native);
+    }
+    sendJson(res, 200, { ok: true });
     return;
   }
   if ((pathname === '/_s3dfs/block/get' || pathname === '/_s3dfs/block/head') && method === 'GET') {

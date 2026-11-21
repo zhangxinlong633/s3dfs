@@ -158,6 +158,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     return this.cluster.layout();
   }
 
+  probeLayout() {
+    return this.cluster.probeLayout();
+  }
+
   lostCount(): number {
     return this.cluster.lostCount();
   }
@@ -184,6 +188,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   async delete(bucket: string, key: string): Promise<boolean> {
     return this.cluster.delete(bucket, key);
+  }
+
+  async putStream(bucket: string, key: string, chunks: AsyncIterable<Buffer>, extraKey?: string): Promise<{ size: number; crc: number }> {
+    return this.cluster.putStream(bucket, key, chunks, extraKey);
   }
 
   async createBucket(bucket: string): Promise<void> {

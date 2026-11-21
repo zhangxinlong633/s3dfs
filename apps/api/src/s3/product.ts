@@ -40,6 +40,8 @@ export class MemoryConfigStore implements ConfigStore {
 export interface ObjectVersion {
   id: string;
   body: Buffer | null;
+  /** Body is already in the block store at `$ver/<key>/<id>`. */
+  external?: boolean;
   deleteMarker: boolean;
   mtimeMs: number;
 }

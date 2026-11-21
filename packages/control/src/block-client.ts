@@ -38,6 +38,43 @@ export async function blockHealth(address: string, timeoutMs = 2000): Promise<Bl
   }
 }
 
+export async function blockWriteBegin(address: string, key: string): Promise<{
+  write(chunk: Buffer): Promise<void>;
+  finish(meta: BlockPutMeta): Promise<ExtentLocator>;
+  abort(): Promise<void>;
+}> {
+  const opened = await fetch(blockUrl(address, '/_s3dfs/block/write/begin'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...locatorHeaders(key) },
+  });
+  if (!opened.ok) {
+    throw new ControlError('BLOCK_UNAVAILABLE', `block write begin ${address} ${opened.status}`);
+  }
+  const { id } = (await opened.json()) as { id: string };
+  const headers = { 'content-type': 'application/octet-stream', 'x-s3dfs-write': id };
+  return {
+    async write(chunk: Buffer) {
+      const res = await fetch(blockUrl(address, '/_s3dfs/block/write/chunk'), { method: 'POST', headers, body: chunk });
+      if (!res.ok) {
+        throw new ControlError('BLOCK_UNAVAILABLE', `block write chunk ${address} ${res.status}`);
+      }
+    },
+    async finish(meta: BlockPutMeta) {
+      const res = await fetch(blockUrl(address, '/_s3dfs/block/write/finish'), {
+        method: 'POST',
+        headers: { ...headers, 'x-s3dfs-meta': encodeURIComponent(JSON.stringify(meta)) },
+      });
+      if (!res.ok) {
+        throw new ControlError('BLOCK_UNAVAILABLE', `block write finish ${address} ${res.status}`);
+      }
+      return (await res.json()) as ExtentLocator;
+    },
+    async abort() {
+      await fetch(blockUrl(address, '/_s3dfs/block/write/abort'), { method: 'POST', headers }).catch(() => undefined);
+    },
+  };
+}
+
 export async function blockPut(
   address: string,
   key: string,

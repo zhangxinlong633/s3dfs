@@ -1,6 +1,8 @@
 #include <napi.h>
+#include <cstdint>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "s3dfs.h"
@@ -152,6 +154,10 @@ public:
             InstanceMethod("get", &Store::Get),
             InstanceMethod("getSpan", &Store::GetSpan),
             InstanceMethod("putChunks", &Store::PutChunks),
+            InstanceMethod("writeBegin", &Store::WriteBegin),
+            InstanceMethod("write", &Store::Write),
+            InstanceMethod("writeFinish", &Store::WriteFinish),
+            InstanceMethod("writeAbort", &Store::WriteAbort),
             InstanceMethod("head", &Store::Head),
             InstanceMethod("tombstone", &Store::Tombstone),
             InstanceMethod("scan", &Store::Scan),
@@ -359,6 +365,94 @@ private:
         return LocToJs(env, loc);
     }
 
+    Napi::Value WriteBegin(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (info.Length() < 1 || !info[0].IsString()) {
+            Napi::TypeError::New(env, "writeBegin(key)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        std::string key = info[0].As<Napi::String>().Utf8Value();
+        s3dfs_writer *writer = s3dfs_write_begin(store_, key.c_str(), (uint32_t)key.size(), nullptr);
+        if (!writer) {
+            ErrFrom(env, S3DFS_ERR_NOMEM).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        uint64_t id = next_writer_++;
+        writers_[id] = writer;
+        return Napi::Number::New(env, (double)id);
+    }
+
+    Napi::Value Write(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsBuffer()) {
+            Napi::TypeError::New(env, "write(id, buffer)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        uint64_t id = (uint64_t)info[0].As<Napi::Number>().Int64Value();
+        auto found = writers_.find(id);
+        if (found == writers_.end()) {
+            Napi::Error::New(env, "unknown writer").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        auto buf = info[1].As<Napi::Buffer<uint8_t>>();
+        int rc = s3dfs_write(found->second, buf.Data(), (uint32_t)buf.Length());
+        if (rc != S3DFS_OK) {
+            ErrFrom(env, rc).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        return env.Undefined();
+    }
+
+    Napi::Value WriteFinish(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (info.Length() < 1 || !info[0].IsNumber()) {
+            Napi::TypeError::New(env, "writeFinish(id, meta)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        uint64_t id = (uint64_t)info[0].As<Napi::Number>().Int64Value();
+        auto found = writers_.find(id);
+        if (found == writers_.end()) {
+            Napi::Error::New(env, "unknown writer").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        s3dfs_writer *writer = found->second;
+        writers_.erase(found);
+        if (info.Length() >= 2 && info[1].IsObject()) {
+            s3dfs_put_meta meta;
+            if (MetaFromJs(info[1], &meta)) {
+                s3dfs_write_set_meta(writer, &meta);
+            }
+        }
+        s3dfs_locator loc;
+        memset(&loc, 0, sizeof(loc));
+        int rc = s3dfs_write_finish(writer, &loc);
+        if (rc != S3DFS_OK) {
+            ErrFrom(env, rc).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        return LocToJs(env, loc);
+    }
+
+    Napi::Value WriteAbort(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        if (info.Length() < 1 || !info[0].IsNumber()) {
+            Napi::TypeError::New(env, "writeAbort(id)").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        uint64_t id = (uint64_t)info[0].As<Napi::Number>().Int64Value();
+        auto found = writers_.find(id);
+        if (found == writers_.end()) {
+            return env.Undefined();
+        }
+        s3dfs_write_abort(found->second);
+        writers_.erase(found);
+        return env.Undefined();
+    }
+
     Napi::Value Head(const Napi::CallbackInfo &info)
     {
         Napi::Env env = info.Env();
@@ -502,6 +596,10 @@ private:
 
     Napi::Value Close(const Napi::CallbackInfo &info)
     {
+        for (auto &entry : writers_) {
+            s3dfs_write_abort(entry.second);
+        }
+        writers_.clear();
         if (store_) {
             s3dfs_close(store_);
             store_ = nullptr;
@@ -510,6 +608,8 @@ private:
     }
 
     s3dfs_store *store_ = nullptr;
+    std::unordered_map<uint64_t, s3dfs_writer *> writers_;
+    uint64_t next_writer_ = 1;
 };
 
 Napi::Object InitAll(Napi::Env env, Napi::Object exports)

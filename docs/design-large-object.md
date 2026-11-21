@@ -40,4 +40,4 @@ flowchart LR
 
 ## 尚待下一步
 
-S3 API 目前仍在 Node 里缓冲完整请求体，默认单对象上限 `S3DFS_MAX_OBJECT_BYTES`（1GiB）。分片上传已经有，但完成时仍在 API 里拼成一个对象再写入。未压缩 Range 按偏移读取；压缩对象先整段解开。引擎的 `putChunks` 可以让一个逻辑对象的总长超过单次 `uint32` 写入，普通 `s3dfs_put` 仍是 `uint32`。
+超过 1 MiB 的原始 Put 按最多 1 MiB 一块进入 block，API 不保留整段。不超过 1 MiB 的仍在 API 里压缩后一次写入。`aws-chunked` 仍先收齐再解码。分片完成时仍在 API 里拼成一个对象再写入。未压缩 Range 按偏移读取；压缩对象先整段解开。引擎的 `s3dfs_write` 可以按块追加，普通 `s3dfs_put` 仍是 `uint32`。

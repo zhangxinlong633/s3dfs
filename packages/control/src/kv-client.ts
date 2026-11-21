@@ -129,9 +129,12 @@ export class IndexClient {
           this.cursor = this.urls.indexOf(base);
           return res;
         }
-        last = new ControlError('INDEX_UNAVAILABLE', `index ${base} returned ${res.status} for ${path}`);
+        const detail = await res.text();
+        last = new ControlError('INDEX_UNAVAILABLE', `index ${base} returned ${res.status} for ${path}: ${detail.slice(0, 180)}`);
       } catch (err) {
-        last = err;
+        if (!(last instanceof ControlError)) {
+          last = err;
+        }
       } finally {
         clearTimeout(timer);
       }
