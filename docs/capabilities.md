@@ -14,10 +14,10 @@
 | --- | --- |
 | 索引与正文分离 | 索引在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群，建议 3–5 台。正文在可扩展的 block 机器上 |
 | 打包 | 对象追加进大文件，默认 1 GiB 一块。inode 和磁盘文件数跟 block 文件走，不跟对象数走 |
-| 定位 | 按 key 哈希分散。locator（`v: 3`）只记节点和稳定的 `recId`。物理偏移留在 block 内存表，打开时可由 `.blk` 重建 |
+| 定位 | 按 key 哈希分散。数据位置（`v: 3`）只记节点和稳定的 `recId`。物理偏移留在 block 内存表，打开时可由 `.blk` 重建 |
 | 跨块 | 放不进当前块的对象切成多段，后一段记下前一段的 `recId`。索引只保留最后一段 |
 | 刷盘 | 1 MiB 写缓冲做组提交，flush 默认 `fsync` |
-| 压缩 | 默认 zstd（`none` / `zstd` / `gzip`）。压不小则存原文，locator 记 `compressType=none` |
+| 压缩 | 默认 zstd（`none` / `zstd` / `gzip`）。压不小则存原文，数据位置记 `compressType=none` |
 | 副本 | 默认 3 份。达到多数即写索引，未写上的份由修复补齐 |
 | 故障域 | 种子可用 `@zone`。放置先从不同 zone 各取一台 |
 | 严格布局 | 默认要求存活节点数和故障域都不少于副本数，不足则拒绝写入 |
@@ -42,7 +42,7 @@
 | 能力 | 说明 |
 | --- | --- |
 | 健康检查 | 定期探测 block。Get / Put 跳过 down 节点。Get 在本次请求内尝试剩余副本 |
-| 副本补齐 | 活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役 down 的 locator。`POST /_s3dfs/repair`，后台默认 30 秒。没有任何活副本记为 `lost`，健康检查 503 |
+| 副本补齐 | 活副本少于 `min(配置副本数, 存活 block 数)` 时，从一份活副本再写到空闲节点，并退役 down 的数据位置。`POST /_s3dfs/repair`，后台默认 30 秒。没有任何活副本记为 `lost`，健康检查 503 |
 | 自动扩缩 | 配置 `S3DFS_SCALE_UP_CMD` 与 `S3DFS_SCALE_DOWN_CMD` 后，API 按容量和延迟决定增减索引、block 或 API。缩容前先排空。未配置脚本时不动作。变量见 [自动扩缩](#7-自动扩缩) |
 | 管理接口 | `GET /_s3dfs/stats\|cluster\|buckets\|health\|metrics`，`POST /_s3dfs/flush\|compact\|repair`。巡检另有 `GET /_s3dfs/modules\|decisions` 和 `POST /_s3dfs/patrol`，见 [模块巡检](#9-模块巡检) |
 | 控制台 | 查看统计、桶、节点，并触发 flush |
@@ -125,7 +125,7 @@
 | `S3DFS_API_MAX_INFLIGHT` | `128` | API 在途请求上限 |
 | `S3DFS_API_NODES` | `1` | 当前 API 进程数，供缩容时保留最后一台 |
 
-脚本退出码非 0 只记日志，不记入冷却时间。block 仍有 locator、故障域不足、索引少于 3 台或达不到法定人数、API 仍有在途请求时，不执行缩容脚本。设计说明见 [自动扩缩容](superpowers/specs/2026-11-20-autoscaling-design.md)。
+脚本退出码非 0 只记日志，不记入冷却时间。block 仍有数据位置、故障域不足、索引少于 3 台或达不到法定人数、API 仍有在途请求时，不执行缩容脚本。设计说明见 [自动扩缩容](superpowers/specs/2026-11-20-autoscaling-design.md)。
 
 ## 8. 省心告警
 

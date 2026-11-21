@@ -18,7 +18,7 @@ s3dfs 默认是 3 份整对象，3 份里 2 份落盘才写索引，名字在 dl
 | 3 份整对象，2 份成功即写索引 | MinIO、RustFS、Ceph 数据池、SeaweedFS 温数据用纠删。GFS、TFS 要每一份都确认。FastDFS 往往一台落盘就返回 |
 | 索引和 block 分开。每次 Get 先问索引 | MinIO、RustFS 把名字和片放在同一套盘的 `xl.meta` 里。SeaweedFS 的 master 不在读路径上。TFS 可以把块位置编进文件名 |
 | 读一份，坏了再换 | Garage `consistent` 要两份元数据对上才回答。纠删要凑够数据片 |
-| 加机器之后旧 locator 留在原节点。`drain` 要人调用 | Btrfs 的 balance、Ceph 的 CRUSH 会搬旧数据。MinIO 追加 pool，旧对象留在原集 |
+| 加机器之后旧数据位置留在原节点。`drain` 要人调用 | Btrfs 的 balance、Ceph 的 CRUSH 会搬旧数据。MinIO 追加 pool，旧对象留在原集 |
 | 入口是 S3。key 由调用方指定 | GFS、TFS、FastDFS、单机文件系统、CephFS、NFS、SMB 管的是文件或目录。Ceph Block 和 Longhorn 给的是一块盘 |
 
 ## 还没对齐的差距
@@ -27,7 +27,7 @@ s3dfs 默认是 3 份整对象，3 份里 2 份落盘才写索引，名字在 dl
 
 | 差距 | 现在 | 别人有、我们还没有 | 关闭条件 |
 | --- | --- | --- | --- |
-| 没人读过、也没有索引的字节 | `scrub` 按 locator 重写坏副本，检查数留在索引里 | ZFS 的 scrub、Ceph 的 deep-scrub 把没人读的块也走一遍 | 把没有索引的 `.blk` 再读一遍。不因此改成 RAID-Z |
+| 没人读过、也没有索引的字节 | `scrub` 按数据位置重写坏副本，检查数留在索引里 | ZFS 的 scrub、Ceph 的 deep-scrub 把没人读的块也走一遍 | 把没有索引的 `.blk` 再读一遍。不因此改成 RAID-Z |
 | 恢复要多久 | 仓库里没有这个时间 | ZFS 的 resilver 有进度 | 目标集群上停一台 block、停一台索引，记下健康检查回到 200 的时间和当时的 JSON |
 | 上线容量 | 只有本机 localhost 的 1 KiB 与 1 MiB、3 副本 | 各家数字来自他们自己的机器，不能拿来减 | 在准备上线的机器和网络上测出这两个尺寸，写入基准文档 |
 | 目标集群演练 | 本机演练已有笔记 | 上线以那套集群自己的故障演练为准 | 准备承接流量的集群走完五步，命令、时间和结果写入部署笔记 |
@@ -54,10 +54,10 @@ s3dfs 默认是 3 份整对象，3 份里 2 份落盘才写索引，名字在 dl
 | [TFS](tfs.md) | 小文件并进块，文件名由系统编出块号 | 我们的 key 由调用方指定。块是复制单位这一点已经相同，写不等齐 3 份 |
 | [FastDFS](fastdfs.md) | tracker 不存每文件索引，同组靠 binlog 异步推 | 我们不在只落下一份时返回。故障域按最紧的盘记账已经有了 |
 | [Longhorn](longhorn.md) | Kubernetes 里的卷，副本是节点盘上的快照链 | 修复单位仍是对象。全部副本没了会记 `lost`，这一点相同 |
-| [ZFS](zfs.md) | 一台机器上的池。校验和在父指针里，scrub 走完没人读的块 | 我们的 `scrub` 只走有 locator 的对象。快照和 RAID-Z 不替换 3 副本 |
-| [Btrfs](btrfs.md) | 单机写时复制。加盘后用 balance 搬匀 | 我们加 block 不自动搬旧 locator。`drain` 是另一次调用 |
+| [ZFS](zfs.md) | 一台机器上的池。校验和在父指针里，scrub 走完没人读的块 | 我们的 `scrub` 只走有数据位置的对象。快照和 RAID-Z 不替换 3 副本 |
+| [Btrfs](btrfs.md) | 单机写时复制。加盘后用 balance 搬匀 | 我们加 block 不自动搬旧数据位置。`drain` 是另一次调用 |
 | [HAMMER2](hammer2.md) | 卷上做写时复制、快照和主从 | 主从卷不代替 3 台 block。没有整卷一次带走 |
-| [APFS](apfs.md) | 一个容器里多个卷共享剩余空间，克隆先改元数据 | 同集群 Copy 可以先共享记录。用户数据的 CRC 仍在记录和 locator 里 |
+| [APFS](apfs.md) | 一个容器里多个卷共享剩余空间，克隆先改元数据 | 同集群 Copy 可以先共享记录。用户数据的 CRC 仍在记录和数据位置里 |
 | [NTFS](ntfs.md) | `$LogFile` 重放元数据，USN 只记名字变了 | `$chg/` 记操作、bucket、key 和时间，不记正文。小文件不因此写进索引 |
 | [FFS](ffs.md) | 软更新按依赖恢复元数据。GEOM 在文件系统下面叠镜像 | 镜像和校验已经在 API 下面的索引和 block 上。软更新不放进 dleveldb |
 | [NFS](nfs.md) | 导出目录。`UNSTABLE` 可以先收在内存里，再 `COMMIT` | 写成功仍是法定人数落盘后再写索引。没有挂载和文件句柄 |

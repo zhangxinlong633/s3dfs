@@ -9,7 +9,7 @@ S3DFS 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的�
 
 - **索引**落在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群里，一般 **3–5 台**就够。S3 API 只是这个集群的客户端，自己不加入 dleveldb 的环。
 - **正文**落在大量只跑 packed-block 引擎的 **block 机器**上，机器数可以远多于索引节点。block 进程不再维护本地 LevelDB。
-- 默认 3 份对象数据副本（受当前存活的 block 节点数限制），在索引里记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`，值里带上对应 block 节点、稳定的 `recId`，以及 `compressType` 等信息。
+- 默认 3 份对象数据副本（受当前存活的 block 节点数限制），在索引里记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`。这条记录叫做数据位置：值里是 block 节点和稳定的 `recId`，以及 `compressType` 等信息，不记盘上偏移。
 
 细节见 [索引与 block 集群](design-replication.md)。
 
@@ -21,7 +21,7 @@ S3DFS 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的�
 
 - **控制台**（`apps/web`，Next.js，默认 :9001）：看统计、桶、block 节点状态，触发 flush。空间回收走管理接口或 block 上的 compact，见下方。
 - **S3 API**（`apps/api`，Nest.js，默认 :9000）：Put / Get / Head / Delete / List（含 `delimiter`）和少量管理接口，GET 支持单个 `Range`。它通过 HTTP 访问 dleveldb 和 block 节点，本进程不再打开本地 store。本机目录挂载由独立的 `apps/fuse`（`s3dfs-fuse`）完成，不进入这条控制面进程。
-- **索引集群**（独立的 dleveldb 进程，默认 :9800）：只存很小的 locator JSON 和 `$node/{nodeId}` 注册信息，不存对象正文。
+- **索引集群**（独立的 dleveldb 进程，默认 :9800）：只存很小的数据位置 JSON 和 `$node/{nodeId}` 注册信息，不存对象正文。
 - **block 节点**（`apps/block`，默认 :9100 起）：每台机器跑 C 引擎，对象打进追加式 1GB block 文件。进程按 `recId` 查本地内存表，再读到文件里的物理位置。
 - **存储引擎**（`packages/engine`）：C 实现追加式 block 文件。记录是带校验的 TLV 帧，方便以后加字段；也可以扫描全部 `.blk` 重建索引。
 - **巡检 AI**（`apps/patrol`，TypeScript，随仓库提供）：不在写入路径上。规则根据模块快照执行修复、compact、flush 或扩容。Deep Agents 把发现和已执行的动作写成中文结论，不读对象正文，不删除、不重启、不缩容。说明见 [能力](capabilities.md#9-模块巡检)。
@@ -46,17 +46,17 @@ magic u32 | rec_len u32 | tags… | crc32 u32 | rec_len u32 | magic u32
 
 ## 定位
 
-对象在哪台机器、对应哪条稳定的 `recId`，全部记在 dleveldb 的 locator 里（`v: 3`），同时带上压缩类型。文件里的 `(blockId, offset, recLen)` 只留在该 block 节点的内存表中，可由扫描 `.blk` 重建。block 进程不再维护 `index/` 目录。
+对象在哪台机器、对应哪条稳定的 `recId`，全部记在 dleveldb 的数据位置里（`v: 3`），同时带上压缩类型。文件里的 `(blockId, offset, recLen)` 只留在该 block 节点的内存表中，可由扫描 `.blk` 重建。block 进程不再维护 `index/` 目录。
 
-打开 block 存储时，扫描各 `.blk` 找到最后一条完整记录的结尾，接着往后追加，并重建 `recId` 映射。重建时先读节点本地的 `recmap.s3m` 快照，再只扫快照之后的新数据；快照不可用则扫描全部 `.blk`。不需要回放一份本地 LevelDB。如果 dleveldb 里的定位信息丢了，可以对每台 block 调用扫描接口，按记录顺序折叠墓碑，重建 locator（重建结果里仍是 `recId`，不是文件偏移）。
+打开 block 存储时，扫描各 `.blk` 找到最后一条完整记录的结尾，接着往后追加，并重建 `recId` 映射。重建时先读节点本地的 `recmap.s3m` 快照，再只扫快照之后的新数据；快照不可用则扫描全部 `.blk`。不需要回放一份本地 LevelDB。如果 dleveldb 里的定位信息丢了，可以对每台 block 调用扫描接口，按记录顺序折叠墓碑，重建数据位置（重建结果里仍是 `recId`，不是文件偏移）。
 
 ## 压缩
 
-控制面在写入 block 之前压缩对象正文，默认 `zstd`（`S3DFS_COMPRESS` 也可设为 `gzip` 或 `none`）。小于 64 字节，或压缩后没有变小，就原样落盘，并把 `compressType` 记成 `none`。locator 里同时保存未压缩的 `size` / `crc`，以及盘上的 `storedSize`。读取时按 `compressType` 解压。同一份压缩后的字节会写到各数据副本。压缩类型也写进 block 的 TLV，便于重建索引时一并恢复。
+控制面在写入 block 之前压缩对象正文，默认 `zstd`（`S3DFS_COMPRESS` 也可设为 `gzip` 或 `none`）。小于 64 字节，或压缩后没有变小，就原样落盘，并把 `compressType` 记成 `none`。数据位置里同时保存未压缩的 `size` / `crc`，以及盘上的 `storedSize`。读取时按 `compressType` 解压。同一份压缩后的字节会写到各数据副本。压缩类型也写进 block 的 TLV，便于重建索引时一并恢复。
 
 ## 大文件
 
-能放进当前块剩余空间的对象，仍是一条记录。更大的对象会切成多段，后一段用 prev tag 记下前一段的 `recId`，dleveldb 只存最后一段的 locator。读取时从 last 往前走完链条，再从前向后取数。详细说明见 [大文件跨 block 存放](design-large-object.md)。
+能放进当前块剩余空间的对象，仍是一条记录。更大的对象会切成多段，后一段用 prev tag 记下前一段的 `recId`，dleveldb 只存最后一段的数据位置。读取时从 last 往前走完链条，再从前向后取数。详细说明见 [大文件跨 block 存放](design-large-object.md)。
 
 ## 压缩整理
 
@@ -64,19 +64,19 @@ magic u32 | rec_len u32 | tags… | crc32 u32 | rec_len u32 | magic u32
 
 ## 对象定位与副本
 
-S3 层把对象记成字面量 `bucket/key`。Put 时按 key 的哈希从存活的 block 节点里挑 N 台（N 默认 3，且不超过存活节点数；标了 `@zone` 时先避开同一故障域），把同一份（可能已压缩的）正文写到这些机器上。达到写法定人数后，再在 dleveldb 里写下已经成功的 locator。Get 先读 locator，跳过被健康检查标为 down 的节点，按剩余副本取数并解压。列举时会丢掉 `key:1`、`key:2` 这种副本后缀，避免同一个对象出现多次。
+S3 层把对象记成字面量 `bucket/key`。Put 时按 key 的哈希从存活的 block 节点里挑 N 台（N 默认 3，且不超过存活节点数；标了 `@zone` 时先避开同一故障域），把同一份（可能已压缩的）正文写到这些机器上。达到写法定人数后，再在 dleveldb 里写下已经成功的数据位置。Get 先读数据位置，跳过被健康检查标为 down 的节点，按剩余副本取数并解压。列举时会丢掉 `key:1`、`key:2` 这种副本后缀，避免同一个对象出现多次。
 
 对象 key 本身不要以 `:数字` 结尾，那是副本索引的约定。
 
 ## 故障与恢复
 
-没有测过确定的恢复时间上限。Get 会在本次请求里尝试剩余的数据副本，新的 Put 会躲开已标记为 down 的 block。后台或 `POST /_s3dfs/repair` 会把活副本不足的对象再写到空闲的存活节点，并退役 down 的 locator。没有活副本的对象记为 `lost`，补不回来，本进程的健康检查随之返回 503。索引在剩余副本达到法定人数时仍可写入，节点回来后由 dleveldb 按较新的 mtime 追平。block 重启优先读 `recmap.s3m` 并补扫尾巴，快照不可用才全量扫描。完整说明见 [故障与恢复](design-recovery.md)。一套部署是否可以承接业务，见 [部署](deploy.md) 和 [上线标准](diff/production.md)。从压缩包启动的步骤在 [部署](deploy.md) 第 8 节，压缩包里也有一份 `使用说明.md`。
+没有测过确定的恢复时间上限。Get 会在本次请求里尝试剩余的数据副本，新的 Put 会躲开已标记为 down 的 block。后台或 `POST /_s3dfs/repair` 会把活副本不足的对象再写到空闲的存活节点，并退役 down 的数据位置。没有活副本的对象记为 `lost`，补不回来，本进程的健康检查随之返回 503。索引在剩余副本达到法定人数时仍可写入，节点回来后由 dleveldb 按较新的 mtime 追平。block 重启优先读 `recmap.s3m` 并补扫尾巴，快照不可用才全量扫描。完整说明见 [故障与恢复](design-recovery.md)。一套部署是否可以承接业务，见 [部署](deploy.md) 和 [上线标准](diff/production.md)。从压缩包启动的步骤在 [部署](deploy.md) 第 8 节，压缩包里也有一份 `使用说明.md`。
 
 ## 对象规模与分布
 
-普通本地文件系统往往一个文件一个 inode，目录里有千万文件时，inode 表和目录项会先成为问题。s3dfs 把对象正文打进少量大的 `.blk` 文件，inode 和磁盘文件数跟 block 文件走，不跟对象数走。一千万个对象，在存储侧主要是 dleveldb 里一千万条 locator（有副本时再加上 `key:1`、`key:2` 等），以及若干 1GB 的 `.blk`。对分布式 KV 来说，这个量级是常规负担，一亿条 key 也还在可预期范围里；这不是已经实测过的数字。
+普通本地文件系统往往一个文件一个 inode，目录里有千万文件时，inode 表和目录项会先成为问题。s3dfs 把对象正文打进少量大的 `.blk` 文件，inode 和磁盘文件数跟 block 文件走，不跟对象数走。一千万个对象，在存储侧主要是 dleveldb 里一千万条数据位置（有副本时再加上 `key:1`、`key:2` 等），以及若干 1GB 的 `.blk`。对分布式 KV 来说，这个量级是常规负担，一亿条 key 也还在可预期范围里；这不是已经实测过的数字。
 
-对象按 key 哈希分散到存活的 block 节点，不是整棵目录树绑在一台机器上。每台 block 只扛自己那一份 `.blk` 和对应的 `recId` 内存表；索引仍由单独那一小摊机器（通常 3–5 台）保存 locator。落点还受副本数影响：默认会在多台 block 上各写一份，所以是按哈希打散后再按副本数重复存放，不是严格的一人一份均分。
+对象按 key 哈希分散到存活的 block 节点，不是整棵目录树绑在一台机器上。每台 block 只扛自己那一份 `.blk` 和对应的 `recId` 内存表；索引仍由单独那一小摊机器（通常 3–5 台）保存数据位置。落点还受副本数影响：默认会在多台 block 上各写一份，所以是按哈希打散后再按副本数重复存放，不是严格的一人一份均分。
 
 这不是完全没有上限。某一台机器用 FUSE 把整个桶挂成本地目录时，内核仍可能按目录项 / inode 来看这份树，列举和元数据缓存也会随文件数变重；block 节点还要在内存里维持 `recId` 映射。对象存储和索引这一层不会像普通本地文件系统那样先被 inode 撑爆，真正把含千万文件的树挂到一台客户端上时，瓶颈更可能出现在挂载进程，而不是 `.blk` 的文件个数。
 

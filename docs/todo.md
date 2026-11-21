@@ -23,7 +23,7 @@
 演练步骤与上线标准第 3 节相同：
 
 1. 三个 zone 均在线时，`GET /_s3dfs/health` 为 200，`layout.ok` 为真。
-2. 停一个 zone 的 block：新 Put 成功，Get 读到刚写的内容。修复后 locator 只指向仍在线的节点。该节点恢复并再次修复后回到 3 份。再停到只剩 1 台：新 Put 失败，健康检查 503，正文含 `reasons`。
+2. 停一个 zone 的 block：新 Put 成功，Get 读到刚写的内容。修复后数据位置只指向仍在线的节点。该节点恢复并再次修复后回到 3 份。再停到只剩 1 台：新 Put 失败，健康检查 503，正文含 `reasons`。
 3. 停一个索引节点：Put 仍成功，另一台 API 能 Get 到同一对象。空节点追平后，已有对象仍能 Get 和 List。
 4. 带密钥完成建桶、上传、分片上传、Range 读、删除和删除空桶。无密钥请求被拒绝。分片要上传两段、重启 API、完成后再 Get，字节与逐段拼接一致。
 5. 删除演练用的桶，确认没有留下 `lost`。健康检查回到 200。
@@ -36,9 +36,9 @@
 
 | 事项 | 代码现状 |
 | --- | --- |
-| 正文副本 | 一台 block 已标为 down、其余仍够法定人数时继续写，修复先去掉已停节点上的 locator，节点回来后再补第 3 份。全部在线但节点或故障域不够配置份数时拒绝写入。`packages/control/test/layout.test.ts`、`put-quorum.test.ts` |
+| 正文副本 | 一台 block 已标为 down、其余仍够法定人数时继续写，修复先去掉已停节点上的数据位置，节点回来后再补第 3 份。全部在线但节点或故障域不够配置份数时拒绝写入。`packages/control/test/layout.test.ts`、`put-quorum.test.ts` |
 | 索引故障 | 控制面在配置的索引地址之间切换。dleveldb 在主节点不可达且剩余副本达到法定人数时接受写入，节点回来后按较新的 mtime 追平。三进程测试已通过 |
-| 索引提交 | 任一条 locator 写入失败，删除本次已写入的 locator，再向客户端返回错误。`packages/control/test/commit.test.ts` |
+| 索引提交 | 任一条数据位置写入失败，删除本次已写入的数据位置，再向客户端返回错误。`packages/control/test/commit.test.ts` |
 | 分片 | 清单留在索引，正文进入 block，key 为 `bucket/$upload/<id>/<part>`，列表不可见。新的 `MultipartUploads` 能读到上一个进程留下的段。`apps/api/test/upload-block.test.ts` |
 | 丢失可见 | 修复写入 `$lost/`。`GET /_s3dfs/health` 先 `syncLost`，JSON 含 `lost` 和 `lostKeys`。计数不在重启时清零 |
 | 入口 | 默认严格布局下，缺访问密钥或秘密密钥时，进程在监听前退出。两个密钥都在时，无签名请求 403。`apps/api/test/auth-gate.test.ts` |
@@ -59,8 +59,8 @@ C 网关不是默认上线入口。它要接到同一负载均衡后面时，另
 | 控制台按钮 | Flush、Compact、Repair 改走控制台自己的 `/api/s3dfs/<action>`。令牌放在 Web 进程的 `S3DFS_PATROL_TOKEN`，不进浏览器。API 地址用 `S3DFS_API_BASE_URL`，没有则用 `NEXT_PUBLIC_API_BASE_URL` |
 | 管理读接口 | `GET /_s3dfs/stats`、`cluster`、`buckets`、`metrics` 仍不校验身份。健康检查保持开放，给负载均衡探活 |
 | 丢失与故障 | 对象丢失写在 `$lost/`，健康检查重启后仍列出这些 key。未关闭的故障事件仍在 API 进程内存里 |
-| 对象计数 | `stats` 的对象数按页扫完。每台 locator 数扫到 2 万条就停止，之后该台记成 1。巡检快照超过约 8 KB 时从末尾丢掉 block 节点 |
-| 扩缩 | 未配置 `S3DFS_SCALE_UP_CMD` 与 `S3DFS_SCALE_DOWN_CMD` 时只判断，不开关机器。加 block 之后旧对象的 locator 留在原节点，新写入才用新节点。MinIO 追加 pool 也不把旧对象搬过去 |
+| 对象计数 | `stats` 的对象数按页扫完。每台数据位置数扫到 2 万条就停止，之后该台记成 1。巡检快照超过约 8 KB 时从末尾丢掉 block 节点 |
+| 扩缩 | 未配置 `S3DFS_SCALE_UP_CMD` 与 `S3DFS_SCALE_DOWN_CMD` 时只判断，不开关机器。加 block 之后旧对象的数据位置留在原节点，新写入才用新节点。MinIO 追加 pool 也不把旧对象搬过去 |
 | 持续集成 | `.github/workflows/test.yml` 在 push 和 pull request 上跑 `bun test packages/control/test apps/api/test` |
 | 恢复时间 | 没有测过。做法见下面「成熟度还没到」：停一台 block、停一台索引，记健康检查回到 200 的时间 |
 
@@ -72,7 +72,7 @@ C 网关不是默认上线入口。它要接到同一负载均衡后面时，另
 
 | | 写成功 | 读 | 加机器以后 |
 | --- | --- | --- | --- |
-| s3dfs | 3 份里 2 份 block 成功即写索引，第 3 份修复补 | 读一份活副本，CRC 不对再换 | 旧 locator 不动 |
+| s3dfs | 3 份里 2 份 block 成功即写索引，第 3 份修复补 | 读一份活副本，CRC 不对再换 | 旧数据位置不动 |
 | Garage `consistent` | 3 份里读写法定人数都是 2 | 两份元数据一致才回答 | 改布局后重新平衡 |
 | SeaweedFS 热数据 | 每一份都要成功；缺卷不自动补，要跑 `volume.fix.replication` | 读一份；master 不在读路径上 | 卷可以在服务器之间搬 |
 | MinIO 社区 / RustFS | 纠删集凑够 K 片；校验片占一半时写要 K+1 | 凑够数据片 | 追加 pool 或集，旧对象留在原集。一个 pool 整体失去法定人数时，MinIO 停掉整个部署的 I/O |
@@ -115,11 +115,11 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 | [FastDFS](diff/fastdfs.md) | Tracker 只知道组和 storage，不存每个文件的索引。同组 storage 互为镜像，容量按组内最小的那台算。上传在一台落盘后就返回，file id 里带有源 storage、时间、大小和 CRC32。同组其他机器靠 binlog 异步推送。源操作用大写字母，副本用小写，避免来回推 | 组可以当成一个故障域。file id 自带 CRC32，读的时候能核对。Tracker 保持得很小 | 上传返回时往往只有一份在盘上，源机器在同步完成前坏了，这份就没了。这和「2 份成功才写索引」相反，不拿来当写成功条件 |
 | [MinIO](diff/minio.md) | 一个 Go 进程上的纠删 S3。对象切成数据片和校验片，元数据是盘上的 `xl.meta`。写到 quorum 才成功。后台修复用剩余片补缺片。全部 Go 约 34.5 万行，纠删和 xl 大约 4 万行，池文件 3005 行 | 同一条盘格式可以写得很短。修复会再看结果，片不够就不编造正文 | 不改成纠删，也不改成一对象一份 `xl.meta`。IAM、站点和对象锁不作为上线前提 |
 | [ZFS](diff/zfs.md) / OpenZFS | 一台机器上的池。镜像或 RAID-Z。写时复制：新块写完再改指针。块的校验和记在父指针里，不记在块自己身上。读到校验失败就用冗余副本修好。scrub 把整池走一遍。快照、克隆、`zfs send`/`recv`。数据集上有压缩、配额和预留 | 校验和和正文分开存，静默损坏盖不过父指针。scrub 是全量巡检，和「缺了副本再补一份」是两件事。快照加 send/recv 是整池备份的形状。压缩按数据集开 | 池在一台机器上，没有跨 zone 的 3 副本。RAID-Z 是纠删，不替换 `.blk` 的 3 副本。不把快照做成在线的 S3 版本 |
-| [Btrfs](diff/btrfs.md) | 单机、写时复制。元数据里带 crc32c。子卷、快照、send/receive、zstd。加盘之后用 balance 把已有数据搬匀。RAID 0/1/10 能用 | 子卷是配额和快照的边界。balance 说明「加盘以后可以搬旧数据」，以及这件事要单独做 | RAID 5/6 长期不能当唯一副本。balance 会搬旧数据，s3dfs 加 block 之后旧 locator 仍留在原节点 |
+| [Btrfs](diff/btrfs.md) | 单机、写时复制。元数据里带 crc32c。子卷、快照、send/receive、zstd。加盘之后用 balance 把已有数据搬匀。RAID 0/1/10 能用 | 子卷是配额和快照的边界。balance 说明「加盘以后可以搬旧数据」，以及这件事要单独做 | RAID 5/6 长期不能当唯一副本。balance 会搬旧数据，s3dfs 加 block 之后旧数据位置仍留在原节点 |
 | [FFS](diff/ffs.md)、[HAMMER2](diff/hammer2.md) | FFS 用软更新记下元数据依赖，崩溃后按依赖恢复，不必为每步元数据都等一次日志提交。UFS2 有快照。FreeBSD 的 GEOM 在文件系统下面叠镜像、条带、日志和加密，文件系统看不见这些层。DragonFly 的 HAMMER2 在卷上做写时复制、快照、CRC、压缩，以及卷一级的主从复制 | 镜像、校验、加密可以叠在对象接口下面，和现在的 API、索引、block 分层同一类。卷一级复制可以整目录拷走，不必按 key 扫一遍 | 软更新不放进 dleveldb。GEOM 和 HAMMER2 仍是一台或少数几台机器上的盘，不提供 S3 |
 | [NTFS](diff/ntfs.md) | `$LogFile` 记元数据日志，崩溃后重放日志，不扫全盘。很小的文件可以住在 MFT 记录里。USN 变更日志按顺序记下命名空间的变化，供增量备份和审计。另有压缩、稀疏文件和 EFS | 变更日志是审计和增量复制的形状：记「哪个 key 变了」，不记正文。元数据日志让重启不必把所有对象再读一遍 | 小文件住进索引这条不学。版本正文刚从索引挪到 block，避免索引被正文撑大 |
 | [APFS](diff/apfs.md) | 一个容器里多个卷共享剩余空间。元数据对象带 Fletcher-64 校验和，用户数据块不校验，靠盘自己的 ECC。克隆在同卷里拷贝文件时只改元数据，两边改写才分配新空间。快照按写时复制留住某一刻。加密按卷，系统卷和数据卷分开 | 同池拷贝可以先共享底层块，调用方改一边再写新块。多个卷共享空间，再按卷给快照和加密。元数据校验和用户数据校验是两件分开的事 | 用户数据没有 ZFS 那种放在父指针里的校验和，静默损坏靠盘。克隆和共享空间都在一台机器的容器里。S3 的 Copy 仍是读出再写入 |
-| [CephFS](diff/cephfs.md) | MDS 管目录，文件切成 RADOS 对象，客户端直接读写 OSD。元数据池通常是副本，数据池可以是纠删。多个 active MDS 按目录分子树 | 元数据确认之后正文不经它转发。副本不够由 backfill 补。目录是配额和快照的边界 | 不做 POSIX、硬链接和客户端能力缓存。纠删数据池不替换 3 副本。旧 locator 不按 CRUSH 搬走。RGW 才是这套集群上的 S3 |
+| [CephFS](diff/cephfs.md) | MDS 管目录，文件切成 RADOS 对象，客户端直接读写 OSD。元数据池通常是副本，数据池可以是纠删。多个 active MDS 按目录分子树 | 元数据确认之后正文不经它转发。副本不够由 backfill 补。目录是配额和快照的边界 | 不做 POSIX、硬链接和客户端能力缓存。纠删数据池不替换 3 副本。旧数据位置不按 CRUSH 搬走。RGW 才是这套集群上的 S3 |
 | [Ceph Block](diff/ceph-block.md) | RBD 镜像切成 RADOS 对象。常见复制池 3 份、写到 `min_size` 2 份即成功。快照克隆共享未改的对象。同一张镜像用 exclusive-lock 限制一个写入者 | 写成功可以是多数副本，不必等齐。克隆和「哪些块写过」的位图让差量不必扫完整张盘 | 不做块设备和偏移读写。单写入者锁不放进 S3。克隆不在上线八项里 |
 | [Longhorn](diff/longhorn.md) | Kubernetes 里的卷。副本是节点盘上的快照链，常见 3 份且不同节点。一个引擎对 Pod 提供这块盘。副本丢失后从健康副本整卷重建。快照可备份到 S3 或 NFS | 份数不够就换一台机器再做一份。全部副本都没了要明确标丢失 | 修复单位仍是对象，不按整卷重建，也不把快照链当成副本格式 |
 | [NFS](diff/nfs.md) | 服务器导出目录树。`UNSTABLE` 写可以先留在服务器内存，再由 `COMMIT` 落盘。NFSv4 用委派把缓存交给一个客户端。pNFS 把布局发给客户端，字节直接去数据服务器 | 把「已经收下」和「已经落盘」分开写清楚。元数据确认后正文可以不经元数据服务转发 | 写成功仍是法定人数落盘后再写索引。不做挂载、文件句柄和委派。导出目录不等于已经有 3 份 |
@@ -129,23 +129,23 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 
 ### 已经是同样的原理，不再排期
 
-法定人数写成功，对应 Ceph 复制池的 `min_size`，不退回 GFS、TFS 的全部副本确认，也不退回 FastDFS 的单台落盘就返回。索引只在取 locator 和提交 locator 时出现，字节在 API 和 block 之间走，这是 GFS、TFS、pNFS 的分层，不做成客户端直连 block。校验和已经记在记录帧和 locator 里，不记成正文的自述。删除用墓碑挡住扫描救回。
+法定人数写成功，对应 Ceph 复制池的 `min_size`，不退回 GFS、TFS 的全部副本确认，也不退回 FastDFS 的单台落盘就返回。索引只在取数据位置和提交数据位置时出现，字节在 API 和 block 之间走，这是 GFS、TFS、pNFS 的分层，不做成客户端直连 block。校验和已经记在记录帧和数据位置里，不记成正文的自述。删除用墓碑挡住扫描救回。
 
 ### 要收进来的设计
 
 | 设计 | 从哪来 | 在 s3dfs 里做成什么 | 不一起搬 | 关闭条件 |
 | --- | --- | --- | --- | --- |
-| 全量巡检和补副本分开 | [ZFS](diff/zfs.md) 的 scrub 对 resilver，[CephFS](diff/cephfs.md) 的 deep-scrub | 代码已补：`scrub` 按 locator 核对正文 CRC，坏的那一份用活副本重写。`repair` 仍只补缺少的份数 | 不改成 RAID-Z 或纠删。巡检不承诺恢复时间 | `packages/control/test/rest.test.ts`：注入 CRC 不对的副本后 Get 恢复；两份都坏时记 `lost` |
+| 全量巡检和补副本分开 | [ZFS](diff/zfs.md) 的 scrub 对 resilver，[CephFS](diff/cephfs.md) 的 deep-scrub | 代码已补：`scrub` 按数据位置核对正文 CRC，坏的那一份用活副本重写。`repair` 仍只补缺少的份数 | 不改成 RAID-Z 或纠删。巡检不承诺恢复时间 | `packages/control/test/rest.test.ts`：注入 CRC 不对的副本后 Get 恢复；两份都坏时记 `lost` |
 | 补副本不经 API 拼整段 | [TFS](diff/tfs.md)、[GFS](diff/gfs.md) 以块为复制单位 | 代码已补：大于 1 MiB 的对象，`repair` 按 1 MiB 范围从源 block 读到目标 block 的 write 流。小对象仍读出再写入 | 不把块号编进 key。写成功仍是法定人数 | `packages/control/test/rest.test.ts`：补副本走 `start=` 和 write 流，不走整段 Put |
 | 丢失跨重启还在 | [Longhorn](diff/longhorn.md) 把救不回写清楚 | 代码已补：修复写入 `$lost/`，`syncLost` 再数一遍。健康 JSON 带 `lostKeys` | 不在重启时把计数清零假装恢复 | 新的 `ObjectCluster` 调用 `syncLost` 之后，先前的 `$lost/` 仍在，健康响应里有这些 key |
 | 变更只记名字 | [NTFS](diff/ntfs.md) 的 USN，[SMB](diff/smb.md) 的变更通知 | 追加一条日志：操作、bucket、key、时间。不写正文。增量备份和审计从这个日志读，而不是扫全部 key。代码已补：Put 和 Delete 写 `$chg/` | 小文件不因此写进索引。不替代对象正文的 3 副本 | 连续 Put、覆盖、Delete 之后，日志顺序与操作一致，条目里没有正文 |
-| 坏段不要整对象重读 | [GFS](diff/gfs.md) 的 64 KiB 校验和 | 代码已补：Put 在 locator 上记下每 64 KiB 的 CRC。Get 对不上时只向下一份重取那一段 | 不引入主副本租约，写不等齐 3 份 | `packages/control/test/rest.test.ts`：坏段重取两次，好段只取一次 |
-| 同集群 Copy 先共享记录 | [APFS](diff/apfs.md) 克隆，[Ceph Block](diff/ceph-block.md) 从快照克隆 | 代码已补：`shareCopy` 让目标 locator 指向已有记录并记 `$ref/`。覆盖改走新的 `dataKey`，不退役仍被引用的记录。引用归零才墓碑 | 不代替跨 zone 的 3 副本。共享只发生在已经写成功的记录上 | `packages/control/test/rest.test.ts`：Copy 不再 Put；改一边之后另一边字节不变 |
-| 桶是配额和压缩的边界 | [ZFS](diff/zfs.md) 数据集，[Btrfs](diff/btrfs.md) 子卷 | 桶上可以关掉压缩，并设逻辑字节上限。超过上限的 Put 失败，其他桶不受影响。代码已补：`setBucketLimits`。没设配额时不写 `$usage/`，设上之后按 locator 合计已有字节再往下记 | 不做目录配额，不做子卷和 POSIX | 一个桶达到上限后继续 Put 得到明确错误，另一个桶仍可写 |
+| 坏段不要整对象重读 | [GFS](diff/gfs.md) 的 64 KiB 校验和 | 代码已补：Put 在数据位置上记下每 64 KiB 的 CRC。Get 对不上时只向下一份重取那一段 | 不引入主副本租约，写不等齐 3 份 | `packages/control/test/rest.test.ts`：坏段重取两次，好段只取一次 |
+| 同集群 Copy 先共享记录 | [APFS](diff/apfs.md) 克隆，[Ceph Block](diff/ceph-block.md) 从快照克隆 | 代码已补：`shareCopy` 让目标数据位置指向已有记录并记 `$ref/`。覆盖改走新的 `dataKey`，不退役仍被引用的记录。引用归零才墓碑 | 不代替跨 zone 的 3 副本。共享只发生在已经写成功的记录上 | `packages/control/test/rest.test.ts`：Copy 不再 Put；改一边之后另一边字节不变 |
+| 桶是配额和压缩的边界 | [ZFS](diff/zfs.md) 数据集，[Btrfs](diff/btrfs.md) 子卷 | 桶上可以关掉压缩，并设逻辑字节上限。超过上限的 Put 失败，其他桶不受影响。代码已补：`setBucketLimits`。没设配额时不写 `$usage/`，设上之后按数据位置合计已有字节再往下记 | 不做目录配额，不做子卷和 POSIX | 一个桶达到上限后继续 Put 得到明确错误，另一个桶仍可写 |
 | 故障域按最紧的盘记账 | [FastDFS](diff/fastdfs.md) 的组容量 | 健康检查按 zone 给出可写字节，并标出同 zone 里明显更小的盘。加一块大盘不把这个数抬高。代码已补：block 报 `freeBytes`，健康检查带 `zones` | 不改成单台落盘就返回 | 同 zone 两块盘容量差一倍时，健康输出里的可写字节等于较小的那块 |
-| 搬旧数据是单独任务，默认关闭 | [Btrfs](diff/btrfs.md) 的 balance | 代码已补：`POST /_s3dfs/rebalance?nodeId=` 把还没在该节点上的对象复制过去，并去掉一份旧 locator。加节点不会自动调用 | 不在加节点时自动 balance。不做 RAID 5/6 | `packages/control/test/rest.test.ts`：不调用时新节点没有 locator；调用后报告字节数，份数不变 |
+| 搬旧数据是单独任务，默认关闭 | [Btrfs](diff/btrfs.md) 的 balance | 代码已补：`POST /_s3dfs/rebalance?nodeId=` 把还没在该节点上的对象复制过去，并去掉一份旧数据位置。加节点不会自动调用 | 不在加节点时自动 balance。不做 RAID 5/6 | `packages/control/test/rest.test.ts`：不调用时新节点没有数据位置；调用后报告字节数，份数不变 |
 | 另一场地要送出去 | [ZFS](diff/zfs.md) 的 send/recv，[Longhorn](diff/longhorn.md) 的备份目标 | 代码已补：`sendChanges` 按 `$chg/` 把 Put 送到另一套集群的 `put`。之后的 Delete 不删目标。默认不调用 | 不默认开启，不把本集群的 3 副本叫作异地备份 | `packages/control/test/rest.test.ts`：源 Delete 之后，已经送出的对象仍留在目标 |
-| 坏 locator 换下一份 | [ZFS](diff/zfs.md)、[APFS](diff/apfs.md) 把元数据校验和用户数据分开 | 某一份 locator JSON 解析失败或字段对不上时，Get 改试 `:1`、`:2`。不要把坏 JSON 当成对象不存在。代码已补 | 不因此减弱用户数据的 CRC。不把小文件正文放进索引 | 写坏第 0 份 locator 之后，Get 仍从其余份读到正文 |
+| 坏数据位置换下一份 | [ZFS](diff/zfs.md)、[APFS](diff/apfs.md) 把元数据校验和用户数据分开 | 某一份数据位置 JSON 解析失败或字段对不上时，Get 改试 `:1`、`:2`。不要把坏 JSON 当成对象不存在。代码已补 | 不因此减弱用户数据的 CRC。不把小文件正文放进索引 | 写坏第 0 份数据位置之后，Get 仍从其余份读到正文 |
 
 自我修复停在规则自动：有活副本就补，没有就不编造。AI 停在手工：模型只写结论，不决定修不修。值班可以不改客户端就躲开一台 down 的 block。换盘和确认 `lost` 仍要人做。
 
@@ -155,7 +155,7 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 
 | 还缺的 | 从哪来 | 做成什么 | 不一起搬 | 关闭条件 |
 | --- | --- | --- | --- | --- |
-| 把 `.blk` 再读一遍并留下计数 | [ZFS](diff/zfs.md) 的 scrub 与池上的错误计数。现有 `scrub` 按 locator 核对，当次返回数字，不把上一轮记在索引里 | 代码已补：`scrub` 把 CRC 不对的副本用活副本重写，没有活副本就记 `$lost/`。检查数、修好数、仍丢失的数写入 `$scrub/report` | 不改成 RAID-Z。计数不是容量承诺，也不和 `repair` 合成一步。巡检仍按 locator 走，不另扫没有索引的字节 | `packages/control/test/rest.test.ts`：坏副本被修好；新的 `ObjectCluster` 读到同一组 `scrubReport` |
+| 把 `.blk` 再读一遍并留下计数 | [ZFS](diff/zfs.md) 的 scrub 与池上的错误计数。现有 `scrub` 按数据位置核对，当次返回数字，不把上一轮记在索引里 | 代码已补：`scrub` 把 CRC 不对的副本用活副本重写，没有活副本就记 `$lost/`。检查数、修好数、仍丢失的数写入 `$scrub/report` | 不改成 RAID-Z。计数不是容量承诺，也不和 `repair` 合成一步。巡检仍按数据位置走，不另扫没有索引的字节 | `packages/control/test/rest.test.ts`：坏副本被修好；新的 `ObjectCluster` 读到同一组 `scrubReport` |
 | 恢复要多久 | [ZFS](diff/zfs.md) 的 resilver 有进度 | 部署笔记记下停一台 block、停一台索引，到 `GET /_s3dfs/health` 回到 200 的时间。本机可以先记一笔 | 不把本机的秒数写成上线容量 | 目标集群的笔记里有这两次时间和当时的健康 JSON。本机步骤在 [部署](deploy.md) 第 9 节，还不能关闭 |
 | 告警送到值班 | [ZFS](diff/zfs.md) 把盘故障和校验错误发到本机事件 | 代码已补：配置了 `S3DFS_ALERT_URL` 时，健康检查把 `lost` 和布局不 ok 各送一条。没配置就不发 | 不自动升级。模型仍不决定修不修 | `apps/api/test/alerts.test.ts`：有地址时收到含 key 的消息。不配地址时不发送 |
 | 升级顺序写给值班 | [CephFS](diff/cephfs.md) 的升级是写下来的步骤，不是自动跳版本 | 代码已补：写出索引、block、API 的停止、替换、拉起顺序和回退，见 [部署](deploy.md) 第 9 节 | 不自动跳版本 | 文档里有这三种角色的顺序和回退。目标集群按该节走完仍属于「生产部署」，不在本仓库里关闭 |
@@ -176,12 +176,12 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 
 | 还缺的 | MinIO 里值得留的一点 | 在 s3dfs 里做成什么 | 不一起搬 | 关闭条件 |
 | --- | --- | --- | --- | --- |
-| 拆掉一台 block | 池退役会把对象搬到还在的盘，再停用这一池 | 代码已补：`drain(nodeId)` 把这一台上面的份复制到别的活节点，再从 locator 去掉它。份数保持配置值。不调用就不动 | 不自动缩容。不搬成纠删 | `packages/control/test/rest.test.ts`：调用后该 `nodeId` 不再出现在 locator 里，对象仍能读出 |
+| 拆掉一台 block | 池退役会把对象搬到还在的盘，再停用这一池 | 代码已补：`drain(nodeId)` 把这一台上面的份复制到别的活节点，再从数据位置去掉它。份数保持配置值。不调用就不动 | 不自动缩容。不搬成纠删 | `packages/control/test/rest.test.ts`：调用后该 `nodeId` 不再出现在数据位置里，对象仍能读出 |
 | 大对象也能加密 | 流式封存，不把整个对象收进内存 | 代码已补：超过 1 MiB 且带 AES256 的 Put 按约 1 MiB 一块封存，Get 读出原文 | 不接 KMS。未标明加密的对象仍是明文 | `apps/api/test/sse-keys.test.ts`：大于 1 MiB 的 Put 带 AES256 后，Get 得到原文 |
 | 换密钥还能读旧对象 | 批任务可以轮换密钥，旧对象仍能打开 | 代码已补：封存头记下密钥代号。`S3DFS_SSE_KEY_PREVIOUS` 里留着上一把时，旧对象仍能 Get | 不接外部 KMS。不因此重写所有 `.blk` | `apps/api/test/sse-keys.test.ts`：用第一把写下的对象，当前密钥换成第二把、上一把仍配置着，Get 得到原文 |
-| 用量算完 | 后台扫描把桶的字节数做进缓存，配额按这个数拒绝 | 代码已补：`bucketUsage(bucket)` 按页扫完这个桶的 locator，把可见对象的逻辑字节加总。`stats` 的对象数也不再停在 10 万条 | 不扫没有索引的字节。不改成 Prometheus | `packages/control/test/rest.test.ts`：索引每次只返回一条时，字节数仍等于这些对象的大小之和 |
+| 用量算完 | 后台扫描把桶的字节数做进缓存，配额按这个数拒绝 | 代码已补：`bucketUsage(bucket)` 按页扫完这个桶的数据位置，把可见对象的逻辑字节加总。`stats` 的对象数也不再停在 10 万条 | 不扫没有索引的字节。不改成 Prometheus | `packages/control/test/rest.test.ts`：索引每次只返回一条时，字节数仍等于这些对象的大小之和 |
 | 复制进度 | 每条对象有没有送到对端，管理接口能看见 | 代码已补：`replicationProgress()` 读出已送出的变更条数，以及 `$chg/` 里还没送的条数。第一次 `sendChanges` 之前两个数都是 0 | 不补送已经在盘上的旧对象。不记 MinIO 那套复制状态机 | `packages/control/test/rest.test.ts`：送出一批之后已送和未送对得上。没打开复制时两个数都不增加 |
 
 ## 不作为上线前提
 
-纠删码、远程分层、审计日志、Helm、Swift、SFTP、把 ETag 改成 MD5、Prometheus 拉取格式、加节点后自动搬走旧对象。LDAP 和 OIDC 不在身份那一条的第一版里。单机文件系统上的快照、RAID-Z、USN 变更日志和同池克隆也不在这八项里。POSIX 共享、块设备、NFS 和 SMB 导出同样不在这八项里。上一节收进来的巡检、按块补副本、持久的 `lost`、变更日志、段校验、共享 Copy、桶配额、按盘记账、显式搬迁、送到另一套集群、坏 locator 换份，以及再后面的全量巡检计数、恢复时间、外部告警和升级顺序，也不挡这八项。上面「对照 MinIO 值得做」里已经补上的身份、加密、复制、通知和默认保留期，以及拆节点、大对象加密、换密钥、用量和复制进度，同样不挡这八项。
+纠删码、远程分层、审计日志、Helm、Swift、SFTP、把 ETag 改成 MD5、Prometheus 拉取格式、加节点后自动搬走旧对象。LDAP 和 OIDC 不在身份那一条的第一版里。单机文件系统上的快照、RAID-Z、USN 变更日志和同池克隆也不在这八项里。POSIX 共享、块设备、NFS 和 SMB 导出同样不在这八项里。上一节收进来的巡检、按块补副本、持久的 `lost`、变更日志、段校验、共享 Copy、桶配额、按盘记账、显式搬迁、送到另一套集群、坏数据位置换份，以及再后面的全量巡检计数、恢复时间、外部告警和升级顺序，也不挡这八项。上面「对照 MinIO 值得做」里已经补上的身份、加密、复制、通知和默认保留期，以及拆节点、大对象加密、换密钥、用量和复制进度，同样不挡这八项。

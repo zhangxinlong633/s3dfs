@@ -11,8 +11,8 @@
 | 0 index ring | 通过 | physical nodes 3,3,3 |
 | 1 health | 通过 | status 200 live 3 zones 3 layout.ok true |
 | 4 create bucket | 通过 | status 200  |
-| 2 stop one block | 通过 | put 200 get 200 repair 201 locators block1,block2 primary yes |
-| 2 node back | 通过 | repair 201 locators block1,block2,block3 |
+| 2 stop one block | 通过 | put 200 get 200 repair 201 数据位置 block1,block2 primary yes |
+| 2 node back | 通过 | repair 201 数据位置 block1,block2,block3 |
 | 2 one block left | 通过 | put 503 health 503 reasons ["live block nodes 1 < configured replicas 3","failure domains 1 < configured replicas 3"] |
 | 2 blocks restored | 通过 | health 200 live 3 |
 | 3 stop one index | 通过 | put 200，另一台 API get 200，20 字节与写入一致 |
