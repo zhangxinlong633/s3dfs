@@ -55,11 +55,11 @@ C 网关不是默认上线入口。它要接到同一负载均衡后面时，另
 | 事项 | 现状 |
 | --- | --- |
 | 分片完成 | 未加密的完成请求按段交给 `putStream`，不再 `Buffer.concat`。带服务端加密时仍拼成一段再封口。验收只要求重启后字节一致 |
-| 大对象压缩和加密 | 超过 1 MiB 的流式 Put 按原文写入，不再做 zstd。带 `x-amz-server-side-encryption` 的对象仍要求能放进 1 MiB 缓冲，否则 400。`aws-chunked` 仍整段读入后再解码 |
+| 大对象压缩和加密 | 超过 1 MiB 的流式 Put 按原文写入，不再做 zstd。带 AES256 的流式 Put 按约 1 MiB 一块封存。`aws-chunked` 仍整段读入后再解码 |
 | 控制台按钮 | Flush、Compact、Repair 改走控制台自己的 `/api/s3dfs/<action>`。令牌放在 Web 进程的 `S3DFS_PATROL_TOKEN`，不进浏览器。API 地址用 `S3DFS_API_BASE_URL`，没有则用 `NEXT_PUBLIC_API_BASE_URL` |
 | 管理读接口 | `GET /_s3dfs/stats`、`cluster`、`buckets`、`metrics` 仍不校验身份。健康检查保持开放，给负载均衡探活 |
 | 丢失与故障 | 对象丢失写在 `$lost/`，健康检查重启后仍列出这些 key。未关闭的故障事件仍在 API 进程内存里 |
-| 对象计数 | `stats` 的对象数只数索引扫描的前 10 万条。每台 locator 数扫到 2 万条就停止，之后该台记成 1。巡检快照超过约 8 KB 时从末尾丢掉 block 节点 |
+| 对象计数 | `stats` 的对象数按页扫完。每台 locator 数扫到 2 万条就停止，之后该台记成 1。巡检快照超过约 8 KB 时从末尾丢掉 block 节点 |
 | 扩缩 | 未配置 `S3DFS_SCALE_UP_CMD` 与 `S3DFS_SCALE_DOWN_CMD` 时只判断，不开关机器。加 block 之后旧对象的 locator 留在原节点，新写入才用新节点。MinIO 追加 pool 也不把旧对象搬过去 |
 | 持续集成 | `.github/workflows/test.yml` 在 push 和 pull request 上跑 `bun test packages/control/test apps/api/test` |
 | 恢复时间 | 没有测过。做法见下面「成熟度还没到」：停一台 block、停一台索引，记健康检查回到 200 的时间 |
@@ -166,12 +166,22 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 
 | 还缺的 | MinIO 里是什么 | 在 s3dfs 里做成什么 | 不一起搬 | 关闭条件 |
 | --- | --- | --- | --- | --- |
-| 多用户身份 | 用户、组、服务账号、STS，以及多条策略。另有 LDAP | 代码已补：`accounts` 里每把密钥限定桶，`expiresAtMs` 过期后拒绝。环境变量 `S3DFS_ACCOUNTS` 可传入同一份 JSON | 第一版不接 LDAP、OIDC。不把策略引擎做成 IAM 的全部动作 | `apps/api/test/s3-rest.test.ts`：两把密钥各写各的桶，过期凭证 403 |
+| 多用户身份 | 用户、组、服务账号、STS，以及多条策略。另有 LDAP | 代码已补：索引里有用户、组、策略、服务账号和 `assumeRole`。`S3DFS_ACCOUNTS` 仍可用 | 不接 LDAP、OIDC。不走 `/minio/admin/v3`，也不走 AWS STS 的表单地址 | `apps/api/test/iam.test.ts`：策略、组、Deny、停用、服务账号收窄、临时凭证到期、根密钥 |
 | 加密接到密钥 | 桶默认加密，以及 SSE-S3、SSE-KMS、SSE-C。密钥可以接到 KMS | 代码已补：`?encryption` 的 AES256 用 `S3DFS_SSE_KEY` 封存。SSE-C 用调用方的密钥，对不上则 Get 失败 | 不替换未标明加密的对象。不把 Vault 当成上线依赖。外部 KMS 仍是这把测试密钥 | `apps/api/test/s3-rest.test.ts`：默认加密的 Put 不带加密头也能读出原文。错的 SSE-C 密钥 Get 为 403 |
 | 桶复制和站点复制 | 桶上的复制配置，以及另一套集群的站点复制。删除和覆盖会送到对端 | 代码已补：`?replication` 打开后，Delete 调 `replica.delete`。`sendChanges(..., { deletes: true })` 才把删除送到目标 | 不把本集群的 3 副本叫作第二站点。不改成纠删后再复制。默认不调用 | `apps/api/test/s3-rest.test.ts`：没配规则时目标收不到删除。配上之后收得到。`packages/control/test/rest.test.ts` 覆盖 `deletes: true` |
 | 通知的目的地 | Webhook 之外还有 Kafka、AMQP、Redis、NATS | 代码已补：通知配置里的 `queue` 把事件交给一个队列。webhook 仍可用 | 只做一种队列接口，不接四种中间件。事件里没有对象正文 | `apps/api/test/s3-rest.test.ts`：队列收到 bucket 和 key |
 | 对象锁的默认保留期 | 桶配置里写默认模式和天数，新建对象不用再逐个 Put retention | 代码已补：`?object-lock` 接受 `DefaultRetention` 的模式和天数。新 Put 写入保留期 | 不锁未打开对象锁的桶。法律保全仍按对象打开 | `apps/api/test/s3-rest.test.ts`：默认 1 天的对象 Delete 为 403。另一个桶 Put 后仍可删 |
 
+上一张表里的五项都已经有第一版。下面这五项也已经有第一版：拆节点、按块加密、换密钥、把用量扫完、复制进度。FTP、SFTP、`/minio/admin/v3`、Listen、Select、KMS、LDAP 和纠删都不在这里。写成功仍是 3 份里的 2 份。都不挡上面的八项。
+
+| 还缺的 | MinIO 里值得留的一点 | 在 s3dfs 里做成什么 | 不一起搬 | 关闭条件 |
+| --- | --- | --- | --- | --- |
+| 拆掉一台 block | 池退役会把对象搬到还在的盘，再停用这一池 | 代码已补：`drain(nodeId)` 把这一台上面的份复制到别的活节点，再从 locator 去掉它。份数保持配置值。不调用就不动 | 不自动缩容。不搬成纠删 | `packages/control/test/rest.test.ts`：调用后该 `nodeId` 不再出现在 locator 里，对象仍能读出 |
+| 大对象也能加密 | 流式封存，不把整个对象收进内存 | 代码已补：超过 1 MiB 且带 AES256 的 Put 按约 1 MiB 一块封存，Get 读出原文 | 不接 KMS。未标明加密的对象仍是明文 | `apps/api/test/sse-keys.test.ts`：大于 1 MiB 的 Put 带 AES256 后，Get 得到原文 |
+| 换密钥还能读旧对象 | 批任务可以轮换密钥，旧对象仍能打开 | 代码已补：封存头记下密钥代号。`S3DFS_SSE_KEY_PREVIOUS` 里留着上一把时，旧对象仍能 Get | 不接外部 KMS。不因此重写所有 `.blk` | `apps/api/test/sse-keys.test.ts`：用第一把写下的对象，当前密钥换成第二把、上一把仍配置着，Get 得到原文 |
+| 用量算完 | 后台扫描把桶的字节数做进缓存，配额按这个数拒绝 | 代码已补：`bucketUsage(bucket)` 按页扫完这个桶的 locator，把可见对象的逻辑字节加总。`stats` 的对象数也不再停在 10 万条 | 不扫没有索引的字节。不改成 Prometheus | `packages/control/test/rest.test.ts`：索引每次只返回一条时，字节数仍等于这些对象的大小之和 |
+| 复制进度 | 每条对象有没有送到对端，管理接口能看见 | 代码已补：`replicationProgress()` 读出已送出的变更条数，以及 `$chg/` 里还没送的条数。第一次 `sendChanges` 之前两个数都是 0 | 不补送已经在盘上的旧对象。不记 MinIO 那套复制状态机 | `packages/control/test/rest.test.ts`：送出一批之后已送和未送对得上。没打开复制时两个数都不增加 |
+
 ## 不作为上线前提
 
-纠删码、远程分层、审计日志、Helm、Swift、SFTP、把 ETag 改成 MD5、Prometheus 拉取格式、加节点后自动搬走旧对象。LDAP 和 OIDC 不在身份那一条的第一版里。单机文件系统上的快照、RAID-Z、USN 变更日志和同池克隆也不在这八项里。POSIX 共享、块设备、NFS 和 SMB 导出同样不在这八项里。上一节收进来的巡检、按块补副本、持久的 `lost`、变更日志、段校验、共享 Copy、桶配额、按盘记账、显式搬迁、送到另一套集群、坏 locator 换份，以及再后面的全量巡检计数、恢复时间、外部告警和升级顺序，也不挡这八项。上面「对照 MinIO 值得做」里的身份、加密、复制、通知目的地和默认保留期同样不挡这八项。
+纠删码、远程分层、审计日志、Helm、Swift、SFTP、把 ETag 改成 MD5、Prometheus 拉取格式、加节点后自动搬走旧对象。LDAP 和 OIDC 不在身份那一条的第一版里。单机文件系统上的快照、RAID-Z、USN 变更日志和同池克隆也不在这八项里。POSIX 共享、块设备、NFS 和 SMB 导出同样不在这八项里。上一节收进来的巡检、按块补副本、持久的 `lost`、变更日志、段校验、共享 Copy、桶配额、按盘记账、显式搬迁、送到另一套集群、坏 locator 换份，以及再后面的全量巡检计数、恢复时间、外部告警和升级顺序，也不挡这八项。上面「对照 MinIO 值得做」里已经补上的身份、加密、复制、通知和默认保留期，以及拆节点、大对象加密、换密钥、用量和复制进度，同样不挡这八项。
