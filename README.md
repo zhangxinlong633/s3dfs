@@ -99,6 +99,8 @@ S3DFS_PATROL_TOKEN=local-token S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
 
 `pnpm dev:api` sets one replica and turns strict layout off, for a single machine. The patrol process and the API share `S3DFS_PATROL_TOKEN`. Production layout is in [Deploy](docs/deploy.md). The first boot-to-conclusion run is in [First patrol](docs/milestones/2026-11-20-first-patrol.md).
 
+A release is the top-level `dist/` directory, not the per-app build folders. `pnpm dist` compiles, then gathers the API, console, block, patrol, and engine there. Runtime dependencies sit only in `dist/node_modules`. From `dist/`, run `npm run start:api`, `start:block`, `start:web`, or `start:patrol`. `pnpm dev` still starts each package from its own directory.
+
 ## Connect with the AWS CLI
 
 Point the official AWS CLI at the Nest API (`:9000`) with `--endpoint-url`. No custom client is required. Use path-style addressing: `http://host:port/bucket/key`.

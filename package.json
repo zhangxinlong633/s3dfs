@@ -17,10 +17,11 @@
     "dev:index": "bash scripts/dev-index.sh",
     "patrol": "bun apps/patrol/src/main.ts",
     "build": "pnpm --filter @s3dfs/engine build && pnpm --filter @s3dfs/control build && pnpm --filter @s3dfs/api build && pnpm --filter @s3dfs/web build",
+    "dist": "pnpm build && bun scripts/stage-dist.mjs",
     "build:engine": "pnpm --filter @s3dfs/engine build",
     "build:control": "pnpm --filter @s3dfs/control build",
     "typecheck": "pnpm -r typecheck",
-    "clean": "pnpm -r exec rm -rf dist .next build node_modules/.cache",
+    "clean": "find apps packages -type d \\( -name dist -o -name .next -o -name build -o -name node_modules \\) -prune -exec rm -rf {} + && find apps packages -name tsconfig.tsbuildinfo -delete",
     "test:split": "bun scripts/test-split.mjs",
     "test:engine": "node packages/engine/scripts/test-span.mjs",
     "bench": "bun scripts/bench-split.mjs"

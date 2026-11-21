@@ -224,7 +224,7 @@ export class ObjectCluster {
     const parsed: BucketLimits = {
       quotaBytes: typeof next.quotaBytes === 'number' ? next.quotaBytes : undefined,
       compress: typeof next.compress === 'boolean' ? next.compress : undefined,
-      shared: next.shared === true ? true : undefined,
+      shared: prev.shared === true ? true : undefined,
     };
     this.limitsCache.set(bucket, { at: Date.now(), limits: parsed });
     if (typeof parsed.quotaBytes === 'number' && !this.usageMem.has(bucket)) {

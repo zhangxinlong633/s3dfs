@@ -98,6 +98,8 @@ S3DFS_PATROL_TOKEN=本机凭证 S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
 
 `pnpm dev:api` 把副本设为 1 并关闭严格布局，供单机开发。巡检进程和 API 使用同一个 `S3DFS_PATROL_TOKEN`。生产部署见 [部署](docs/deploy.md)。第一次从自启到模型结论的记录见 [里程碑](docs/milestones/2026-11-20-first-patrol.md)。
 
+发版用仓库根的 `dist/`，不要到各个 `apps/*/dist` 里取文件。`pnpm dist` 先编译，再把 API、控制台、block、巡检和引擎收进去。运行时依赖只放在 `dist/node_modules`。在 `dist/` 里用 `npm run start:api`、`start:block`、`start:web`、`start:patrol`。开发时的 `pnpm dev` 仍从各包目录启动。
+
 ## 用 AWS CLI 接入
 
 默认入口是 Nest API（`:9000`）。官方 AWS CLI 把 `--endpoint-url` 指过来即可，不需要专用客户端。寻址用路径风格：`http://主机:端口/桶/对象`。
