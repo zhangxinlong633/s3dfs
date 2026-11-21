@@ -66,7 +66,7 @@ C 网关不是默认上线入口。它要接到同一负载均衡后面时，另
 
 ## 多对比之后的位置
 
-材料与 [mainstream.md](diff/mainstream.md) 相同，日期 2026-11-21。这一节补上 CubeFS、Ozone，以及上一轮没展开的产品面。JuiceFS 是架在对象存储前面的文件系统，不放进同一张表。AWS S3、GCS、Azure Blob 不由本系统管盘，只在接口兼容那一行当作客户端期望。GFS、TFS、FastDFS、单机文件系统、CephFS、Ceph Block、Longhorn、NFS 和 SMB 各有一份对照，场景对不上，机制里有可留的。摘要在本节末尾。
+材料与 [mainstream.md](diff/mainstream.md) 相同，日期 2026-11-21。这一节补上 CubeFS、Ozone，以及上一轮没展开的产品面。JuiceFS 是架在对象存储前面的文件系统，不放进同一张表。AWS S3、GCS、Azure Blob 不由本系统管盘，只在接口兼容那一行当作客户端期望。GFS、TFS、FastDFS、单机文件系统、CephFS、Ceph Block、Longhorn、NFS 和 SMB 各有一份对照，场景对不上，机制里有可留的。MinIO 的放置和代码量在 [minio.md](diff/minio.md)。摘要在本节末尾。
 
 ### 冗余、读和扩容
 
@@ -113,6 +113,7 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 | [GFS](diff/gfs.md)（2003） | 一个 master 记命名空间和 64 MiB chunk 的位置，位置由 chunkserver 心跳报上来。客户端拿到位置后直接读写 chunkserver。默认 3 副本，写成功要每一份都确认。chunk 内按 64 KiB 做校验和 | 元数据服务不在数据路径上。校验和比整段对象小。副本少了由 master 再复制一份 | 每个文件的元数据都在 master 内存里，海量小对象会把 master 撑满。写要等齐全部副本，比法定人数更严。chunk 是大文件顺序追加的单位 |
 | [TFS](diff/tfs.md) | 两个 NameServer 一主一备。小文件并进块，块大小常见 64 MiB，块在集群里有唯一编号。NameServer 只记块在哪些 DataServer 上。文件名由客户端编进块号和文件号，最长约 18 字节。DataServer 上另有该块的索引。公开材料里一块常见 3 份，并且要每一份都写完才算成功。一份损坏时按 CRC 换另一份。空闲时按块做均衡和复制 | 块是复制、均衡和修复的单位，小文件只是块里的一条记录。一级索引按块，不按文件。返回名里带位置，读的时候可以先用缓存的块位置 | S3 的 key 由调用方指定，不能把块号编进 key，所以每次 Get 仍要问索引。写成功条件保持法定人数，不等齐 3 份。不另做主辅机房重放 |
 | [FastDFS](diff/fastdfs.md) | Tracker 只知道组和 storage，不存每个文件的索引。同组 storage 互为镜像，容量按组内最小的那台算。上传在一台落盘后就返回，file id 里带有源 storage、时间、大小和 CRC32。同组其他机器靠 binlog 异步推送。源操作用大写字母，副本用小写，避免来回推 | 组可以当成一个故障域。file id 自带 CRC32，读的时候能核对。Tracker 保持得很小 | 上传返回时往往只有一份在盘上，源机器在同步完成前坏了，这份就没了。这和「2 份成功才写索引」相反，不拿来当写成功条件 |
+| [MinIO](diff/minio.md) | 一个 Go 进程上的纠删 S3。对象切成数据片和校验片，元数据是盘上的 `xl.meta`。写到 quorum 才成功。后台修复用剩余片补缺片。全部 Go 约 34.5 万行，纠删和 xl 大约 4 万行，池文件 3005 行 | 同一条盘格式可以写得很短。修复会再看结果，片不够就不编造正文 | 不改成纠删，也不改成一对象一份 `xl.meta`。IAM、站点和对象锁不作为上线前提 |
 | [ZFS](diff/zfs.md) / OpenZFS | 一台机器上的池。镜像或 RAID-Z。写时复制：新块写完再改指针。块的校验和记在父指针里，不记在块自己身上。读到校验失败就用冗余副本修好。scrub 把整池走一遍。快照、克隆、`zfs send`/`recv`。数据集上有压缩、配额和预留 | 校验和和正文分开存，静默损坏盖不过父指针。scrub 是全量巡检，和「缺了副本再补一份」是两件事。快照加 send/recv 是整池备份的形状。压缩按数据集开 | 池在一台机器上，没有跨 zone 的 3 副本。RAID-Z 是纠删，不替换 `.blk` 的 3 副本。不把快照做成在线的 S3 版本 |
 | [Btrfs](diff/btrfs.md) | 单机、写时复制。元数据里带 crc32c。子卷、快照、send/receive、zstd。加盘之后用 balance 把已有数据搬匀。RAID 0/1/10 能用 | 子卷是配额和快照的边界。balance 说明「加盘以后可以搬旧数据」，以及这件事要单独做 | RAID 5/6 长期不能当唯一副本。balance 会搬旧数据，s3dfs 加 block 之后旧 locator 仍留在原节点 |
 | [FFS](diff/ffs.md)、[HAMMER2](diff/hammer2.md) | FFS 用软更新记下元数据依赖，崩溃后按依赖恢复，不必为每步元数据都等一次日志提交。UFS2 有快照。FreeBSD 的 GEOM 在文件系统下面叠镜像、条带、日志和加密，文件系统看不见这些层。DragonFly 的 HAMMER2 在卷上做写时复制、快照、CRC、压缩，以及卷一级的主从复制 | 镜像、校验、加密可以叠在对象接口下面，和现在的 API、索引、block 分层同一类。卷一级复制可以整目录拷走，不必按 key 扫一遍 | 软更新不放进 dleveldb。GEOM 和 HAMMER2 仍是一台或少数几台机器上的盘，不提供 S3 |

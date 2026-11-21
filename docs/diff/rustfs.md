@@ -41,6 +41,49 @@ s3dfs 把「对象很多」变成「KV 里很多 locator + 少量大文件」。
 
 容量算法也不同。s3dfs 默认 3 副本，有效容量大约是裸容量的 1/3（只有一台 block 时有效副本是 1）。RustFS 在 8–16 盘的纠删集上默认 4 个校验片，16 盘大约是 75%（12 数据 + 4 校验），还要再扣文件系统、元数据、版本和 healing 的余量。`EC:4` 表示一个集里能缺 4 个片，不等于能扛 4 台整机故障，要看这些盘落在哪些机器上。
 
+## 代码分类
+
+`cloc` 数到的 Rust **代码行**是 173 万。下面按 `.rs` 文件的物理行分类，空行和注释都算在内，所以合计更大：`crates/` 与 `rustfs/` 里的 Rust 文件约 207 万行。依赖目录 `target/` 没有算进去。`scripts/` 另有约 7.0 万行 Python 和 5.5 万行 Shell，不在下表里。同一口径下，s3dfs 的 TypeScript、C 和文档不到 3 万行。
+
+这七类互不重叠，加起来就是约 207 万行。
+
+| 类别 | 物理行 | 里面是什么 |
+| --- | --- | --- |
+| 纠删和保住数据 | 77.8 万 | 磁盘、盘组、放置、池、远程磁盘、Reed-Solomon，再加上修复和后台扫描。编解码本身只有 2.4 万 |
+| 对外接口 | 49.8 万 | S3 请求路径 22.2 万，管理接口 14.5 万，表目录 5.9 万，FTPS / WebDAV / Swift / SFTP 4.6 万，S3 Select 2.6 万 |
+| 其余库 | 21.8 万 | 工具、管理客户端、协议定义、缓存、配置等没有单列的小库 |
+| 测试 | 16.9 万 | `crates/e2e_test` 和 `rustfs/tests`。没有产品实现。各目录里的单元测试还留在上面各类中 |
+| 桶上的规则 | 16.0 万 | 生命周期 5.2 万，复制 4.7 万，远程分层 3.4 万，配额与用量 2.5 万，对象锁库 0.2 万 |
+| 元数据、锁、通知、观测 | 13.0 万 | 文件元数据 2.8 万，分布式锁 1.8 万，事件通知 3.0 万，指标与审计 5.4 万 |
+| 身份与加密 | 11.7 万 | 用户、策略、Keystone、签名 5.8 万，KMS 5.9 万 |
+
+目录对照如下。纠删那一行已经含磁盘、盘组和节点间调用，不再拆开相加。
+
+| 功能 | 物理行 | 目录 |
+| --- | --- | --- |
+| 纠删存储 | 56.5 万 | `crates/ecstore` 里的磁盘、盘组读写、放置、池、远程磁盘和 Reed-Solomon。编解码目录 `erasure` 只有 2.4 万，其余是围绕纠删集的磁盘和放置 |
+| 远程分层 | 3.4 万 | `crates/ecstore/src/services/tier`。把对象转到远端，不是纠删本身 |
+| 生命周期 | 5.2 万 | `crates/ecstore/src/bucket/lifecycle` 4.4 万，`crates/lifecycle` 0.7 万 |
+| 桶复制与站点复制 | 4.7 万 | `crates/ecstore/src/bucket/replication` 2.4 万，`crates/replication` 1.2 万，`rustfs/src/site_replication` 1.1 万 |
+| 配额与用量 | 2.5 万 | `crates/ecstore` 里的 quota 与 data_usage，加上 `crates/data-usage`、`crates/object-capacity` |
+| 对象锁目录 | 0.2 万 | `crates/ecstore/src/bucket/object_lock`。请求处理还在 `rustfs/src/app` |
+| 修复 | 9.0 万 | `crates/heal`。其中约 3.9 万在测试文件 |
+| 后台扫描 | 12.3 万 | `crates/scanner` 11.6 万（约一半在测试文件），`crates/scanner-metrics` 0.7 万 |
+| S3 请求路径 | 22.2 万 | `rustfs/src/app` 10.1 万，`rustfs/src/storage` 7.3 万，`rustfs/src/server` 4.9 万 |
+| 管理接口 | 14.5 万 | `rustfs/src/admin`。其中约 2.4 万在测试文件 |
+| 表目录 | 5.9 万 | `rustfs/src/table_catalog`。约 2.6 万在测试文件 |
+| 身份与策略 | 5.8 万 | `crates/iam`、`crates/policy`、`crates/keystone`、`crates/signer`、`crates/credentials`，以及 `rustfs/src/auth.rs` |
+| 加密 | 5.9 万 | `crates/kms` 5.7 万，`crates/crypto` 0.2 万。对象 SSE 接线在 `rustfs/src/storage`，已算进 S3 请求路径 |
+| 协议 | 4.6 万 | `crates/protocols` 3.8 万，`rustfs/src/protocols` 0.8 万。含 FTPS、WebDAV，以及可选的 Swift、SFTP |
+| 可观测与审计 | 5.4 万 | `crates/obs` 3.3 万，`crates/io-metrics` 1.6 万，`crates/audit` 0.4 万 |
+| 事件通知 | 3.0 万 | `crates/notify` 1.1 万，`crates/targets` 1.9 万 |
+| 文件元数据 | 2.8 万 | `crates/filemeta` |
+| S3 Select | 2.6 万 | `crates/s3select-api`、`crates/s3select-query` |
+| 分布式锁 | 1.8 万 | `crates/lock` |
+| 端到端测试 | 16.9 万 | `crates/e2e_test` 13.4 万，`rustfs/tests` 3.5 万。没有产品实现 |
+
+单个文件仍可以到 3 万至 4 万行，例如 `crates/ecstore/src/core/pools.rs` 和 `crates/ecstore/src/disk/local.rs`。和 MinIO 同一套纠删盘格式的行数对照在 [minio.md](minio.md)。
+
 ## S3 与产品面
 
 RustFS 文档列出的数据面包括：桶的创建、删除、列举和 location；对象的 Put / Get / Head / Copy / Delete / 批量删除、Range、条件请求和用户元数据；ListObjects 与 ListObjectsV2；分片上传的创建、上传、拷贝、列举、完成和中止；版本、生命周期、标签、校验和、Object Lock；IAM、桶策略、阻止公共访问、预签名 GET/PUT；CORS、桶通知、复制配置和服务端加密。SigV4 可用。README 另标可用：Swift（可选 feature）、Keystone、FTPS / WebDAV、SFTP（可选）、事件通知、审计、配额、多租户、KMS（生产可用 Vault 与 AWS KMS）、站点复制、远程 S3 分层、S3 Select、Helm。S3 Tables（Iceberg REST）和 MinIO 盘格式兼容是预览，默认构建不含后者。
@@ -71,7 +114,7 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | cors | `rustfs/src/server/cors.rs`，`rustfs/src/app/bucket_usecase.rs` 的 cors 模块 | `?cors` 保存规则。`OPTIONS` 按来源和方法回预检头 |
 | website | `rustfs/src/app/website.rs` | `?website` 保存索引、错误页和按前缀重定向。目录请求返回索引。对象不存在时返回错误页，状态仍是 404。命中前缀时返回配置的跳转状态和 `Location` |
 | replication | `crates/replication`，桶复制配置 | 没有。`sendChanges` 只把变更送到另一套集群，默认不调用，也没有 S3 复制配置 |
-| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | 对象 `?retention` 支持 GOVERNANCE 和 COMPLIANCE。`?legal-hold` 为 ON 时拒绝删除，治理模式的绕过头也不生效。没有桶级 Object Lock 开关 |
+| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | `?object-lock` 打开后才能设保留期和法律保全，打开后不能关掉。GOVERNANCE 可用绕过头，法律保全不能 |
 | encryption | `crates/kms`：SSE-S3、SSE-KMS、SSE-C，后端可以是本地、Vault KV2、Vault Transit | 桶上的一把 AES-256-GCM。没有 KMS，也没有按对象换密钥 |
 | inventory | `rustfs/src/connect/inventory` | `?inventory` 保存一份 CSV 配置。`POST` 立刻把当前对象写成 `前缀/id.csv`。没有按天调度 |
 | requestPayment、accelerate、intelligent-tiering、analytics、metrics | 路由接了这些查询名 | 没有 |
@@ -92,7 +135,7 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | S3 Select | `crates/s3select-api`、`crates/s3select-query`。README 写明只收未压缩输入 | 没有 |
 | 审计 | `crates/audit` | 没有。访问日志是每个响应一行 JSON |
 | 可观测性 | `crates/obs`、`crates/io-metrics` | `GET /_s3dfs/metrics` 只计本进程状态码 |
-| 事件通知 | `crates/notify` | 一个 webhook URL。`events` 里可以用具体事件名或 `s3:ObjectRemoved:*` 这种前缀。不配事件时仍发送全部 |
+| 事件通知 | `crates/notify` | `targets` 里可以有多个 webhook，每个地址用自己的 `events`。只写 `url` 时仍是一个地址 |
 | 多租户 | README 标可用 | 没有 |
 | Swift | `crates/protocols` 的 swift，编译 feature，默认不进 | 没有 |
 | FTPS、WebDAV | 默认 feature：`ftps`、`webdav` | 没有。挂载是自带的 `s3dfs-fuse` |

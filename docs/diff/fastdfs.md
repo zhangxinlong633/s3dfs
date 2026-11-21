@@ -5,7 +5,7 @@
 | 日期 | 2026-11-21 |
 | 读者 | 要看「元数据服务很小」和「上传立刻返回」各付出什么的人 |
 | s3dfs | 以当时仓库的 [架构](../architecture.md)、[能力](../capabilities.md) 为准 |
-| FastDFS | 以 happyfish100/fastdfs 的部署说明和 storage 同步行为为准 |
+| FastDFS | 本机 `/Users/bruce/git/fss/fastdfs-master`。`cloc` 计到 C 代码行 93469，全部语言代码行 147093 |
 | 怎么读 | 标准对照的项目和 s3dfs 列，与本目录其他文件系统对照相同。特色只写 FastDFS 多出来的部分 |
 
 FastDFS 用 tracker 告诉客户端去哪台 storage。tracker 不保存每个文件的索引。同组 storage 互为镜像。s3dfs 的索引保存每个对象的 locator，写入要凑够法定人数才对调用方成功。
@@ -43,6 +43,35 @@ FastDFS 用 tracker 告诉客户端去哪台 storage。tracker 不保存每个�
 | 某一刻 | 版本清单在索引，正文在 block 的 `$ver/` | 没有版本。同步的是文件的出现和删除 |
 | 压缩与配额 | 默认 zstd，压不小则存原文。没有桶配额 | 不在存储层做对象压缩。组的容量上限是组内最小盘 |
 | 拷贝 | CopyObject 读出再写入 | 组内同步就是把文件推到同组机器。没有 S3 Copy |
+
+## 代码量
+
+`cloc` 在这份源码上数到 433 个文件。C 的代码行是 93469，全部语言的代码行是 147093。下面再按 `.c`、`.h`、`.cpp` 的物理行分目录，空行和注释都算在内，合计约 13.4 万。同一口径下，s3dfs 大约 3.4 万行，MinIO 的 Go 大约 34.5 万行，RustFS 大约 207 万行。
+
+| 目录 | 物理行 | 是什么 |
+| --- | --- | --- |
+| storage | 3.6 万 | 存文件、binlog、组内同步 |
+| tools | 3.3 万 | 配额、快照、清理这类命令行工具，不是 tracker 或 storage 进程 |
+| tracker | 1.9 万 | 只调度组和 storage，不存每个文件的索引 |
+| client | 1.3 万 | C 客户端 |
+| 测试 | 0.8 万 | `test/` |
+
+storage 和 tracker 加起来大约 5.5 万物理行。相对 MinIO 和 RustFS 少，是因为 tracker 不记每个文件，副本按文件名推送，磁盘格式交给本地文件系统。没有纠删集，也没有每对象一份要自己解析的 `xl.meta`。
+
+按模块对齐。两边都是物理行。FastDFS 只算 `.c`、`.h`、`.cpp`。s3dfs 算 TypeScript、C 和脚本，不含 Markdown，也不含 `node_modules`。仓库里的 `packages/dleveldb` 就是索引；旁边那个 dleveldb 仓库是同一套，大约 0.4 万行，不重复加。
+
+| 模块 | FastDFS | 物理行 | s3dfs | 物理行 |
+| --- | --- | --- | --- | --- |
+| 组和机器调度 | `tracker` | 1.9 万 | `packages/control`。放置和法定人数 | 0.37 万 |
+| 每个对象的位置 | 不存，编进文件 id | 0 | `packages/dleveldb` | 0.27 万 |
+| 存文件和同步 | `storage` 根目录。含 binlog 和组内推送 | 2.5 万 | `packages/engine` 0.43 万，`apps/block` 0.03 万。返回前写完副本，没有 binlog | 0.47 万 |
+| 小文件合并 | `storage/trunk_mgr` | 0.7 万 | 打进 `.blk`，写在 engine 里 | 已含在上面 |
+| 客户端 SDK | `client`、`cpp_client`、`php_client` | 2.9 万 | 仓库里没有。调用方用 AWS SDK | 0 |
+| 对外协议 | 专有协议，写在 tracker 和 storage 里 | 已含在上面 | `apps/api` 0.65 万，`apps/s3-gateway` 0.62 万 | 1.3 万 |
+| 命令行工具 | `tools` | 3.3 万 | `scripts` | 0.21 万 |
+| 挂载 | 这 13.4 万里没有 | 0 | `apps/fuse` | 0.35 万 |
+
+s3dfs 的 HTTP、CRC、zstd 和 AES 用 Node 里现成的，所以 engine 和 block 不用再写一套网络和压缩。Go、Rust 等 FastDFS 客户端在 `cloc` 的 14.7 万代码行里，不在上表的 C/C++ 物理行里。
 
 ## 修复与运维
 
@@ -110,3 +139,16 @@ s3dfs 现在停在规则自动。下面两档还没有。纠删、IAM、KMS、Ob
 ## 不照搬的部分
 
 上传返回时文件往往只在一台盘上。源 storage 在 binlog 推完之前坏了，这一份就没有了。s3dfs 的写成功仍是 3 份里的 2 份，不改成单台返回。S3 key 也不能换成 FastDFS 的文件 id。
+
+## 代码量对照
+
+物理行，空行和注释都算，依赖目录不算。s3dfs 含 TypeScript、C 和文档。dleveldb 是旁边的索引仓库。FastDFS 只算 `.c`、`.h`、`.cpp`。MinIO 只算 `.go`，不含 `vendor`。RustFS 只算 `crates/` 与 `rustfs/` 的 `.rs`，不含 `target/`。
+
+| 系统 | 大约行数 | 其中和放数据有关的 |
+| --- | --- | --- |
+| s3dfs | 3.4 万。加上 dleveldb 约 3.9 万 | 打包块、locator、法定人数写入 |
+| FastDFS | 13.4 万。`cloc` 的 C 代码行是 9.3 万 | storage 加 tracker 约 5.5 万。其余是客户端和命令行工具 |
+| MinIO | 34.5 万。去掉测试文件约 24.8 万 | 纠删和 xl 大约 4 万。池文件 3005 行 |
+| RustFS | 207 万 | 纠删存储 56.5 万。`pools.rs` 43162 行 |
+
+从少到多是 s3dfs、FastDFS、MinIO、RustFS。FastDFS 和 s3dfs 同属整份复制，行数差在多语言客户端、命令行工具，以及用 C 写的 binlog 和 trunk。MinIO 和 RustFS 同属纠删盘格式，行数差在同一条路径被写成了很长的单文件。细节见 [minio.md](minio.md) 和 [rustfs.md](rustfs.md)。
