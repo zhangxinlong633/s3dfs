@@ -37,6 +37,8 @@ export interface BucketConfig {
   lifecycle?: LifecycleRule[];
   notifyUrl?: string;
   notifyEvents?: string[];
+  notify?: { url: string; events?: string[] }[];
+  objectLock?: { enabled: true };
   blockPublicPolicy?: boolean;
   tags?: Record<string, string>;
   cors?: CorsRule[];
@@ -298,22 +300,37 @@ export function parsePublicAccessBlock(body: string): boolean {
   return /<BlockPublicPolicy>\s*true\s*<\/BlockPublicPolicy>/i.test(body);
 }
 
+export function notifyTargets(config: { notifyUrl?: string; notifyEvents?: string[]; notify?: { url: string; events?: string[] }[] }): { url: string; events?: string[] }[] {
+  if (config.notify && config.notify.length > 0) {
+    return config.notify.filter((target) => target.url.length > 0);
+  }
+  return config.notifyUrl ? [{ url: config.notifyUrl, events: config.notifyEvents }] : [];
+}
+
+export function parseObjectLock(body: string): { enabled: true } {
+  if (!/<ObjectLockEnabled>\s*Enabled\s*<\/ObjectLockEnabled>/i.test(body)) {
+    throw new S3HttpError(400, 'MalformedXML', 'Object lock must be Enabled');
+  }
+  return { enabled: true };
+}
+
 export async function postEvent(
-  config: { notifyUrl?: string; notifyEvents?: string[] },
+  config: { notifyUrl?: string; notifyEvents?: string[]; notify?: { url: string; events?: string[] }[] },
   event: Record<string, unknown>,
   fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  if (!config.notifyUrl) {
-    return;
-  }
-  if (!eventSelected(config.notifyEvents, String(event.event ?? ''))) {
-    return;
-  }
-  await fetchImpl(config.notifyUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(event),
-  });
+  const name = String(event.event ?? '');
+  await Promise.all(
+    notifyTargets(config)
+      .filter((target) => eventSelected(target.events, name))
+      .map((target) =>
+        fetchImpl(target.url, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(event),
+        }),
+      ),
+  );
 }
 
 export function parseVersioningStatus(xml: string): 'Enabled' | 'Suspended' {

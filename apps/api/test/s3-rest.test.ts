@@ -280,10 +280,13 @@ describe('s3 surface that was still open', () => {
   test('retention blocks delete until the date, and governance can be bypassed', async () => {
     const backend = new MemBackend();
     const meta = new MemoryObjectMeta();
+    const config = new MemoryConfigStore();
+    const lock = '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?object-lock', body: Buffer.from(lock) }, { config, meta });
     await call(backend, { method: 'PUT', path: '/logs/keep.txt', body: Buffer.from('keep') }, { meta });
     const until = new Date(Date.now() + 86_400_000).toISOString();
     const xml = `<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>${until}</RetainUntilDate></Retention>`;
-    const put = await call(backend, { method: 'PUT', path: '/logs/keep.txt?retention', body: Buffer.from(xml) }, { meta });
+    const put = await call(backend, { method: 'PUT', path: '/logs/keep.txt?retention', body: Buffer.from(xml) }, { config, meta });
     expect(put.status).toBe(200);
     const blocked = await call(backend, { method: 'DELETE', path: '/logs/keep.txt' }, { meta });
     expect(blocked.status).toBe(403);
@@ -300,23 +303,26 @@ describe('s3 surface that was still open', () => {
   test('legal hold blocks delete until it is turned off', async () => {
     const backend = new MemBackend();
     const meta = new MemoryObjectMeta();
+    const config = new MemoryConfigStore();
+    const lock = '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?object-lock', body: Buffer.from(lock) }, { config });
     await call(backend, { method: 'PUT', path: '/logs/hold.txt', body: Buffer.from('hold') }, { meta });
     const on = await call(
       backend,
       { method: 'PUT', path: '/logs/hold.txt?legal-hold', body: Buffer.from('<LegalHold><Status>ON</Status></LegalHold>') },
-      { meta },
+      { config, meta },
     );
     expect(on.status).toBe(200);
     const blocked = await call(
       backend,
       { method: 'DELETE', path: '/logs/hold.txt', headers: { 'x-amz-bypass-governance-retention': 'true' } },
-      { meta },
+      { config, meta },
     );
     expect(blocked.status).toBe(403);
     await call(
       backend,
       { method: 'PUT', path: '/logs/hold.txt?legal-hold', body: Buffer.from('<LegalHold><Status>OFF</Status></LegalHold>') },
-      { meta },
+      { config, meta },
     );
     const removed = await call(backend, { method: 'DELETE', path: '/logs/hold.txt' }, { meta });
     expect(removed.status).toBe(204);
@@ -559,6 +565,9 @@ describe('s3 surface that was still open', () => {
   test('lists open multipart uploads and keeps a retained object in a batch delete', async () => {
     const backend = new MemBackend();
     const meta = new MemoryObjectMeta();
+    const config = new MemoryConfigStore();
+    const lock = '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?object-lock', body: Buffer.from(lock) }, { config });
     const uploads = new MultipartUploads();
     const created = await call(backend, { method: 'POST', path: '/logs/big.bin?uploads' }, { uploads });
     const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(created.body.toString())?.[1] ?? '';
@@ -576,12 +585,73 @@ describe('s3 surface that was still open', () => {
         path: '/logs/keep.txt?retention',
         body: Buffer.from(`<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>${until}</RetainUntilDate></Retention>`),
       },
-      { meta },
+      { config, meta },
     );
     const xml = '<Delete><Object><Key>keep.txt</Key></Object></Delete>';
-    const removed = await call(backend, { method: 'POST', path: '/logs?delete', body: Buffer.from(xml) }, { meta });
+    const removed = await call(backend, { method: 'POST', path: '/logs?delete', body: Buffer.from(xml) }, { config, meta });
     expect(removed.status).toBe(200);
     expect(removed.body.toString()).toContain('<Code>AccessDenied</Code>');
     expect(backend.objects.has('logs/keep.txt')).toBe(true);
+  });
+
+  test('object lock must be enabled before retention, and each notify target gets its events', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const meta = new MemoryObjectMeta();
+    const options = { config, meta };
+    const early = await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs/a.txt?retention',
+        body: Buffer.from('<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>2099-01-01T00:00:00.000Z</RetainUntilDate></Retention>'),
+      },
+      options,
+    );
+    expect(early.status).toBe(400);
+    const lock = '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>';
+    expect((await call(backend, { method: 'PUT', path: '/logs?object-lock', body: Buffer.from(lock) }, options)).status).toBe(200);
+    const got = await call(backend, { method: 'GET', path: '/logs?object-lock' }, options);
+    expect(got.body.toString()).toContain('<ObjectLockEnabled>Enabled</ObjectLockEnabled>');
+    expect((await call(backend, { method: 'DELETE', path: '/logs?object-lock' }, options)).status).toBe(405);
+    await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('locked') }, options);
+    const until = new Date(Date.now() + 86_400_000).toISOString();
+    await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs/a.txt?retention',
+        body: Buffer.from(`<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>${until}</RetainUntilDate></Retention>`),
+      },
+      options,
+    );
+    const blocked = await call(backend, { method: 'DELETE', path: '/logs/a.txt' }, options);
+    expect(blocked.status).toBe(403);
+
+    const seen: { url: string; event: string }[] = [];
+    const fetchImpl = (async (url: string, init?: { body?: string }) => {
+      seen.push({ url, event: (JSON.parse(init?.body ?? '{}') as { event: string }).event });
+      return new Response('ok');
+    }) as typeof fetch;
+    await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs?notification',
+        body: Buffer.from(JSON.stringify({
+          targets: [
+            { url: 'http://hook.local/put', events: ['s3:ObjectCreated:*'] },
+            { url: 'http://hook.local/del', events: ['s3:ObjectRemoved:*'] },
+          ],
+        })),
+      },
+      { ...options, fetchImpl },
+    );
+    await call(backend, { method: 'PUT', path: '/logs/b.txt', body: Buffer.from('b') }, { ...options, fetchImpl });
+    await call(backend, { method: 'DELETE', path: '/logs/b.txt' }, { ...options, fetchImpl });
+    expect(seen).toEqual([
+      { url: 'http://hook.local/put', event: 's3:ObjectCreated:Put' },
+      { url: 'http://hook.local/del', event: 's3:ObjectRemoved:Delete' },
+    ]);
   });
 });

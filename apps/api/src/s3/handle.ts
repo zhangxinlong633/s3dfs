@@ -9,6 +9,7 @@ import {
   openObject,
   matchCors,
   parseCors,
+  parseObjectLock,
   parsePublicAccessBlock,
   policyIsPublic,
   parseInventory,
@@ -218,7 +219,8 @@ function isBucketAdmin(req: S3Request): boolean {
     req.query.has('website') ||
     req.query.has('inventory') ||
     req.query.has('publicAccessBlock') ||
-    req.query.has('location')
+    req.query.has('location') ||
+    req.query.has('object-lock')
   );
 }
 
@@ -580,12 +582,39 @@ async function handleBucket(
       return empty(204);
     }
   }
+  if (req.query.has('object-lock') && configStore) {
+    if (method === 'GET') {
+      const config = await configStore.get(bucket);
+      const body = config.objectLock?.enabled
+        ? `<?xml version="1.0" encoding="UTF-8"?><ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>`
+        : `<?xml version="1.0" encoding="UTF-8"?><ObjectLockConfiguration/>`;
+      return xml(200, body);
+    }
+    if (method === 'PUT') {
+      const config = await configStore.get(bucket);
+      config.objectLock = parseObjectLock(req.body.toString('utf8'));
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+    if (method === 'DELETE') {
+      return xml(405, errorXml('MethodNotAllowed', 'Object lock cannot be removed', bucket));
+    }
+  }
   if (req.query.has('notification') && configStore) {
     if (method === 'PUT') {
-      const parsed = JSON.parse(req.body.toString('utf8')) as { url?: string; events?: string[] };
+      const parsed = JSON.parse(req.body.toString('utf8')) as { url?: string; events?: string[]; targets?: { url?: string; events?: string[] }[] };
       const config = await configStore.get(bucket);
-      config.notifyUrl = parsed.url;
-      config.notifyEvents = parsed.events;
+      if (Array.isArray(parsed.targets)) {
+        config.notify = parsed.targets
+          .filter((target) => typeof target.url === 'string' && target.url.length > 0)
+          .map((target) => ({ url: target.url ?? '', events: target.events }));
+        config.notifyUrl = config.notify[0]?.url;
+        config.notifyEvents = config.notify[0]?.events;
+      } else {
+        config.notifyUrl = parsed.url;
+        config.notifyEvents = parsed.events;
+        config.notify = parsed.url ? [{ url: parsed.url, events: parsed.events }] : [];
+      }
       await configStore.put(bucket, config);
       return empty(200);
     }
@@ -806,6 +835,12 @@ async function handleObject(
     if (method === 'DELETE') {
       await options.meta.removeTags(bucket, key);
       return empty(204);
+    }
+  }
+  if ((req.query.has('retention') || req.query.has('legal-hold')) && options.meta && method === 'PUT') {
+    const locked = options.config ? (await options.config.get(bucket)).objectLock?.enabled === true : false;
+    if (!locked) {
+      return xml(400, errorXml('InvalidRequest', 'Bucket object lock is not enabled', `/${bucket}/${key}`));
     }
   }
   if (req.query.has('retention') && options.meta) {
