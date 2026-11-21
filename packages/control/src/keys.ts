@@ -7,6 +7,11 @@ export const LOST_PREFIX = '$lost/';
 /** Name-only change records. The value never contains object bytes. */
 export const CHANGE_PREFIX = '$chg/';
 
+/** A block node stepped out for maintenance. Value is the reason and the return deadline. */
+export const MAINT_PREFIX = '$maint/';
+
+export const MAINTENANCE_MS = 2 * 60 * 60 * 1000;
+
 export function lostKey(objectKey: string): string {
   return `${LOST_PREFIX}${objectKey}`;
 }
@@ -33,6 +38,10 @@ export function isNodeKey(indexKey: string): boolean {
 
 export function nodeKey(nodeId: string): string {
   return `${NODE_PREFIX}${nodeId}`;
+}
+
+export function maintKey(nodeId: string): string {
+  return `${MAINT_PREFIX}${nodeId}`;
 }
 
 export function nodeIdFromKey(indexKey: string): string | null {

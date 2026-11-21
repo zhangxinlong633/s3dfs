@@ -1,169 +1,161 @@
-# 与 RustFS 的功能对照
+# 与 RustFS 的对照
 
 | | |
 | --- | --- |
 | 日期 | 2026-11-21 |
-| 读者 | 需要逐项确认 S3 与运维能力差异的人 |
-| s3dfs | 以当时仓库的 [架构](../architecture.md)、[能力](../capabilities.md)、[网关](../design-s3-gateway.md) 为准 |
-| RustFS | 对照本机源码：`rustfs/src/server/http.rs` 的配置子资源，`rustfs/src/app` 与 `crates/` 下的实现。README 的功能表会继续变化 |
+| 读者 | 要看纠删对象存储和 3 副本打包块各写了多少代码、各怎么放数据的人 |
+| s3dfs | 以当时仓库的 [架构](../architecture.md)、[能力](../capabilities.md) 为准 |
+| RustFS | 以本机源码 `/Users/bruce/git/fss/rustfs` 为准。行数不含 `vendor`、`target` |
+| 怎么读 | 原理、标准对照和代码量说明两边怎么放数据、为什么行数差这么多。后文「哪些能放进 s3dfs」写当前已经放进来的机制，以及明确不拿的部分。待办见 [todo.md](../todo.md) |
 
-两边都提供 S3 兼容的对象存储，解决的不是同一件事。RustFS 把纠删码、数据面、控制台和运维放在一个 Rust 进程里。s3dfs 把索引和正文分开扩容，面向大量小对象。Nest API 覆盖 AWS CLI 常用的签名、分片、拷贝、版本、生命周期和单密钥加密；运维面比 RustFS 窄。未关闭事项见 [todo.md](../todo.md)。
+RustFS 是一个 Rust 进程上的 S3，对象按纠删集切到多块盘，元数据是每对象一份 `xl.meta`。s3dfs 把索引和正文分开，默认 3 份整对象打进 `.blk`。同一套纠删盘格式在 RustFS 里被写成很长的单文件：池 43162 行，单盘 41897 行。Go 里同一职责的文件长度见 [minio.md](minio.md)。本篇只对 RustFS 和 s3dfs。
 
-## 选型
+## 原理与细节
 
-| 场景 | 更合适的一边 |
-| --- | --- |
-| 海量小对象，担心本地文件系统 inode 和每对象一个文件 | s3dfs。对象打进大 `.blk`，文件数跟块走，不跟对象数走 |
-| 日志、文本，希望写入前就压缩，压不小则原样落盘 | s3dfs。默认 zstd，类型记在数据位置上 |
-| 要接到现成 AWS CLI / SDK，并且依赖 IAM、KMS、站点复制、Object Lock、配额 | RustFS。这些在它的数据面上已经标成可用。s3dfs 的 Nest API 能做 SigV4、预签名、分片、Copy、虚拟主机 URL、桶策略、用户和组、默认 AES256 与 SSE-C、版本、对象锁、桶配额、按前缀过期、webhook 和一个队列。没有 KMS，也不补送已有对象 |
-| 大对象、数据湖、AI 吞吐，希望用纠删码换容量，而不是 3 副本 | RustFS。默认按纠删集做 Reed-Solomon |
-| 索引很小、正文机器很多，两边独立加机器 | s3dfs。索引建议 3–5 台 dleveldb，block 可以很多 |
-| 单进程就把 S3 和控制台一起跑起来，用 Docker / Helm 当 MinIO 替代 | RustFS。一个 `rustfs` 进程同时听 :9000 和 :9001。s3dfs 单机默认要分别起索引、block、API、控制台 |
+标准对照只对齐结论。这里写出结论从哪条原理来，以及能对上的字节、步数和规模。s3dfs 这一列在本目录各份对照里相同。
 
-没有在同一套机器上对打过。s3dfs 的数字是 2026-11-17 一台 MacBook Pro 上的本机测试，见 [benchmarks.md](../benchmarks.md)。RustFS README 给过一套压测环境（2 核、4 GB、4 块盘），图里的吞吐没有写进本文，也不能和 s3dfs 的 localhost ops/s 相减。
-
-## 架构
-
-| | s3dfs | RustFS |
+| 点 | s3dfs | RustFS |
 | --- | --- | --- |
-| 实现 | 控制面 TypeScript（Nest / Next，节点进程用 Bun），落盘引擎 C；另有一条薄的 C S3 网关。挂载程序 `s3dfs-fuse` 也是 C | 主体 Rust，Apache 2.0 |
-| 进程 | API、控制台、block、独立的 dleveldb 索引，要一起起 | 一个 `rustfs` 进程同时做 S3（:9000）和控制台（:9001） |
-| 元数据 | 数据位置 JSON 在 dleveldb：`bucket/key`、`bucket/key:1`、`bucket/key:2`。只记节点和稳定 `recId`，不记文件偏移 | 每对象（或每个版本）一份 `xl.meta`，几何、校验写在元数据里 |
-| 正文 | 追加进默认 1 GiB 的 `.blk`。记录是带 CRC 的 TLV（魔数 `S3R1`）。写缓冲约 1 MiB，flush 默认 `fsync` | 大对象按纠删集切成数据片和校验片，1 MiB 一块做 Reed-Solomon，再写到各盘。文档写明每个对象（或版本）是独立文件 |
-| 小对象 | 几千个 1 KiB 对象进同一个 `.blk`，不按对象建目录，block 上没有本地 LevelDB | 分片不超过预算时内联进该盘自己的 `xl.meta`。默认每片预算 `256 KiB / K`，上限 128 KiB；版本桶再除以 8。超过则仍是独立文件。官方建议数据盘用 XFS，inode 512 字节 |
-| 放置 | 按 key 哈希从存活 block 里挑 N 台，同一份字节写 N 份。默认 N=3，不超过存活节点数 | 对象哈希到某个纠删集，片在集内轮转。集之间不共享故障预算 |
-| 读 | 跳过健康检查标 down 的节点，按 `recId` 取，按数据位置上的 `compressType` 解压 | 读 quorum 选定元数据，校验 bitrot，至少 K 个片才能解出；缺片但读成功会排队 read-repair |
-| 写成功条件 | 默认 3 副本里 2 份 block 成功即写索引，未写上的一份由修复补。任一条数据位置失败则删掉本次已写入的数据位置。索引地址失败时改写下一条；节点回来后由 dleveldb 按较新的 mtime 追平 | 达到写 quorum 才对外成功；低于 quorum 不报成功 |
-| 扩容 | 加 block 机器扩正文；索引集群另算。新索引节点加入环后，由 dleveldb 按较新的 mtime 追平本机负责的 key | 多盘池只能在后面追加新 Pool，不能改已有池的端点和纠删集宽度。单盘部署不能原地扩成多盘，要新建集群再经 S3 迁数据 |
-| 挂载 | 自带 `s3dfs-fuse`（C）。Linux 没有 libfuse 时直接对 `/dev/fuse`；有 macFUSE / libfuse 时用 libfuse。没有 FUSE 时 macOS 走本机 WebDAV。关文件时整对象 Put，只是兼容层 | 不带 FUSE。用 s3fs、rclone mount 对 S3 端点挂 |
+| 分层 | 三种进程。dleveldb 只存数据位置，block 里的 C 引擎只追加记录，API 不打开本地盘。对象变多，增加的是 KV 条数和少量大文件，不是一对象一文件 | 一个 `rustfs` 进程同时做 S3（:9000）和控制台（:9001）。元数据和分片落在同一套盘上，没有单独的小索引集群 |
+| 磁盘上的单位 | `blocks/` 下的文件名是 20 位块号加 `.blk`，默认 1 GiB。记录小端，魔数 `S3R1`（`0x31523353`）。帧依次是 magic u32、rec_len u32、tags、crc32 u32，再重复 rec_len u32 和 magic u32，开销 20 字节。标签依次是 type u16、length u32、value。不认识的标签跳过。`recmap.s3m` 魔数 `S3M1`，只是重启缓存；末尾 4 字节 CRC 对不上就重扫 `.blk` | 纠删集上的数据片和校验片，外加该对象的 `xl.meta`。单盘读写在 `crates/ecstore/src/disk/local.rs`，41897 行。Reed-Solomon 在 `crates/ecstore/src/erasure`，23572 行。片不超过预算时内联进该盘的 `xl.meta`，默认每片 `256 KiB / K`，上限 128 KiB；版本桶再除以 8 |
+| 名字怎么找到字节 | 索引值是 JSON，`v` 为 3。第 0 份的键是 `bucket/key`，第 i 份（i≥1）是 `bucket/key:i`。里面有 `nodeId`、`address`、`recId`，没有文件偏移。`recId` 是标签 `0x000E` 的 u64。compact 可以改块号和偏移，不改 `recId` | 对象哈希进某个纠删集，集内再落到各盘。位置不在另一套 KV 里。`xl.meta` 的编解码在 `crates/filemeta` |
+| 一次写 | 默认 3 份，法定人数是多数：3 份里要 2 份。同一段字节写到不同 `@zone`。引擎把记录追加进当前 `.blk`，写缓冲默认 1 MiB，flush 默认 fsync。凑够 2 份才写索引；没凑够就删掉这次已写的数据位置。放得进缓冲的对象默认 zstd，压不小则 `compressType=none`。超过 1 MiB 的原始 Put 按 1 MiB 交给 block，这种对象不压缩 | 1 MiB 一块做 Reed-Solomon，写入纠删集，凑够写 quorum 才对外成功。池的实现在 `crates/ecstore/src/core/pools.rs`，43162 行 |
+| 一次读 | 先取数据位置，跳过 down 的节点，按 `recId` 取记录。记录上的 CRC 是键字节接上正文。数据位置里的 `crc` 是压缩前正文的 CRC-32。对不上就试下一份。链式对象用标签 `0x0006` 的 `PREV` 指向上一条 extent 的 `recId`，最后一段 kind 为 3 | 至少 K 个片才能解出。bitrot 对不上时用其余片解码。缺片但读成功会排队修复。对象读写在 `crates/ecstore/src/set_disk/ops/object.rs`，30339 行 |
+| 校验放在哪 | 帧内 CRC-32 覆盖前 8 字节加全部标签，初值按 `crc32_update(0, …)` 计算，算法是 CRC-32/ISO-HDLC，反射多项式 `0xEDB88320`，与 zlib.crc32 相同。正文 CRC 另记在标签 `0x0004` 和数据位置里。kind：1 单条对象，2 中间 extent，3 最后一段，4 墓碑 | 分片上的 bitrot。读时核对。没人读过的盘由 `crates/scanner` 走一遍，缺片交给 `crates/heal` |
+| 副本是什么形状 | 三份是同一段逻辑字节的三份完整记录，不是条带，也不是纠删片。没有主副本。后写的数据位置覆盖先写的。删除先写 kind 4 的墓碑，避免扫描把已删对象救回来 | 一个纠删集里的数据片加校验片，不是三份完整对象。8 到 16 盘的集默认 4 个校验片。16 盘大约是 12 个数据片加 4 个校验片，可用容量大约四分之三，还要再扣元数据和修复余量。`EC:4` 是一个集里能缺 4 片，要看这些盘落在哪些机器上 |
+| 规模 | 每个可见对象至少一条数据位置，3 副本是 3 条键。`.blk` 的个数约等于字节数除以 1 GiB。单进程活记录停在 2^30−1。索引按 key 涨，不按块涨 | 每个对象或每个版本一份独立文件，小片再内联进 `xl.meta`。盘上的文件数随对象数涨。官方建议数据盘用 XFS，inode 512 字节 |
 
-s3dfs 把「对象很多」变成「KV 里很多数据位置 + 少量大文件」。RustFS 把「盘坏几块还能读」变成「一个纠删集上的 Reed-Solomon」，小对象再靠内联减轻独立文件的代价，但数据盘仍然要扛大量文件和目录项。这是两边最硬的差别，不要用同一套「小文件 IOPS」去理解两边。
+## 标准对照
 
-容量算法也不同。s3dfs 默认 3 副本，有效容量大约是裸容量的 1/3（只有一台 block 时有效副本是 1）。RustFS 在 8–16 盘的纠删集上默认 4 个校验片，16 盘大约是 75%（12 数据 + 4 校验），还要再扣文件系统、元数据、版本和 healing 的余量。`EC:4` 表示一个集里能缺 4 个片，不等于能扛 4 台整机故障，要看这些盘落在哪些机器上。
-
-## 代码分类
-
-`cloc` 数到的 Rust **代码行**是 173 万。下面按 `.rs` 文件的物理行分类，空行和注释都算在内，所以合计更大：`crates/` 与 `rustfs/` 里的 Rust 文件约 207 万行。依赖目录 `target/` 没有算进去。`scripts/` 另有约 7.0 万行 Python 和 5.5 万行 Shell，不在下表里。同一口径下，s3dfs 的 TypeScript、C 和文档不到 3 万行。
-
-这七类互不重叠，加起来就是约 207 万行。
-
-| 类别 | 物理行 | 里面是什么 |
+| 项 | s3dfs | RustFS |
 | --- | --- | --- |
-| 纠删和保住数据 | 77.8 万 | 磁盘、盘组、放置、池、远程磁盘、Reed-Solomon，再加上修复和后台扫描。编解码本身只有 2.4 万 |
-| 对外接口 | 49.8 万 | S3 请求路径 22.2 万，管理接口 14.5 万，表目录 5.9 万，FTPS / WebDAV / Swift / SFTP 4.6 万，S3 Select 2.6 万 |
-| 其余库 | 21.8 万 | 工具、管理客户端、协议定义、缓存、配置等没有单列的小库 |
-| 测试 | 16.9 万 | `crates/e2e_test` 和 `rustfs/tests`。没有产品实现。各目录里的单元测试还留在上面各类中 |
-| 桶上的规则 | 16.0 万 | 生命周期 5.2 万，复制 4.7 万，远程分层 3.4 万，配额与用量 2.5 万，对象锁库 0.2 万 |
-| 元数据、锁、通知、观测 | 13.0 万 | 文件元数据 2.8 万，分布式锁 1.8 万，事件通知 3.0 万，指标与审计 5.4 万 |
-| 身份与加密 | 11.7 万 | 用户、策略、Keystone、签名 5.8 万，KMS 5.9 万 |
+| 它解决什么 | 大量小对象的 S3。key 由调用方指定 | 通用 S3。用纠删换容量，并带 IAM、KMS、站点复制、对象锁、配额、审计和多种旁边的协议 |
+| 跑在哪 | 多台机器。API、dleveldb 索引、block 三种进程。故障域是 block 上的 `@zone` | 一组磁盘上的一个或一组 `rustfs` 进程。故障域是纠删集里的盘。控制台和 S3 在同一进程 |
+| 元数据 | 每个对象一条数据位置 JSON（v:3），在 dleveldb。Get 先问索引 | 每对象一份 `xl.meta`，和数据片在同一套盘上 |
+| 正文 | 追加进约 1 GiB 的 `.blk`。记录是 `S3R1` TLV。数据位置记节点和 `recId`，不记偏移 | 按纠删集切成片，写到各盘。大对象 1 MiB 一块编码 |
+| 名字 | `bucket/key`。第 i 份（i≥1）在 `bucket/key:i` | 调用方指定的桶和 key。放置由对象哈希决定 |
+| 冗余 | 默认同一份对象 3 份，落在不同 zone | 纠删。校验片能补上缺少的数据片 |
+| 写成功 | 3 份里 2 份 block 成功即写索引。第 3 份由修复补。任一条数据位置失败则删掉本次已写的数据位置 | 纠删集达到写 quorum。已有池的端点和集宽度不能改 |
+| 读和校验 | 读一份活副本。记录 CRC 和数据位置上的正文 CRC 对不上就换下一份 | 凑够数据片，并核对 bitrot |
+| 损坏之后 | 健康检查跳过 down 节点。`repair` 把不足的份数补到仍在线的节点，并去掉 down 的数据位置。一份都不活记 `lost` | `crates/heal` 用剩余片把缺的片写回去。`crates/scanner` 把没人读过的盘也排进修复。片不够解码时对象读不出来 |
+| 崩溃恢复 | `.blk` 里只承认完整记录。索引按法定人数写入。`recmap.s3m` 只是重启缓存，坏了就重扫 `.blk` | 未完成的写入按盘上的 `xl.meta` 和分片恢复。单盘删除恢复在 `crates/ecstore/src/disk/local/delete_recovery.rs` |
+| 扩容 | 新 block 只接新写入。旧数据位置留在原节点 | 多盘池只能在后面追加新 Pool。单盘部署不能原地扩成多盘，要新建集群再经 S3 迁数据 |
+| 某一刻 | 版本清单在索引，正文在 block 的 `$ver/`。对象锁打开后可以写保留期、法律保全，桶上也可以给新对象一个默认天数 | 版本写在 `xl.meta`。对象锁、保留期和法律保全在同一条产品路径上 |
+| 压缩与配额 | 默认 zstd，压不小则存原文。桶上可以设 `quotaBytes` | 服务端不默认把对象压小。桶配额和用量缓存在 `crates/data-usage`、`crates/object-capacity` |
+| 拷贝 | CopyObject 读出再写入。同集群可以先共享已有记录。送到另一套集群要另开复制规则，默认不送 | 服务端复制。站点复制会同步已有对象和之后的删除，并按对象记住送到入口在 `crates/replication` 和 `rustfs/src/site_replication` |
 
-目录对照如下。纠删那一行已经含磁盘、盘组和节点间调用，不再拆开相加。
+RustFS 自己写明还没对齐 AWS 的地方：桶访问日志和所有权控制仍在计划中；ACL 的 XML grant 返回 `NotImplemented`；POST Object 的校验和还不完整；S3 Select 只收未压缩输入；Access Point 形式的 copy-source 这些不记成 s3dfs 要补的洞。
 
-| 功能 | 物理行 | 目录 |
+## 代码量
+
+同一口径：物理行，空行和注释都算。RustFS 只算 `.rs`，不含 `vendor` 和 `target`。合计 206.8 万行。其中实现 1667868 行，测试文件 391153 行，生成代码 8980 行。`vendor/` 里另有约 2.3 万行，主要是 hyper，没有算进实现。s3dfs 的 TypeScript 和 C 约 3.1 万行，不含 Markdown。其中 `apps/api` 7688 行，`packages/control` 3906 行，`packages/engine` 4338 行。
+
+| | RustFS | s3dfs |
 | --- | --- | --- |
-| 纠删存储 | 56.5 万 | `crates/ecstore` 里的磁盘、盘组读写、放置、池、远程磁盘和 Reed-Solomon。编解码目录 `erasure` 只有 2.4 万，其余是围绕纠删集的磁盘和放置 |
-| 远程分层 | 3.4 万 | `crates/ecstore/src/services/tier`。把对象转到远端，不是纠删本身 |
-| 生命周期 | 5.2 万 | `crates/ecstore/src/bucket/lifecycle` 4.4 万，`crates/lifecycle` 0.7 万 |
-| 桶复制与站点复制 | 4.7 万 | `crates/ecstore/src/bucket/replication` 2.4 万，`crates/replication` 1.2 万，`rustfs/src/site_replication` 1.1 万 |
-| 配额与用量 | 2.5 万 | `crates/ecstore` 里的 quota 与 data_usage，加上 `crates/data-usage`、`crates/object-capacity` |
-| 对象锁目录 | 0.2 万 | `crates/ecstore/src/bucket/object_lock`。请求处理还在 `rustfs/src/app` |
-| 修复 | 9.0 万 | `crates/heal`。其中约 3.9 万在测试文件 |
-| 后台扫描 | 12.3 万 | `crates/scanner` 11.6 万（约一半在测试文件），`crates/scanner-metrics` 0.7 万 |
-| S3 请求路径 | 22.2 万 | `rustfs/src/app` 10.1 万，`rustfs/src/storage` 7.3 万，`rustfs/src/server` 4.9 万 |
-| 管理接口 | 14.5 万 | `rustfs/src/admin`。其中约 2.4 万在测试文件 |
-| 表目录 | 5.9 万 | `rustfs/src/table_catalog`。约 2.6 万在测试文件 |
-| 身份与策略 | 5.8 万 | `crates/iam`、`crates/policy`、`crates/keystone`、`crates/signer`、`crates/credentials`，以及 `rustfs/src/auth.rs` |
-| 加密 | 5.9 万 | `crates/kms` 5.7 万，`crates/crypto` 0.2 万。对象 SSE 接线在 `rustfs/src/storage`，已算进 S3 请求路径 |
-| 协议 | 4.6 万 | `crates/protocols` 3.8 万，`rustfs/src/protocols` 0.8 万。含 FTPS、WebDAV，以及可选的 Swift、SFTP |
-| 可观测与审计 | 5.4 万 | `crates/obs` 3.3 万，`crates/io-metrics` 1.6 万，`crates/audit` 0.4 万 |
-| 事件通知 | 3.0 万 | `crates/notify` 1.1 万，`crates/targets` 1.9 万 |
-| 文件元数据 | 2.8 万 | `crates/filemeta` |
-| S3 Select | 2.6 万 | `crates/s3select-api`、`crates/s3select-query` |
-| 分布式锁 | 1.8 万 | `crates/lock` |
-| 端到端测试 | 16.9 万 | `crates/e2e_test` 13.4 万，`rustfs/tests` 3.5 万。没有产品实现 |
+| 全部 `.rs` 或实现语言 | 206.8 万行 | TypeScript 和 C 约 3.1 万行 |
+| 去掉测试文件和生成代码 | 166.8 万 | 上面 3.1 万已经不含测试目录和生成代码 |
+| 纠删和磁盘格式 | 这一类 51.5 万。编解码目录只有 2.4 万 | 整份记录 4685 行：引擎 4338，block 的 HTTP 347 |
+| 池的实现文件 | `pools.rs` 43162 行 | 放置写在 `packages/control` 里，不单拆一个池文件 |
+| 单盘读写 | `local.rs` 41897 行 | 记录追加在 C 引擎里 |
+| 最大的单个文件 | `pools.rs` 43162 行 | 没有上万行的单文件 |
 
-单个文件仍可以到 3 万至 4 万行，例如 `crates/ecstore/src/core/pools.rs` 和 `crates/ecstore/src/disk/local.rs`。和 MinIO 同一套纠删盘格式的行数对照在 [minio.md](minio.md)。
+Reed-Solomon、CRC、HTTP 和序列化，Rust 都有库，RustFS 也接上了。没有库的是这种盘格式本身：片落在哪、`xl.meta` 怎么提交、池怎么扩。库的有无说明这条路径要自己写，说明不了池文件会到 4 万行。s3dfs 短在三份整对象、索引另放，以及 HTTP、CRC、AES 用 Node 自带的实现。
 
-## S3 与产品面
+## 源码各部分
 
-RustFS 文档列出的数据面包括：桶的创建、删除、列举和 location；对象的 Put / Get / Head / Copy / Delete / 批量删除、Range、条件请求和用户元数据；ListObjects 与 ListObjectsV2；分片上传的创建、上传、拷贝、列举、完成和中止；版本、生命周期、标签、校验和、Object Lock；IAM、桶策略、阻止公共访问、预签名 GET/PUT；CORS、桶通知、复制配置和服务端加密。SigV4 可用。README 另标可用：Swift（可选 feature）、Keystone、FTPS / WebDAV、SFTP（可选）、事件通知、审计、配额、多租户、KMS（生产可用 Vault 与 AWS KMS）、站点复制、远程 S3 分层、S3 Select、Helm。S3 Tables（Iceberg REST）和 MinIO 盘格式兼容是预览，默认构建不含后者。
+口径是实现行：`.rs` 的物理行，去掉测试文件和生成代码，不含 `vendor` 和 `target`。一个文件只进一行，所以下面 20 行相加是 1667868。s3dfs 是 TypeScript 和 C 的物理行，不含 `node_modules`、`dist`、`.next` 和 Markdown，合计约 3.1 万。表里的 s3dfs 数字不互相加。写着「没有单独目录」的能力已经算进 `apps/api` 或 `packages/control`。
 
-已知和 AWS / MinIO 不完全一样的地方（RustFS 自己写的）：桶访问日志和所有权控制还在计划中；ACL 授权故意不做，XML grant 返回 `NotImplemented`；POST Object 的校验和还不完整；S3 Select 目前只收未压缩输入；Access Point / Outposts 形式的 copy-source 没有。
+| 部分 | RustFS 行 | 为什么是这些行 | s3dfs 行 | 为什么是这些行 |
+| --- | --- | --- | --- | --- |
+| 纠删与盘 | 515332 | 对象要切成数据片和校验片，每片落到哪块盘、怎么读回来、小片何时内联进 `xl.meta`，都在 `crates/ecstore` 里算。`pools.rs` 43162 行，`local.rs` 41897 行，`set_disk/ops/object.rs` 30339 行，`store/init.rs` 30283 行。编解码目录只有 23572 行，其余是围绕纠删集的磁盘和放置 | 4685 | 正文是整份记录追加进 `.blk`，`packages/engine` 4338 行管记录、墓碑和 compact。`apps/block` 347 行把本机记录收成 HTTP。位置不写在盘上的元数据文件里，所以没有 `xl.meta` 这一层 |
+| S3 请求 | 146810 | `rustfs/src/app`、`storage`、`server` 把 Put、分片、拷贝、版本、条件和错误码写在一起，并接到加密、复制和配额。`app/object/get.rs` 12419 行，`server/http.rs` 10188 行。分片在 `set_disk/ops/multipart.rs`，那部分算在「纠删与盘」 | 7688 | `apps/api` 做调用方会碰到的动作：上传、读取、分片、拷贝、版本、过期、标签、对象锁。身份账本、按块封存和换密钥也写在这里，所以下面「身份」「加密」不另计行。带服务端加密的分片完成仍拼成一段，`aws-chunked` 仍整段缓冲 |
+| 管理、诊断与控制台 | 172526 | `rustfs/src/admin` 约 12.2 万行，管用户、修复、池、再平衡和配置。`admin/handlers/site_replication.rs` 16611 行是管理入口，复制状态本身在「复制」那一行。`rustfs/src/connect` 约 3.8 万行是诊断、许可和心跳。`crates/madmin` 约 1.2 万行是管理客户端的类型 | 730 | 管理动作是 flush、compact、repair、scrub、按一个节点 rebalance，写在 `apps/api` 里，没有另算行。控制台 `apps/web` 342 行只摆这几个按钮。巡检 `apps/patrol` 388 行把模块数字写成中文结论，不决定修不修 |
+| 修复、扫描、退役 | 118256 | 缺的是片，不是整份对象，所以要用剩下的片重算。`crates/scanner` 把没人读过的盘走一遍，并做用量、生命周期和复制的排队。`crates/heal` 写回缺片。测试文件已经从这行去掉，实现仍有 11.8 万行 | 3906 | `packages/control` 整包就是这些行，里面还有放置、配额和变更日志。`repair` 再写一整份对象。`scrub` 按数据位置核对 CRC。`drain` 把指定节点上的整份副本写到别的活节点。`bucketUsage` 按页把这个桶的逻辑字节加完。不重编码，也不做盘上的用量缓存 |
+| 节点互调 | 77497 | 纠删集上的节点要互相调读片、写片和修复。`crates/ecstore/src/cluster` 是远程盘，`remote_disk.rs` 13671 行。`rustfs/src/storage/rpc/node_service.rs` 13184 行。协议生成代码已经从这行去掉 | 347 | 字节只在 API 和 block 之间走。`apps/block` 提供本机记录的读和写，block 之间不互相调用 |
+| 加密与密钥 | 60949 | 同一对象要能走 SSE-S3、SSE-KMS、SSE-C，密钥接到本地、Vault KV2 或 Vault Transit，并且能轮换。`crates/kms` 是这层对接，对象上的封存在 `rustfs/src/storage/sse.rs`，9840 行 | 没有 KMS | 桶默认加密和请求上的 AES256 共用 `S3DFS_SSE_KEY`。超过 1 MiB 按约 1 MiB 一块封存。封存头带密钥代号，`S3DFS_SSE_KEY_PREVIOUS` 留着上一把时旧对象仍能打开。SSE-C 用调用方给的 32 字节。封存用 `node:crypto`，所以没有密钥管理包 |
+| 身份 | 54596 | 用户、组、服务账号、策略、临时凭证、LDAP、Keystone 要存、要校验、要过期。`crates/iam`、`crates/policy`、`crates/keystone`、`crates/signer` 是这份账本 | 没有单独目录 | 索引里有用户、组、策略、服务账号和 `assumeRole`。`S3DFS_ACCOUNTS` 仍可用。没有 LDAP、OpenID 和 Keystone |
+| 可观测、指标与审计 | 58269 | `crates/obs`、`crates/io-metrics`、`crates/audit` 把请求、磁盘和审计做成可拉取的记录。接到值班系统仍要人配 | 没有单独目录 | `GET /_s3dfs/metrics` 只计本进程状态码。访问是每个响应一行 JSON。配置了 `S3DFS_ALERT_URL` 才把 `lost` 和布局不 ok 送出去 |
+| 生命周期 | 60495 | 按规则删除、转移和清理非当前版本。`crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs` 17427 行。转移要判断对象能不能迁到远端 | 没有单独目录 | 按前缀和标签过期删除，按 `NoncurrentDays` 删掉非当前版本，并在删除标记成为唯一版本后清掉它。规则是索引里的一份 JSON，写在 `apps/api` 里。不把对象转到远端 |
+| 复制与站点 | 46875 | 站点复制要把桶配置和已有对象同步到另一套集群，并记住每个版本送到`crates/ecstore/src/bucket/replication` 含再同步，`replication_resyncer.rs` 10041 行。`crates/replication` 和 `rustfs/src/site_replication` 是状态和入口 | 没有单独目录 | 复制是桶上一个开关。打开之后，新的 Put 和 Delete 送到 `S3DFS_REPLICA_URL`。`replicationProgress` 只给两个数：已送出多少条，`$chg/` 里还剩多少条。不补旧对象，不记每条对象的复制状态 |
+| 分层与迁移 | 55872 | 对象可以迁到另一套 S3，热数据留下。`crates/ecstore/src/services/tier/tier.rs` 20065 行。`rustfs/src/on_demand_migration` 约 1.6 万行用来迁已有的纠删盘格式 | 0 | 对象留在这 3 份 block 上，不迁到另一套对象存储，也不读别人的盘格式 |
+| 文件与对象协议 | 39840 | 同一套盘再暴露 FTPS、WebDAV，以及可选的 Swift 和 SFTP。`crates/protocols` 是这些登录、目录和传输 | 0 | 入口只有 S3。目录挂载是 `apps/fuse` 3526 行，算在本表之外 |
+| 表目录 | 35332 | S3 Tables 和 Iceberg REST 的目录、提交和对象布局。`rustfs/src/table_catalog`。README 标为预览 | 0 | 没有表目录 |
+| S3 Select | 29339 | 在对象正文上跑一份 SQL，要有解析、求值和按行输出。`crates/s3select-api`、`crates/s3select-query`，再加上 `rustfs/src/app` 里的 select 入口。只收未压缩输入 | 0 | 读取按 key 把整段或一个 Range 交回去，不在服务端筛行 |
+| 通知 | 25861 | 事件要编成记录，再送到 webhook 或几种队列。`crates/notify` 是事件，`crates/targets` 是目的地 | 没有单独目录 | 按桶配置把 bucket 和 key 交给 webhook 或一个队列。事件结构就这几个字段，写在 `apps/api` 里 |
+| 配置与启动 | 24625 | 身份、通知、生命周期、分层、扫描各有自己的配置。`rustfs/src` 里一串 `startup_*.rs` 按顺序把这些子系统拉起来，失败要能停在明确的一步 | 没有配置子系统 | 份数、密钥、压缩、告警地址放在环境变量里。三种进程由 `scripts` 装起来，那 2076 行算在部署，不在这里单列 |
+| 盘上元数据 | 26225 | 每个对象一份 `xl.meta` 要能编码几何、校验和版本。`crates/filemeta` 是这份格式 | 2725 | 对象名在索引里。这 2725 行是 `packages/dleveldb` 本身，不是每对象一份盘上文件 |
+| 锁 | 16044 | 同一对象的分片不能同时写，节点之间用 `crates/lock` 抢锁 | 没有 dsync | 一次写在 3 份里成功 2 份再记索引，不锁住其他盘上的分片。保留期和法律保全只是索引里的一条记录 |
+| 校验 | 8515 | 多种校验和 ETag 的选择，加上 bitrot 自检。读片时的核对还写在纠删路径里，不完全在这行 | 不另写 | ETag 用 `node:zlib` 的 CRC32，需要时再用 `node:crypto` 的 SHA256。记录帧里的 CRC 在 C 引擎里，算在「纠删与盘」那一行的 4685 里 |
+| 工具、类型与运行时 | 94610 | `crates/utils`、`crates/s3-client`、类型、TLS、并发、网关适配和进程里的零散运行时。每份都不大，加在一起是这些行 | 不单列 | 同类的小函数写在正在用它的那个包里。HTTP 用 Nest，不再包一层自己的 HTTP 库 |
 
-s3dfs 的 Nest API（默认 :9000）现在能做：
+上面 20 行相加是 1667868。RustFS 长在自己写的盘格式、管理接口、扫描修复、密钥和复制状态上。s3dfs 短在三份整对象、索引另放，以及 HTTP、CRC、AES 用 Node 自带的实现。
 
-- Put / Get / Head / Delete / List（含 delimiter）、单个 Range、建桶、删空桶、CopyObject、虚拟主机风格 URL
-- 两个环境变量都设置时的 SigV4，以及预签名 URL。不设置则不鉴权。ETag 是整段正文的 CRC32，另有 `x-s3dfs-etag-algorithm: crc32`；`Content-MD5` 按 MD5 核对
-- `aws-chunked`（含 chunk signature）先解开再落盘。分片有创建、上传、ListParts、完成、中止；清单在索引里，分片正文在 block，重启还在。未加密的完成按段转发，带服务端加密时仍拼成一段再封口
-- 桶策略（Allow / Deny）、用户和组、默认 AES256 与 SSE-C、版本和删除标记、对象锁、桶配额、按前缀的天数过期、webhook 和一个队列
-- 按对象压缩、3 副本、宕机节点避让、活副本不足时补齐并退役 down 的数据位置、没有活副本时记为 `lost`、墓碑、扫描重建数据位置、空闲或手动 compact
+还有两块 s3dfs 有、这份 RustFS 树里没有对应目录。`apps/s3-gateway` 6222 行是用 C 再做一套 S3 入口。`apps/fuse` 3526 行把桶挂成目录。RustFS 的对象位置写在 `xl.meta` 里，已经算进「纠删与盘」和「盘上元数据」，所以它没有单独的索引进程。
 
-控制台仍是看统计、桶和 block 状态，并触发 flush。C S3 网关能解开 `aws-chunked`、做内存中的分片和删空桶；配了同一对密钥时校验请求头签名和预签名，不校验分块签名。未压缩对象的 Range 按偏移向 block 要那一段；压缩对象仍先整段解开。超过 1 MiB 的原始 Put 按块进入 block。多数副本写成功就提交索引，种子上的 `@zone` 用来避开同一故障域。每个响应带 `x-amz-request-id`。
+## 修复与运维
 
-这些和 RustFS 同名的能力，深度不一样。RustFS 的签名背后还能接 LDAP 和外部 KMS，复制会补送已有对象。s3dfs 的身份、加密、对象锁、配额和桶复制是第一版：没有 LDAP 和 KMS，复制默认关闭，也不补送盘上的旧对象。Nest API 已有条件请求、用户元数据和批量删除。
-
-还没做的部分见 [todo.md](../todo.md)，以及下一节按源码逐项列出的缺口。s3dfs 自己的写入路径上仍开着：带服务端加密的分片完成仍拼成一段、`aws-chunked` 仍整段缓冲、C 网关不校验分块签名。
-
-## 源码里有、s3dfs 还没有
-
-下面按 `rustfs/src/server/http.rs` 里的配置查询对照。访问日志和所有权控制，RustFS 自己写明还在计划中；ACL 的 XML grant 返回 `NotImplemented`。其余几项在 `rustfs/src/app` 或 `crates/` 里有对应模块。
-
-| 查询名 | RustFS 源码 | s3dfs |
+| 项 | s3dfs | RustFS |
 | --- | --- | --- |
-| tagging | `rustfs/src/app/object_meta/tagging.rs`，桶和对象标签 | `?tagging` 读写桶标签和对象标签。对象标签存在索引 `$tags/`，不进 `.blk` |
-| cors | `rustfs/src/server/cors.rs`，`rustfs/src/app/bucket_usecase.rs` 的 cors 模块 | `?cors` 保存规则。`OPTIONS` 按来源和方法回预检头 |
-| website | `rustfs/src/app/website.rs` | `?website` 保存索引、错误页和按前缀重定向。目录请求返回索引。对象不存在时返回错误页，状态仍是 404。命中前缀时返回配置的跳转状态和 `Location` |
-| replication | `crates/replication`，桶复制配置 | `?replication` 打开后，之后的 Put 和 Delete 才送到 `S3DFS_REPLICA_URL`。默认关闭。不补送已有对象。`replicationProgress` 只给已送和未送两个数 |
-| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | `?object-lock` 打开后才能设保留期和法律保全，打开后不能关掉。可以给新对象一个默认天数。GOVERNANCE 可用绕过头，法律保全不能 |
-| encryption | `crates/kms`：SSE-S3、SSE-KMS、SSE-C，后端可以是本地、Vault KV2、Vault Transit | 默认 AES256 和请求上的 AES256 共用 `S3DFS_SSE_KEY`。超过 1 MiB 按块封存。上一把密钥留着时旧对象仍能打开。SSE-C 用调用方的密钥。没有 KMS |
-| inventory | `rustfs/src/connect/inventory` | `?inventory` 保存一份 CSV 配置。`POST` 立刻把当前对象写成 `前缀/id.csv`。没有按天调度 |
-| requestPayment、accelerate、intelligent-tiering、analytics、metrics | 路由接了这些查询名 | 没有 |
-| publicAccessBlock | 路由接了这个查询名 | `?publicAccessBlock` 打开后，拒绝资源为 `*` 或 `/*` 的 Allow 策略 |
-| logging、ownershipControls | 路由接了；README 写明还在计划中 | 没有 |
-| acl | 路由接了；授权故意不做，XML grant 返回 `NotImplemented` | 没有 |
+| 自我修复 | 活副本不足时，周期任务或 `POST /_s3dfs/repair` 再写一份，并去掉指向 down 节点的数据位置。一份都不活就记 `lost`，健康检查失败，不编造正文。没有测过恢复时间上限 | `crates/heal` 用剩余片把缺的片写回。片不够解码时不会编造正文 |
+| 自运维 | 探活、flush、compact、repair 按周期跑。巡检规则在副本不足、空洞过高或有未落盘字节时执行对应动作；配置了扩容命令且负载持续高时才扩容。换盘、搬走旧数据位置、缩容和重启只记下来。`lost` 写在 `$lost/`，重启后还在。未关闭的故障事件仍在进程内存里 | 扫描和后台修复自己跑。换盘、追加 pool、升级要人排。已有纠删集的宽度不能改 |
+| AI 辅助检查 | 规则先做维护。本机模型只把七个模块的数字写成中文结论，并留下能和上一轮比较的 HTML。模型不读对象正文，不删除，不重启，不缩容。关掉模型时规则简报还在。模型不决定修不修 | 健康和修复是进程里的数字，不是模型结论 |
+| 静默损坏巡检 | Get 时核对记录 CRC 和数据位置里的正文 CRC，不对就换一份副本。`scrub` 按数据位置重写坏副本并把检查数留在索引里，不把没有索引的 `.blk` 再读一遍 | 读路径核对 bitrot。`crates/scanner` 会处理没人读过的片，并留下扫描指标 |
+| 告警与升级 | 未恢复事件进巡检决定，简报写出要看的节点。配置了 `S3DFS_ALERT_URL` 才把 `lost` 和布局不 ok 送出去。升级顺序写在部署文档里，不自动跳版本 | `crates/obs` 提供指标，接到值班系统要人配。升级是替换二进制，没有自动跳版本 |
 
-身份、分层和旁边的协议不在这四个查询里，源码是独立 crate：
+## 省心与数据保护
 
-| 能力 | RustFS 源码 | s3dfs |
+这一节写值班的人和数据本身。修复与运维一节是修复做到哪一档。这里写人可以不碰什么、人仍然必须碰什么，以及写下去、读出来、删错、整机丢失和另一场地各保护到哪。
+
+| 项 | s3dfs | RustFS |
 | --- | --- | --- |
-| IAM | `crates/iam`：用户、组、服务账号、策略、LDAP、多因素 | 索引里有用户、组、策略、服务账号和 `assumeRole`。根密钥和 `S3DFS_ACCOUNTS` 仍可用。没有 LDAP 和多因素 |
-| OIDC | README 标可用，认证走 IAM 旁边的登录 | 没有 |
-| Keystone | `crates/keystone` | 没有 |
-| 桶配额 | README 标可用；用量在 `crates/data-usage`、`crates/object-capacity` | 管理接口可以设 `quotaBytes`。没有 S3 的桶配额查询 |
-| 生命周期分层 | `crates/lifecycle` 含转移到远端 S3 的准入；scanner 负责到期和转移 | 按前缀和标签过期删除，按 `NoncurrentDays` 删掉非当前版本，并在删除标记成为唯一版本后清掉它。不把对象转到远端。`GET ?usage` 返回对象个数和字节 |
-| 站点复制 | `crates/replication` 与 `.docker/test/site-replication` | 桶复制开关只送之后的 Put 和 Delete。不补送已有对象，也不做整集群对写 |
-| S3 Select | `crates/s3select-api`、`crates/s3select-query`。README 写明只收未压缩输入 | 没有 |
-| 审计 | `crates/audit` | 没有。访问日志是每个响应一行 JSON |
-| 可观测性 | `crates/obs`、`crates/io-metrics` | `GET /_s3dfs/metrics` 只计本进程状态码 |
-| 事件通知 | `crates/notify` | `targets` 里可以有多个 webhook，每个地址用自己的 `events`。也可以交给一个队列。事件里是 bucket 和 key |
-| 多租户 | README 标可用 | 没有 |
-| Swift | `crates/protocols` 的 swift，编译 feature，默认不进 | 没有 |
-| FTPS、WebDAV | 默认 feature：`ftps`、`webdav` | 没有。挂载是自带的 `s3dfs-fuse` |
-| SFTP | 可选 feature | 没有 |
-| Helm | `helm/` | 没有。部署脚本会生成 Kubernetes 清单 |
-| S3 Tables | README 标为预览 | 没有 |
-| TLS | `crates/tls-runtime`，进程自己可以终止 TLS | 证书在反向代理上 |
+| 值班可以不碰 | 一台 block 宕了，不用改客户端，也不用手工指定另一台。读会换活副本，新的 Put 不再选这台。周期 repair 把第 3 份补上，并去掉指向 down 节点的数据位置。flush 和 compact 到了阈值自己跑。巡检先给四段简报，人看「值班下一步」，不必先从七个模块的原始数字里找 | 一块盘掉了，只要纠删集还凑得齐，读和写可以继续。后台修复把缺的片写到还在的盘上。客户端仍用原来的 S3 地址 |
+| 值班仍要碰 | 换盘，并把盘装回原来的 nodeId。确认 `lost` 里的对象是不是业务唯一的一份。在真正承接流量的集群上做演练。没配扩容命令时，加机器是人做的。旧对象不会自己搬到新 block。索引达不到法定人数，或三份正文都没了，没有按钮能把字节变出来 | 换盘、追加 pool、看一个集是不是已经失去法定人数。站点复制、对象锁和 KMS 要单独配置。升级要人替换进程 |
+| 写下去 | 默认 3 个 zone 里至少 2 台 block 落盘，才把数据位置写入索引。第 3 份可以稍后补。这次的数据位置没有写齐，已经写下的会删掉，调用方看不到半份。索引还要达到 dleveldb 的法定人数 | 纠删集达到写 quorum 才对调用方成功。没有凑够就不会把半套分片当成对象 |
+| 读出来 | Get 按数据位置找还活着的节点，核对大小和 CRC，不对就换下一份。Head 在节点暂时不可达时可以用索引里的 size、crc、mtime，那是没有把正文读出来核对 | 凑够数据片并核对 bitrot。片不够就读失败，不返回一段对不上的正文 |
+| 删错和覆盖 | Delete 后索引里立刻看不见。盘上先留墓碑，compact 才收回空间。保留期没到或法律保全开着时，删除被拒绝。开了版本时，旧正文在同一组 block 的 `$ver/` 里，不是另一场地的备份 | 删除和版本在 `xl.meta`。对象锁打开后，保留期和法律保全会挡住删除。这些版本仍在这一套盘上 |
+| 整机或整盘没了 | 丢一台、对象还有活副本时，读可以继续；还有空闲节点就再补一份。三份都在丢了的盘上，或当时只写成一份且那份没了，记为 `lost`，健康检查失败，字节补不回来。`lost` 写在 `$lost/`，重启后还在 | 丢的盘不超过该纠删集的校验片能力时，对象还能读，修复会补片。丢的盘超过这个能力，这一集上的对象读不出来。新 pool 不替旧集承担故障 |
+| 另一场地 | 3 副本仍是这一套集群里的三台 block。桶上打开复制并配置了 `S3DFS_REPLICA_URL` 之后，之后的 Put 和 Delete 才送到另一套。默认不送，也不补送已经在盘上的旧对象。第一次送出之前，已送和未送都是 0；送出之后能读出这两个数 | 站点复制要单独打开。打开后会同步已有对象和之后的删除，并且按对象记住送到不开启时，分片只在这一套磁盘上 |
 
-数据放置是另一条路线，不把缺的接口补上就能对齐：
+## 哪些能放进 s3dfs
 
-| 能力 | RustFS 源码 | s3dfs |
+实现行 166.8 万里，有三笔性质不同。
+
+纠删盘格式大约 51.5 万行，再加上节点互调 7.7 万、锁 1.6 万、盘上元数据 2.6 万。这些行存在，是因为对象被切成片，名字和字节都在盘上，一次读要向多块盘要片。s3dfs 的名字在索引里，正文是整份记录。把这几十万行搬过来，等于改掉现在的放置。
+
+旁边的产品面是 KMS、LDAP、Keystone、Select、表目录、FTPS、WebDAV、Swift、SFTP、远端分层，以及管理接口里只为这套进程准备的诊断和许可。这些接口没有让三份整对象更安全。
+
+第三笔是运维上比「只有 3 份副本」更完整的地方：一台节点离开、大对象加密、换密钥、用量、复制进度。这五点当前代码里已经有了。拿的是结果。RustFS 把同一结果写成了扫描器、密钥库和按对象的复制状态。下面按这个分。
+
+### 已经放进来的
+
+身份账本在索引里：用户、组、策略、服务账号、`assumeRole`。Deny 压过 Allow，过期和停用都拒绝。根密钥和 `S3DFS_ACCOUNTS` 还在。桶可以默认 AES256，SSE-C 用调用方的密钥。复制是一个开关，打开后新的 Put 和 Delete 才送到另一套，默认关闭。通知是 webhook 加一个队列，事件里只有 bucket 和 key。对象锁可以给新对象一个默认保留期。`scrub` 按数据位置重写坏副本，并把检查数留在索引里。标签、CORS、静态网站、一次性清单和公共访问阻止也已有第一版。
+
+这五点也已经在：
+
+| 机制 | RustFS 为什么写了那么多 | 当前 s3dfs |
 | --- | --- | --- |
-| 冗余 | `crates/ecstore`、`crates/ecstore/src/erasure`，Reed-Solomon | 默认 3 份整对象副本。纠删不替换 `.blk` |
-| 没人读过的数据 | `crates/scanner` 后台扫用量、生命周期、复制和 bitrot，并排队 `crates/heal` | `scrub` 按数据位置重写坏副本并把检查数留在索引里。不扫没有索引的字节。Get 时仍会换一份好副本 |
-| 扩容 | 存储池在后面追加，已有纠删集宽度不能改 | 加 block 机器。旧对象不自动搬到新机器。`drain(nodeId)` 要人调用，才把这一台上面的份写到别的活节点 |
+| 一台节点离开 | 片的宽度不能变，搬走等于按集重编码。再平衡在 `crates/ecstore/src/services/rebalance`，约 1.5 万行，还含在「纠删与盘」里 | `drain(nodeId)` 从一份活副本再写到别的活节点，然后从数据位置去掉它。份数仍是配置的数。不调用就不动 |
+| 加密和上传是同一条路 | 封存做在对象流上。`sse.rs` 9840 行，长的是旁边 5 万行的 KMS | 超过 1 MiB 且带 AES256 的 Put 按约 1 MiB 一块封存，Get 读出原文。未标明加密的对象仍是明文。不接 KMS |
+| 密钥可以换 | 轮换要改每条对象的片和 `xl.meta`，并接到 Vault 或外部 KMS | 新封存头带密钥代号。当前密钥换成第二把、`S3DFS_SSE_KEY_PREVIOUS` 留着第一把时，旧对象仍能打开。没有代号的旧 `S3E1` 对象先试当前密钥，再试上一把。不因此重写 `.blk` |
+| 用量是算完的数 | 名字在各块盘上，所以 `crates/scanner` 和 `crates/data-usage` 把列表和字节数做成缓存 | 名字已经在索引里。`bucketUsage` 按页扫完这个桶的数据位置，把可见对象的逻辑字节加总。`stats` 的对象数也不再停在 10 万条。不扫没有索引的字节 |
+| 复制能看见进度 | 4.7 万行是因为每一版都要记「送到没有」，还要补送已有对象，两边还可以对写 | `replicationProgress` 只给两个数：已送出多少条，`$chg/` 里还剩多少条。第一次 `sendChanges` 之前两个数都是 0。不补送已经在盘上的旧对象 |
 
-## 可靠性对照
+这些都不要再做成 RustFS 的样子。身份不接 LDAP 和 Keystone。复制不补送盘上的旧对象，也不给每个对象做一套状态。通知不改成多种队列。换密钥不接外部 KMS，也不把全部对象重写一遍。
 
-| | s3dfs | RustFS |
-| --- | --- | --- |
-| 静默损坏 | 记录带 CRC-32；Get 对副本做大小和 CRC 校验，不匹配就试下一份 | bitrot 保护；读时校验，缺片则在 K 个片够用时解码，并排队修复 |
-| 盘或节点挂了 | 健康检查后读写跳过 down 节点。后台或 `POST /_s3dfs/repair` 把不足的副本再写到空闲节点，并去掉已经 down 的数据位置。没有任何活副本时记为 `lost`，补不回来 | healing / scanner。写、读都看 quorum |
-| 删和覆盖 | 立刻对用户不可见。盘上先留洞，墓碑防止扫描把已删对象救回来。compact 重写活记录并保留原 `recId`，不改索引 | 版本、Object Lock、生命周期是产品功能；对象文件由 scanner 和 ILM 管 |
-| 索引挂了 | 可以扫 `.blk` 重建数据位置。多个索引地址时，当前地址失败会改写下一条。剩余副本达到法定人数时 dleveldb 继续写入，节点回来后按较新的 mtime 追平 | 元数据和数据片在同一套盘上，没有单独的小索引集群 |
+### 不拿
 
-## 不照搬的部分
+一次 Get 如果必须让数据节点互相调用，那就是纠删网格里的事。网格、分布式锁、盘上的 `xl.meta`、内联进元数据，都属于这一类。默认冗余继续是 3 份整对象。纠删能把可用容量从大约三分之一提高到大约四分之三，那是另一条小对象继续打进 `.blk`，不改成一对象一文件。
 
-- 不要把默认冗余改成纠删码来对齐 RustFS。3 副本和打包块是小对象路径的选择；纠删码适合大对象和容量效率，编码、修复和读放大都另一套。若要做，应是另一种存储类，而不是替换 `.blk`。
-- 不要改成一对象一文件。那是 s3dfs 故意避开的本地文件系统上限。RustFS 用内联和 XFS inode 尺寸缓解，s3dfs 用大块文件去掉这个问题。
-- 「源码里有、s3dfs 还没有」里的 Swift、Keystone、SFTP、Iceberg REST、多租户和纠删，不因此改默认路径，也不挡上线八项。AWS CLI 主路径上还缺的是单次 Put 的有界缓冲，以及在目标集群上做索引演练。
-- RustFS README 里「Rust 更安全、别的语言有 GC / 泄漏」一类对比，不拿来当 s3dfs 的结论。s3dfs 热路径在 C 引擎里，控制面在 TypeScript。
+只为了多一种入口而存在的协议也不拿。FTPS、WebDAV、Swift、SFTP 是第二套文件协议。S3 Select、表目录、远端分层、多租户和进程内 TLS 是这套产品面。身份、加密、配额和通知已经有自己的形状。
+
+Helm 不是部署前提。Kubernetes 使用普通清单。语言和运行时的比较不作为选型结论：热路径在 C 引擎，控制面在 TypeScript。
+
+容量、片修复和「一个进程包办全部磁盘」是 RustFS 的选择。s3dfs 用索引换掉盘上的列表，用整份副本换掉片重建，用 Node 的 HTTP、CRC 和 AES 换掉再写一层库。上面那五点补的是离开一台、封存、换密钥、用量和复制进度，不是把 166.8 万行里剩下的文件再抄一遍。
+
+## 总结
+
+本篇供容量规划和产品取舍使用。s3dfs 面向大量小对象，默认以三份完整副本保存正文，三份中的两份落盘后即对业务返回成功，读取一份即可。可用容量按裸盘的约三分之一规划。RustFS 以纠删把可用容量提高到大约四分之三，元数据与分片放在同一套盘上。s3dfs 维持现有放置，不改为纠删，也不把元数据改成每对象一份盘上文件。
+
+实现行 166.8 万里，最大的一块是纠删盘格式，其次是管理、扫描修复和密钥。运维上已经纳入当前版本的，是有序退出一台数据节点、大对象加密、密钥轮换后仍能读取旧对象、桶用量一次算完，以及复制进度的已送与未送。身份、对象锁、桶配额和通知亦有第一版。外部密钥服务、目录服务、整集群补送和文件传输协议不进入交付范围。
+
+业务数据的唯一副本，以准备承接流量的集群完成容量测量和故障演练为准。本篇的功能对照不提前关闭该条件。

@@ -11,7 +11,7 @@ export {
   blockTombstone,
 } from './block-client.js';
 export { NodeRegistry, parseBlockNodes, parseIndexUrls, type SeedNode } from './registry.js';
-export { ObjectCluster, assessLayout, serviceHealthy, strictLayoutEnabled, tightestDisks, writeQuorum, type ClusterStats, type LayoutReport, type RepairReport } from './cluster.js';
+export { ObjectCluster, assessLayout, serviceHealthy, strictLayoutEnabled, tightestDisks, writeQuorum, type ClusterStats, type LayoutReport, type MaintenanceLeave, type RepairReport } from './cluster.js';
 export { PUT_CHUNK_BYTES, relayChunks } from './stream.js';
 export { LAYOUT_FILE_NAME, s3dfsLayout, writeLayoutFile } from './layout.js';
 export {

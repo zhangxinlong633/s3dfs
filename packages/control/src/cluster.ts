@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone, blockWriteBegin } from './block-client.js';
 import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
-import { CHANGE_PREFIX, LOST_PREFIX, isVisibleObjectKey, locatorKey, lostKey, usageKey } from './keys.js';
+import { CHANGE_PREFIX, LOST_PREFIX, MAINT_PREFIX, MAINTENANCE_MS, isVisibleObjectKey, locatorKey, lostKey, maintKey, usageKey } from './keys.js';
 import type { IndexClient } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
 import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
@@ -118,6 +118,13 @@ export interface RepairReport {
   skipped: number;
   failed: number;
   lost: number;
+}
+
+export interface MaintenanceLeave {
+  nodeId: string;
+  reason: string;
+  leftAtMs: number;
+  untilMs: number;
 }
 
 export interface ClusterStats {
@@ -785,6 +792,7 @@ export class ObjectCluster {
    */
   async repair(opts: { maxObjects?: number } = {}): Promise<RepairReport> {
     await this.registry.checkAll();
+    const paused = await this.maintenanceHolds(Date.now());
     const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0, lost: 0 };
     const maxObjects = Math.max(1, opts.maxObjects ?? Number.MAX_SAFE_INTEGER);
     let startAfter: string | undefined;
@@ -803,7 +811,7 @@ export class ObjectCluster {
           continue;
         }
         report.scanned++;
-        const result = await this.repairObject(obj.key);
+        const result = await this.repairObject(obj.key, paused);
         report[result]++;
         if (report.scanned >= maxObjects) {
           break;
@@ -817,7 +825,7 @@ export class ObjectCluster {
     return report;
   }
 
-  private async repairObject(objectKey: string): Promise<'alreadyOk' | 'repaired' | 'skipped' | 'failed' | 'lost'> {
+  private async repairObject(objectKey: string, paused: Set<string>): Promise<'alreadyOk' | 'repaired' | 'skipped' | 'failed' | 'lost'> {
     const parts = splitObjectKey(objectKey);
     if (!parts) {
       return 'skipped';
@@ -828,13 +836,18 @@ export class ObjectCluster {
     }
     const live = this.registry.live();
     const wanted = Math.min(this.dataReplicas, live.length);
-    const liveLocs = locs.filter((loc) => live.some((n) => n.nodeId === loc.nodeId));
-    const downLocs = locs.filter((loc) => !live.some((n) => n.nodeId === loc.nodeId));
+    const liveIds = new Set(live.map((node) => node.nodeId));
+    const liveLocs = locs.filter((loc) => liveIds.has(loc.nodeId));
+    const away = locs.filter((loc) => paused.has(loc.nodeId) && !liveIds.has(loc.nodeId));
+    const downLocs = locs.filter((loc) => !liveIds.has(loc.nodeId) && !paused.has(loc.nodeId));
     if (liveLocs.length === 0) {
+      if (away.length > 0) {
+        return 'skipped';
+      }
       await this.noteLost(objectKey);
       return 'lost';
     }
-    if (liveLocs.length >= wanted && downLocs.length === 0) {
+    if (downLocs.length === 0 && (liveLocs.length >= wanted || liveLocs.length + away.length >= this.dataReplicas)) {
       await this.clearLost(objectKey);
       return 'alreadyOk';
     }
@@ -1289,6 +1302,72 @@ export class ObjectCluster {
       startAfter = listed.objects[listed.objects.length - 1]!.key;
     }
     return { objects, bytes };
+  }
+
+  /** Step a block node out for two hours. Copies stay put and the reason is kept in the index. */
+  async leaveForMaintenance(nodeId: string, reason: string, now = Date.now()): Promise<MaintenanceLeave> {
+    const text = reason.trim();
+    if (!text) {
+      throw new ControlError('BAD_REQUEST', 'maintenance reason is required');
+    }
+    if (!this.registry.get(nodeId)) {
+      throw new ControlError('BAD_REQUEST', `unknown block node ${nodeId}`);
+    }
+    const leave: MaintenanceLeave = { nodeId, reason: text, leftAtMs: now, untilMs: now + MAINTENANCE_MS };
+    await this.kv.put(maintKey(nodeId), Buffer.from(JSON.stringify(leave)));
+    this.registry.noteDraining(nodeId, true);
+    return leave;
+  }
+
+  async maintenanceLeaves(now = Date.now()): Promise<MaintenanceLeave[]> {
+    const holds = await this.maintenanceHolds(now);
+    const out: MaintenanceLeave[] = [];
+    for (const nodeId of holds) {
+      const raw = await this.kv.get(maintKey(nodeId));
+      if (!raw) {
+        continue;
+      }
+      try {
+        out.push(JSON.parse(raw.value.toString('utf8')) as MaintenanceLeave);
+      } catch {
+        // A torn record is not shown.
+      }
+    }
+    return out;
+  }
+
+  private async maintenanceHolds(now: number): Promise<Set<string>> {
+    const holds = new Set<string>();
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: MAINT_PREFIX, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        const raw = await this.kv.get(obj.key);
+        if (!raw) {
+          continue;
+        }
+        let leave: MaintenanceLeave;
+        try {
+          leave = JSON.parse(raw.value.toString('utf8')) as MaintenanceLeave;
+        } catch {
+          continue;
+        }
+        if (!leave.nodeId || leave.untilMs <= now) {
+          await this.kv.delete(obj.key);
+          if (leave.nodeId) {
+            this.registry.noteDraining(leave.nodeId, false);
+          }
+          continue;
+        }
+        holds.add(leave.nodeId);
+        this.registry.noteDraining(leave.nodeId, true);
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    return holds;
   }
 
   /**

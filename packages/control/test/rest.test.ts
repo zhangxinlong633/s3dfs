@@ -59,6 +59,7 @@ function open() {
   const bodies = new Map<string, Buffer>();
   const calls: string[] = [];
   const bad = new Set<string>();
+  const down = new Set<string>();
   const previous = globalThis.fetch;
   globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
@@ -82,6 +83,9 @@ function open() {
       return new Response(JSON.stringify({ ...extent, size: body.length || 4, recId: calls.length }), { status: 200 });
     }
     if (u.endsWith('/health')) {
+      if (down.has(address)) {
+        return new Response('down', { status: 500 });
+      }
       return new Response(JSON.stringify({ ok: true }), { status: 200 });
     }
     if (u.includes('/get')) {
@@ -103,6 +107,7 @@ function open() {
     calls,
     bodies,
     bad,
+    down,
     restore: () => {
       globalThis.fetch = previous;
     },
@@ -339,6 +344,46 @@ describe('remaining designs', () => {
         { deletes: true },
       );
       expect(removed).toContain('logs/a.txt');
+    } finally {
+      box.restore();
+    }
+  });
+
+  test('a node can leave for maintenance without copying its replica away', async () => {
+    const box = open();
+    try {
+      const registry = new NodeRegistry(box.kv, [
+        { nodeId: 'a', address: '10.0.0.1:9100', zone: 'z1' },
+        { nodeId: 'b', address: '10.0.0.2:9100', zone: 'z2' },
+        { nodeId: 'c', address: '10.0.0.3:9100', zone: 'z3' },
+      ]);
+      const cluster = new ObjectCluster(box.kv, registry, 3, 'none');
+      await cluster.put('logs', 'a.txt', Buffer.from('keep'));
+      box.down.add('10.0.0.1:9100');
+      const leave = await cluster.leaveForMaintenance('a', '更换系统盘');
+      expect(leave.reason).toBe('更换系统盘');
+      expect(leave.untilMs - leave.leftAtMs).toBe(2 * 60 * 60 * 1000);
+      const during = await cluster.repair();
+      expect(during.repaired).toBe(0);
+      const mates: string[] = [];
+      for (const replica of [0, 1, 2]) {
+        const raw = await box.kv.get(replica === 0 ? 'logs/a.txt' : `logs/a.txt:${replica}`);
+        if (raw) {
+          mates.push((JSON.parse(raw.value.toString('utf8')) as { nodeId: string }).nodeId);
+        }
+      }
+      expect(mates).toContain('a');
+      await cluster.leaveForMaintenance('a', '更换系统盘', Date.now() - 2 * 60 * 60 * 1000 - 1);
+      const after = await cluster.repair();
+      expect(after.repaired).toBe(1);
+      const remain: string[] = [];
+      for (const replica of [0, 1, 2]) {
+        const raw = await box.kv.get(replica === 0 ? 'logs/a.txt' : `logs/a.txt:${replica}`);
+        if (raw) {
+          remain.push((JSON.parse(raw.value.toString('utf8')) as { nodeId: string }).nodeId);
+        }
+      }
+      expect(remain).not.toContain('a');
     } finally {
       box.restore();
     }

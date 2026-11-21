@@ -10,11 +10,13 @@ import {
   parseIndexUrls,
   strictLayoutEnabled,
   type ClusterStats,
+  type MaintenanceLeave,
   type RepairReport,
 } from '@s3dfs/control';
 import { IndexConfigStore, IndexUploadStore } from '../s3/index-store';
 import { MultipartUploads } from '../s3/multipart';
 import { applyLifecycle } from '../s3/product';
+import { alertBodies, postAlerts } from '../s3/alerts';
 import { deliverCare, emptyCareState, markCareDelivered, reviewCare, type CareIncident, type CareState } from '../s3/care';
 import { compactSnapshot, executePatrol, reviewPatrol, type PatrolReport, type PatrolSnapshot } from '../s3/patrol';
 import {
@@ -192,6 +194,12 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   rebalance(nodeId: string) {
     return this.cluster.rebalance(nodeId);
+  }
+
+  async leaveForMaintenance(nodeId: string, reason: string): Promise<MaintenanceLeave> {
+    const leave = await this.cluster.leaveForMaintenance(nodeId, reason);
+    await postAlerts(process.env.S3DFS_ALERT_URL, alertBodies({ lostKeys: [], layoutOk: true, maintenance: [leave] }));
+    return leave;
   }
 
   shareCopy(srcBucket: string, srcKey: string, dstBucket: string, dstKey: string): Promise<boolean> {

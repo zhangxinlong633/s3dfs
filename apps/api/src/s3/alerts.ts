@@ -1,10 +1,13 @@
-export function alertBodies(input: { lostKeys: string[]; layoutOk: boolean; reasons?: string[] }): string[] {
+export function alertBodies(input: { lostKeys: string[]; layoutOk: boolean; reasons?: string[]; maintenance?: { nodeId: string; reason: string }[] }): string[] {
   const bodies: string[] = [];
   for (const key of input.lostKeys) {
     bodies.push(`lost ${key}`);
   }
   if (!input.layoutOk) {
     bodies.push(`layout ${input.reasons?.join(',') || 'not ok'}`);
+  }
+  for (const leave of input.maintenance ?? []) {
+    bodies.push(`maintenance ${leave.nodeId} ${leave.reason}`);
   }
   return bodies;
 }

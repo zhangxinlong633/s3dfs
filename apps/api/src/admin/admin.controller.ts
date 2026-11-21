@@ -72,6 +72,18 @@ export class AdminController {
     return { ok: true, report: await this.engine.scrub() };
   }
 
+  @Post('maintenance')
+  async maintenance(@Req() req: Request) {
+    this.allow(req);
+    const url = new URL(req.originalUrl || req.url, 'http://127.0.0.1');
+    const nodeId = url.searchParams.get('nodeId') ?? '';
+    const reason = url.searchParams.get('reason') ?? '';
+    if (!nodeId || !reason.trim()) {
+      return { ok: false, error: 'nodeId and reason are required' };
+    }
+    return { ok: true, leave: await this.engine.leaveForMaintenance(nodeId, reason) };
+  }
+
   @Post('rebalance')
   async rebalance(@Req() req: Request) {
     this.allow(req);
