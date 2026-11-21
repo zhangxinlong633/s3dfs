@@ -3,6 +3,7 @@ import { randomBytes } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { ControlError, serviceHealthy } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
+import { alertBodies, postAlerts } from './alerts';
 import { handleS3, type S3Options } from './handle';
 import type { AccessAccount } from './product';
 import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
@@ -101,6 +102,7 @@ export class S3Controller {
         const zones = this.engine.zoneDisks();
         const ok = serviceHealthy(indexOk, layout, lost);
         status = ok ? 200 : 503;
+        void postAlerts(process.env.S3DFS_ALERT_URL, alertBodies({ lostKeys, layoutOk: layout.ok, reasons: layout.reasons })).catch(() => undefined);
         res.status(status).json({ indexOk, lost, lostKeys, zones, ...layout, layout, ok });
         return;
       }
