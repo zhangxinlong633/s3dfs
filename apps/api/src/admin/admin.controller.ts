@@ -9,7 +9,13 @@ export class AdminController {
 
   @Get('stats')
   async stats() {
-    return this.engine.stats();
+    const stats = await this.engine.stats();
+    return {
+      ...stats,
+      layout: this.engine.layout(),
+      lost: this.engine.lostCount(),
+      zones: this.engine.zoneDisks(),
+    };
   }
 
   @Get('cluster')
@@ -82,6 +88,44 @@ export class AdminController {
       return { ok: false, error: 'nodeId and reason are required' };
     }
     return { ok: true, leave: await this.engine.leaveForMaintenance(nodeId, reason) };
+  }
+
+  @Post('drain')
+  async drain(@Req() req: Request) {
+    this.allow(req);
+    const url = new URL(req.originalUrl || req.url, 'http://127.0.0.1');
+    const nodeId = url.searchParams.get('nodeId') ?? '';
+    if (!nodeId) {
+      return { ok: false, error: 'missing nodeId' };
+    }
+    return { ok: true, report: await this.engine.drain(nodeId) };
+  }
+
+  @Post('patrol')
+  async patrol(@Req() req: Request) {
+    this.allow(req);
+    return this.engine.patrol();
+  }
+
+  @Post('patrol/summary')
+  async patrolSummary(@Req() req: Request & { rawBody?: Buffer }) {
+    this.allow(req);
+    const raw = req.rawBody?.toString('utf8') ?? '';
+    let summary = '';
+    if (raw) {
+      try {
+        summary = String((JSON.parse(raw) as { summary?: string }).summary ?? '');
+      } catch {
+        summary = raw;
+      }
+    }
+    return this.engine.notePatrolSummary(summary);
+  }
+
+  @Get('decisions')
+  async decisions(@Req() req: Request) {
+    this.allow(req);
+    return this.engine.decisions();
   }
 
   @Post('rebalance')

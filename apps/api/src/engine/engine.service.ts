@@ -207,6 +207,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     return this.cluster.rebalance(nodeId);
   }
 
+  drain(nodeId: string) {
+    return this.cluster.drain(nodeId);
+  }
+
   async leaveForMaintenance(nodeId: string, reason: string): Promise<MaintenanceLeave> {
     const leave = await this.cluster.leaveForMaintenance(nodeId, reason);
     await postAlerts(process.env.S3DFS_ALERT_URL, alertBodies({ lostKeys: [], layoutOk: true, maintenance: [leave] }));

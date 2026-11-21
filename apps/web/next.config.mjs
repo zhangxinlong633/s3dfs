@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  allowedDevOrigins: ['127.0.0.1'],
   experimental: {
     // TypeScript 7 has no lib/typescript.js; Next 16 typechecks via tsc.
     useTypeScriptCli: true,
