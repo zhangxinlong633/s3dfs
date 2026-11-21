@@ -83,7 +83,18 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     await this.registry.checkAll();
     const interval = Number(process.env.S3DFS_HEALTH_INTERVAL_MS ?? 5000);
     this.timer = setInterval(() => {
-      void this.registry.checkAll();
+      void this.registry
+        .checkAll()
+        .then(async () => {
+          const returned = await this.cluster.admitReturns();
+          if (returned.length > 0) {
+            await postAlerts(
+              process.env.S3DFS_ALERT_URL,
+              returned.map((item) => `online ${item.nodeId} kept ${item.kept} removed ${item.removed}`),
+            );
+          }
+        })
+        .catch(() => undefined);
     }, interval);
     this.timer.unref();
     const repairEvery = Number(process.env.S3DFS_REPAIR_INTERVAL_MS ?? 30_000);
@@ -273,6 +284,12 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   async repair(): Promise<RepairReport> {
     const report = await this.cluster.repair();
     this.lastRepair = report;
+    if (report.returned.length > 0) {
+      await postAlerts(
+        process.env.S3DFS_ALERT_URL,
+        report.returned.map((item) => `online ${item.nodeId} kept ${item.kept} removed ${item.removed}`),
+      );
+    }
     return report;
   }
 

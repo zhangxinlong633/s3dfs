@@ -60,6 +60,7 @@ function open() {
   const calls: string[] = [];
   const bad = new Set<string>();
   const down = new Set<string>();
+  const scans = new Map<string, { key: string; locator: { recId: number } }[]>();
   const previous = globalThis.fetch;
   globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
@@ -98,6 +99,9 @@ function open() {
       const value = start !== null && end !== null ? stored.subarray(Number(start), Number(end) + 1) : stored;
       return new Response(value, { status: 200 });
     }
+    if (u.includes('/scan')) {
+      return new Response(JSON.stringify(scans.get(address) ?? []), { status: 200 });
+    }
     return new Response('no', { status: 500 });
   }) as typeof fetch;
   return {
@@ -108,6 +112,7 @@ function open() {
     bodies,
     bad,
     down,
+    scans,
     restore: () => {
       globalThis.fetch = previous;
     },
@@ -384,6 +389,49 @@ describe('remaining designs', () => {
         }
       }
       expect(remain).not.toContain('a');
+      expect(box.calls.some((url) => url.includes('10.0.0.1:9100') && url.includes('/delete'))).toBe(false);
+      box.down.delete('10.0.0.1:9100');
+      await cluster.repair();
+      expect(box.calls.some((url) => url.includes('10.0.0.1:9100') && url.includes('/delete'))).toBe(true);
+    } finally {
+      box.restore();
+    }
+  });
+
+  test('a returning node tells the index, and cleanup follows what is still referenced', async () => {
+    const box = open();
+    try {
+      const registry = new NodeRegistry(box.kv, [
+        { nodeId: 'a', address: '10.0.0.1:9100', zone: 'z1' },
+        { nodeId: 'b', address: '10.0.0.2:9100', zone: 'z2' },
+        { nodeId: 'c', address: '10.0.0.3:9100', zone: 'z3' },
+      ]);
+      const cluster = new ObjectCluster(box.kv, registry, 3, 'none');
+      await cluster.put('logs', 'a.txt', Buffer.from('keep'));
+      const live = (await cluster.locators('logs/a.txt')).find((loc) => loc.nodeId === 'a');
+      expect(live).toBeTruthy();
+      box.down.add('10.0.0.1:9100');
+      await cluster.leaveForMaintenance('a', '重启');
+      box.scans.set('10.0.0.1:9100', [{ key: 'logs/a.txt', locator: { recId: live!.recId } }]);
+      await box.kv.put('$back/a', Buffer.from(JSON.stringify({ nodeId: 'a', address: '10.0.0.1:9100', atMs: 1 })));
+      const back = await cluster.repair();
+      expect(back.returned).toEqual([{ nodeId: 'a', kept: 1, removed: 0 }]);
+      expect(box.calls.some((url) => url.includes('10.0.0.1:9100') && url.includes('/delete'))).toBe(false);
+      expect(await box.kv.get('$back/a')).toBeNull();
+      expect(registry.get('a')?.status).toBe('up');
+      expect(registry.get('a')?.draining).toBe(false);
+
+      box.down.add('10.0.0.1:9100');
+      await cluster.leaveForMaintenance('a', '更换系统盘', Date.now() - 2 * 60 * 60 * 1000 - 1);
+      await cluster.repair();
+      const gone = (await cluster.locators('logs/a.txt')).find((loc) => loc.nodeId === 'a');
+      expect(gone).toBeUndefined();
+      box.scans.set('10.0.0.1:9100', [{ key: 'logs/a.txt', locator: { recId: live!.recId } }, { key: 'logs/old', locator: { recId: 99 } }]);
+      await box.kv.put('$back/a', Buffer.from(JSON.stringify({ nodeId: 'a', address: '10.0.0.1:9100', atMs: 2 })));
+      box.calls.length = 0;
+      const again = await cluster.repair();
+      expect(again.returned[0]?.removed).toBe(2);
+      expect(box.calls.filter((url) => url.includes('10.0.0.1:9100') && url.includes('/delete'))).toHaveLength(2);
     } finally {
       box.restore();
     }

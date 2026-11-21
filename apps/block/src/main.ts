@@ -3,7 +3,7 @@ import { statfsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
-import { IndexClient, nodeKey, parseIndexUrls, writeLayoutFile, type BlockNodeInfo } from '@s3dfs/control';
+import { IndexClient, nodeKey, parseIndexUrls, writeLayoutFile, BACK_PREFIX, type BlockNodeInfo } from '@s3dfs/control';
 import { Store } from '@s3dfs/engine';
 
 const dataDir = path.resolve(process.env.S3DFS_DATA_DIR ?? './data/block');
@@ -110,7 +110,7 @@ function snapshot(): BlockNodeInfo & { stats: ReturnType<Store['stats']>; freeBy
   };
 }
 
-async function announce(): Promise<void> {
+async function announce(back: boolean): Promise<void> {
   if (!kv) {
     return;
   }
@@ -122,6 +122,12 @@ async function announce(): Promise<void> {
   };
   try {
     await kv.put(nodeKey(nodeId), Buffer.from(JSON.stringify(info)));
+    if (back) {
+      await kv.put(
+        `${BACK_PREFIX}${nodeId}`,
+        Buffer.from(JSON.stringify({ nodeId, address: advertise, atMs: Date.now() })),
+      );
+    }
   } catch (err) {
     console.warn(`block ${nodeId}: index announce failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -302,7 +308,7 @@ const flushTimer = setInterval(() => {
 flushTimer.unref();
 
 const healthTimer = setInterval(() => {
-  void announce();
+  void announce(false);
 }, healthInterval);
 healthTimer.unref();
 
@@ -328,7 +334,7 @@ const compactTimer =
 
 server.listen(port, host, () => {
   console.log(`s3dfs block ${nodeId} listening on ${host}:${port} (advertise ${advertise}, data ${dataDir})`);
-  void announce();
+  void announce(true);
 });
 
 const shutdown = () => {

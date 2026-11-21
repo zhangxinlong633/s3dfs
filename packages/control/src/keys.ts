@@ -12,6 +12,12 @@ export const MAINT_PREFIX = '$maint/';
 
 export const MAINTENANCE_MS = 2 * 60 * 60 * 1000;
 
+/** Bytes that left the index while their block node was away. Swept after it returns. */
+export const GC_PREFIX = '$gc/';
+
+/** A block node just started and asked the index to look at its disks. */
+export const BACK_PREFIX = '$back/';
+
 export function lostKey(objectKey: string): string {
   return `${LOST_PREFIX}${objectKey}`;
 }

@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
-import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone, blockWriteBegin } from './block-client.js';
+import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockScan, blockTombstone, blockWriteBegin } from './block-client.js';
 import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
-import { CHANGE_PREFIX, LOST_PREFIX, MAINT_PREFIX, MAINTENANCE_MS, isVisibleObjectKey, locatorKey, lostKey, maintKey, usageKey } from './keys.js';
+import { BACK_PREFIX, CHANGE_PREFIX, GC_PREFIX, LOST_PREFIX, MAINT_PREFIX, MAINTENANCE_MS, isVisibleObjectKey, locatorKey, lostKey, maintKey, usageKey } from './keys.js';
 import type { IndexClient } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
 import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
@@ -118,6 +118,8 @@ export interface RepairReport {
   skipped: number;
   failed: number;
   lost: number;
+  /** Nodes that announced they are back. kept records still match the index; removed records did not. */
+  returned: { nodeId: string; kept: number; removed: number }[];
 }
 
 export interface MaintenanceLeave {
@@ -792,8 +794,10 @@ export class ObjectCluster {
    */
   async repair(opts: { maxObjects?: number } = {}): Promise<RepairReport> {
     await this.registry.checkAll();
+    const returned = await this.admitReturns();
     const paused = await this.maintenanceHolds(Date.now());
-    const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0, lost: 0 };
+    await this.sweepGarbage();
+    const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0, lost: 0, returned };
     const maxObjects = Math.max(1, opts.maxObjects ?? Number.MAX_SAFE_INTEGER);
     let startAfter: string | undefined;
     while (report.scanned < maxObjects) {
@@ -921,6 +925,12 @@ export class ObjectCluster {
       keep[i]!.replicaCount = keep.length;
       await this.kv.put(locatorKey(objectKey, i), Buffer.from(JSON.stringify(keep[i])));
     }
+    for (const loc of locs) {
+      if (keep.some((item) => item.nodeId === loc.nodeId && item.recId === loc.recId)) {
+        continue;
+      }
+      await this.releaseOrQueue(loc, objectKey);
+    }
     await this.clearLost(objectKey);
     return downLocs.length > 0 || accepted.length > 0 ? 'repaired' : 'alreadyOk';
   }
@@ -1035,6 +1045,185 @@ export class ObjectCluster {
       await blockTombstone(loc.address, loc.dataKey ?? objectKey);
     } else {
       await this.kv.put(storage, Buffer.from(String(next)));
+    }
+  }
+
+  /** Tombstone a copy the index no longer names. A down node keeps a ticket until it returns. */
+  private async releaseOrQueue(loc: ObjectLocator, objectKey: string): Promise<void> {
+    if (this.registry.isDown(loc.nodeId)) {
+      await this.queueGc(loc, objectKey);
+      return;
+    }
+    try {
+      await this.releaseLocator(loc, objectKey);
+    } catch {
+      await this.queueGc(loc, objectKey);
+    }
+  }
+
+  private async queueGc(loc: ObjectLocator, objectKey: string): Promise<void> {
+    const ticket = {
+      nodeId: loc.nodeId,
+      address: loc.address,
+      recId: loc.recId,
+      dataKey: loc.dataKey ?? objectKey,
+      objectKey,
+    };
+    await this.kv.put(`${GC_PREFIX}${loc.nodeId}/${loc.recId}`, Buffer.from(JSON.stringify(ticket)));
+  }
+
+  /**
+   * A block node wrote `$back/<nodeId>` after opening its disks.
+   * Records whose recId is still in the index are kept. The rest are tombstoned.
+   */
+  async admitReturns(): Promise<{ nodeId: string; kept: number; removed: number }[]> {
+    const notices: { key: string; nodeId: string; address: string }[] = [];
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: BACK_PREFIX, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        const raw = await this.kv.get(obj.key);
+        if (!raw) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(raw.value.toString('utf8')) as { nodeId?: string; address?: string };
+          if (parsed.nodeId && parsed.address) {
+            notices.push({ key: obj.key, nodeId: parsed.nodeId, address: parsed.address });
+          }
+        } catch {
+          // A torn notice is left for the next pass.
+        }
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    if (notices.length === 0) {
+      return [];
+    }
+    const referenced = await this.referencedRecs();
+    const reports: { nodeId: string; kept: number; removed: number }[] = [];
+    for (const notice of notices) {
+      let records: { key: string; locator: { recId?: number } }[];
+      try {
+        records = await blockScan(notice.address);
+      } catch {
+        continue;
+      }
+      const known = this.registry.get(notice.nodeId);
+      await this.registry.upsert({
+        nodeId: notice.nodeId,
+        address: notice.address,
+        status: 'up',
+        lastSeenMs: Date.now(),
+        zone: known?.zone,
+        draining: false,
+      });
+      this.registry.noteDraining(notice.nodeId, false);
+      await this.kv.delete(maintKey(notice.nodeId));
+      let kept = 0;
+      let removed = 0;
+      for (const record of records) {
+        const recId = record.locator?.recId ?? 0;
+        if (!recId) {
+          continue;
+        }
+        if (referenced.has(`${notice.nodeId}/${recId}`)) {
+          kept++;
+          await this.kv.delete(`${GC_PREFIX}${notice.nodeId}/${recId}`);
+          continue;
+        }
+        try {
+          await blockTombstone(notice.address, record.key);
+          removed++;
+          await this.kv.delete(`${GC_PREFIX}${notice.nodeId}/${recId}`);
+        } catch {
+          // Leave any ticket in place and try on the next announce.
+        }
+      }
+      await this.kv.delete(notice.key);
+      reports.push({ nodeId: notice.nodeId, kept, removed });
+    }
+    return reports;
+  }
+
+  private async referencedRecs(): Promise<Set<string>> {
+    const referenced = new Set<string>();
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: '', startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        if (!isVisibleObjectKey(obj.key) && !obj.key.includes('/$ver/')) {
+          continue;
+        }
+        const locs = await this.locators(obj.key);
+        for (const loc of locs) {
+          referenced.add(`${loc.nodeId}/${loc.recId}`);
+        }
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    return referenced;
+  }
+
+  private async sweepGarbage(): Promise<void> {
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: GC_PREFIX, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        const raw = await this.kv.get(obj.key);
+        if (!raw) {
+          continue;
+        }
+        let ticket: { nodeId: string; address: string; recId: number; dataKey: string; objectKey: string };
+        try {
+          ticket = JSON.parse(raw.value.toString('utf8')) as typeof ticket;
+        } catch {
+          continue;
+        }
+        if (this.registry.isDown(ticket.nodeId)) {
+          continue;
+        }
+        const live = await this.locators(ticket.objectKey);
+        if (live.some((loc) => loc.nodeId === ticket.nodeId && loc.recId === ticket.recId)) {
+          await this.kv.delete(obj.key);
+          continue;
+        }
+        try {
+          await this.releaseLocator(
+            {
+              v: 3,
+              replica: 0,
+              replicaCount: 1,
+              nodeId: ticket.nodeId,
+              address: ticket.address,
+              recId: ticket.recId,
+              chained: false,
+              generation: 1,
+              extentCount: 1,
+              size: 0,
+              storedSize: 0,
+              compressType: 'none',
+              crc: 0,
+              mtimeMs: 0,
+              dataKey: ticket.dataKey,
+            },
+            ticket.objectKey,
+          );
+          await this.kv.delete(obj.key);
+        } catch {
+          // The node blinked. The ticket stays for the next pass.
+        }
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
     }
   }
 
@@ -1223,6 +1412,7 @@ export class ObjectCluster {
           keep[i] = { ...keep[i]!, replica: i, replicaCount: keep.length };
           await this.kv.put(locatorKey(obj.key, i), Buffer.from(JSON.stringify(keep[i])));
         }
+        await this.releaseOrQueue(retired, obj.key);
         moved++;
         bytes += got.value.length;
       }
@@ -1421,6 +1611,7 @@ export class ObjectCluster {
             mtimeMs: ev.mtimeMs,
           };
           await this.kv.put(locatorKey(obj.key, loc.replica), Buffer.from(JSON.stringify(replaced)));
+          await this.releaseOrQueue(loc, obj.key);
           const idx = locs.findIndex((item) => item.replica === loc.replica);
           if (idx >= 0) {
             locs[idx] = replaced;

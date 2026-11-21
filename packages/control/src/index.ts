@@ -28,6 +28,7 @@ export {
   type ScaleRole,
 } from './scale.js';
 export {
+  BACK_PREFIX,
   NODE_PREFIX,
   isNodeKey,
   isReplicaLocatorKey,
