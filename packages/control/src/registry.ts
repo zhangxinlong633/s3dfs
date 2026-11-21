@@ -104,6 +104,7 @@ export class NodeRegistry {
             lastSeenMs: Date.now(),
             zone: node.zone,
             draining: node.draining,
+            freeBytes: health.freeBytes,
           }
         : {
             ...node,

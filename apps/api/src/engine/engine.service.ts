@@ -166,6 +166,38 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     return this.cluster.lostCount();
   }
 
+  syncLost(): Promise<number> {
+    return this.cluster.syncLost();
+  }
+
+  zoneDisks() {
+    return this.cluster.zoneDisks();
+  }
+
+  setBucketLimits(bucket: string, limits: { quotaBytes?: number; compress?: boolean }): Promise<void> {
+    return this.cluster.setBucketLimits(bucket, limits);
+  }
+
+  listChanges() {
+    return this.cluster.listChanges();
+  }
+
+  lostKeys(): Promise<string[]> {
+    return this.cluster.lostKeys();
+  }
+
+  scrub() {
+    return this.cluster.scrub();
+  }
+
+  rebalance(nodeId: string) {
+    return this.cluster.rebalance(nodeId);
+  }
+
+  shareCopy(srcBucket: string, srcKey: string, dstBucket: string, dstKey: string): Promise<boolean> {
+    return this.cluster.shareCopy(srcBucket, srcKey, dstBucket, dstKey);
+  }
+
   incident(id: string): CareIncident | undefined {
     return this.incidents.get(id);
   }

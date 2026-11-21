@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockTombstone, blockWriteBegin } from './block-client.js';
 import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
-import { isVisibleObjectKey, locatorKey } from './keys.js';
+import { CHANGE_PREFIX, LOST_PREFIX, isVisibleObjectKey, locatorKey, lostKey, usageKey } from './keys.js';
 import type { IndexClient } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
 import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
@@ -72,6 +72,37 @@ export function assessLayout(
   };
 }
 
+/** Logical bytes covered by one segment checksum. */
+export const SEGMENT_BYTES = 64 * 1024;
+
+export function segmentCrcs(value: Buffer, segmentBytes = SEGMENT_BYTES): number[] {
+  const out: number[] = [];
+  for (let start = 0; start < value.length; start += segmentBytes) {
+    out.push(crc32(value.subarray(start, Math.min(value.length, start + segmentBytes))));
+  }
+  return out.length > 0 ? out : [crc32(value)];
+}
+
+/** Writable bytes in a zone are the smaller disk. A second, larger disk does not raise that number. */
+export function tightestDisks(
+  nodes: { zone?: string; status?: string; freeBytes?: number }[],
+): { zone: string; writableBytes: number; uneven: boolean }[] {
+  const byZone = new Map<string, number[]>();
+  for (const node of nodes) {
+    if (node.status === 'down' || !node.zone || typeof node.freeBytes !== 'number') {
+      continue;
+    }
+    const sizes = byZone.get(node.zone) ?? [];
+    sizes.push(node.freeBytes);
+    byZone.set(node.zone, sizes);
+  }
+  return [...byZone.entries()].map(([zone, sizes]) => {
+    const writableBytes = Math.min(...sizes);
+    const biggest = Math.max(...sizes);
+    return { zone, writableBytes, uneven: biggest > 0 && writableBytes * 2 <= biggest };
+  });
+}
+
 export function serviceHealthy(indexOk: boolean, layout: LayoutReport, lost: number): boolean {
   return indexOk && (!layout.strict || layout.ok) && lost === 0;
 }
@@ -105,6 +136,18 @@ export interface ClusterStats {
   compressType: CompressType;
 }
 
+function parseLocator(value: Buffer): ObjectLocator | null {
+  try {
+    const parsed = JSON.parse(value.toString('utf8')) as ObjectLocator;
+    if (parsed.v !== 3 || typeof parsed.recId !== 'number' || typeof parsed.address !== 'string') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 export class ObjectCluster {
   constructor(
     private readonly kv: IndexClient,
@@ -114,9 +157,63 @@ export class ObjectCluster {
   ) {}
 
   private lostTotal = 0;
+  private changeSeq = 0;
 
   lostCount(): number {
     return this.lostTotal;
+  }
+
+  /** Count lost keys in the index. A new process starts at 0 until this runs. */
+  async syncLost(): Promise<number> {
+    let count = 0;
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: LOST_PREFIX, startAfter, maxKeys: 1000 });
+      count += listed.objects.length;
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    this.lostTotal = count;
+    return count;
+  }
+
+  zoneDisks(): { zone: string; writableBytes: number; uneven: boolean }[] {
+    return tightestDisks(this.registry.list());
+  }
+
+  async listChanges(): Promise<{ op: string; bucket: string; key: string; mtimeMs: number }[]> {
+    const out: { op: string; bucket: string; key: string; mtimeMs: number }[] = [];
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: CHANGE_PREFIX, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        const raw = await this.kv.get(obj.key);
+        if (!raw) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(raw.value.toString('utf8')) as { op: string; bucket: string; key: string; mtimeMs: number };
+          out.push({ op: parsed.op, bucket: parsed.bucket, key: parsed.key, mtimeMs: parsed.mtimeMs });
+        } catch {
+          // Skip a torn journal record.
+        }
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    return out;
+  }
+
+  async setBucketLimits(bucket: string, limits: { quotaBytes?: number; compress?: boolean }): Promise<void> {
+    await this.createBucket(bucket);
+    const markerKey = this.objectKey(bucket);
+    const raw = await this.kv.get(markerKey);
+    const prev = raw ? (JSON.parse(raw.value.toString('utf8')) as Record<string, unknown>) : { v: 1, kind: 'bucket', mtimeMs: Date.now() };
+    await this.kv.put(markerKey, Buffer.from(JSON.stringify({ ...prev, ...limits })));
   }
 
   objectKey(bucket: string, key?: string): string {
@@ -129,11 +226,15 @@ export class ObjectCluster {
       throw new ControlError('BLOCK_UNAVAILABLE', layout.reasons.join('; '));
     }
     const objectKey = this.objectKey(bucket, key);
-    const packed = compressValue(value, this.compressType);
+    const previous = await this.locators(objectKey);
+    const oldSize = previous[0]?.size ?? 0;
+    await this.assertQuota(bucket, value.length - oldSize);
+    const blockKey = (await this.heldByOthers(previous)) ? `$obj/${Date.now().toString(36)}-${this.changeSeq + 1}` : objectKey;
+    const packed = compressValue(value, await this.compressFor(bucket));
     const digest = crc32(value);
     const targets = this.registry.pick(objectKey, this.dataReplicas);
     const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
-    const writes = await Promise.allSettled(targets.map((n) => blockPut(n.address, objectKey, packed.stored, meta)));
+    const writes = await Promise.allSettled(targets.map((n) => blockPut(n.address, blockKey, packed.stored, meta)));
     const accepted: { nodeId: string; address: string; recId: number; chained: boolean; generation: number; extentCount: number; storedSize: number; mtimeMs: number }[] = [];
     for (let i = 0; i < writes.length; i++) {
       const result = writes[i]!;
@@ -177,6 +278,9 @@ export class ObjectCluster {
           compressType: packed.compressType,
           crc: digest,
           mtimeMs: ev.mtimeMs,
+          segments: segmentCrcs(value),
+          segmentBytes: SEGMENT_BYTES,
+          ...(blockKey === objectKey ? {} : { dataKey: blockKey }),
         };
         const indexKey = locatorKey(objectKey, i);
         await this.kv.put(indexKey, Buffer.from(JSON.stringify(loc)));
@@ -186,6 +290,13 @@ export class ObjectCluster {
       await Promise.all(written.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
       throw err;
     }
+    if (blockKey !== objectKey) {
+      for (const loc of previous) {
+        await this.releaseShare(loc);
+      }
+    }
+    await this.addUsage(bucket, value.length - oldSize);
+    await this.noteChange('put', bucket, key);
   }
 
   /**
@@ -270,15 +381,21 @@ export class ObjectCluster {
     if (!primaryRaw) {
       return [];
     }
-    const primary = JSON.parse(primaryRaw.value.toString('utf8')) as ObjectLocator;
-    const count = Math.max(1, primary.replicaCount ?? 1);
-    const out: ObjectLocator[] = [primary];
+    const primary = parseLocator(primaryRaw.value);
+    const count = Math.max(primary?.replicaCount ?? 3, 1);
+    const out: ObjectLocator[] = [];
+    if (primary) {
+      out.push(primary);
+    }
     for (let i = 1; i < count; i++) {
       const raw = await this.kv.get(locatorKey(objectKey, i));
       if (!raw) {
         continue;
       }
-      out.push(JSON.parse(raw.value.toString('utf8')) as ObjectLocator);
+      const parsed = parseLocator(raw.value);
+      if (parsed) {
+        out.push(parsed);
+      }
     }
     return out;
   }
@@ -294,10 +411,13 @@ export class ObjectCluster {
   async get(bucket: string, key: string): Promise<ObjectValue | null> {
     const objectKey = this.objectKey(bucket, key);
     const locs = this.prefer(await this.locators(objectKey));
+    if (locs.some((loc) => (loc.segments?.length ?? 0) > 1)) {
+      return this.readSegments(objectKey, locs);
+    }
     let last: unknown;
     for (const loc of locs) {
       try {
-        const got = await blockGet(loc.address, objectKey, loc);
+        const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc);
         if (!got) {
           continue;
         }
@@ -347,7 +467,7 @@ export class ObjectCluster {
     let last: unknown;
     for (const loc of locs) {
       try {
-        const got = await blockGet(loc.address, objectKey, loc, { start, end });
+        const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc, { start, end });
         if (!got) {
           continue;
         }
@@ -377,10 +497,13 @@ export class ObjectCluster {
     if (locs.length === 0) {
       return false;
     }
-    await Promise.allSettled(locs.map((loc) => blockTombstone(loc.address, objectKey)));
+    await Promise.allSettled(locs.map((loc) => this.releaseLocator(loc, objectKey)));
+    const size = locs[0]?.size ?? 0;
     for (const loc of locs) {
       await this.kv.delete(locatorKey(objectKey, loc.replica));
     }
+    await this.addUsage(bucket, -size);
+    await this.noteChange('delete', bucket, key);
     return true;
   }
 
@@ -649,9 +772,11 @@ export class ObjectCluster {
     const liveLocs = locs.filter((loc) => live.some((n) => n.nodeId === loc.nodeId));
     const downLocs = locs.filter((loc) => !live.some((n) => n.nodeId === loc.nodeId));
     if (liveLocs.length === 0) {
+      await this.noteLost(objectKey);
       return 'lost';
     }
     if (liveLocs.length >= wanted && downLocs.length === 0) {
+      await this.clearLost(objectKey);
       return 'alreadyOk';
     }
     const held = new Set(liveLocs.map((loc) => loc.nodeId));
@@ -662,17 +787,30 @@ export class ObjectCluster {
       if (targets.length === 0) {
         return 'failed';
       }
-      const got = await this.get(parts.bucket, parts.key);
-      if (!got) {
+      const source = liveLocs[0]!;
+      if (source.size > 1_048_576) {
+        for (const node of targets) {
+          try {
+            accepted.push(await this.copyRanges(objectKey, source, node));
+          } catch {
+            // A later target can still satisfy the missing copy.
+          }
+        }
+        if (accepted.length === 0) {
+          return 'failed';
+        }
+      }
+      const got = accepted.length > 0 ? null : await this.get(parts.bucket, parts.key);
+      if (accepted.length === 0 && !got) {
         return 'failed';
       }
-      const packed = compressValue(got.value, this.compressType);
-      const digest = got.crc || crc32(got.value);
-      for (const node of targets) {
+      const packed = got ? compressValue(got.value, this.compressType) : null;
+      const digest = got ? got.crc || crc32(got.value) : source.crc;
+      for (const node of accepted.length > 0 ? [] : targets) {
         try {
-          const ev = await blockPut(node.address, objectKey, packed.stored, {
-            compressType: packed.compressType,
-            origSize: got.value.length,
+          const ev = await blockPut(node.address, source.dataKey ?? objectKey, packed!.stored, {
+            compressType: packed!.compressType,
+            origSize: got!.value.length,
             origCrc: digest,
           });
           accepted.push({
@@ -685,11 +823,14 @@ export class ObjectCluster {
             chained: ev.chained,
             generation: ev.generation,
             extentCount: ev.extentCount,
-            size: got.value.length,
+            size: got!.value.length,
             storedSize: ev.size,
-            compressType: packed.compressType,
+            compressType: packed!.compressType,
             crc: digest,
             mtimeMs: ev.mtimeMs,
+            segments: source.segments,
+            segmentBytes: source.segmentBytes,
+            dataKey: source.dataKey,
           });
         } catch {
           // A later target can still satisfy the missing copy.
@@ -708,7 +849,378 @@ export class ObjectCluster {
       keep[i]!.replicaCount = keep.length;
       await this.kv.put(locatorKey(objectKey, i), Buffer.from(JSON.stringify(keep[i])));
     }
+    await this.clearLost(objectKey);
     return downLocs.length > 0 || accepted.length > 0 ? 'repaired' : 'alreadyOk';
+  }
+
+  private async copyRanges(
+    objectKey: string,
+    source: ObjectLocator,
+    node: { nodeId: string; address: string },
+  ): Promise<ObjectLocator> {
+    const writer = await blockWriteBegin(node.address, source.dataKey ?? objectKey);
+    const chunk = 1_048_576;
+    for (let start = 0; start < source.size; start += chunk) {
+      const end = Math.min(source.size, start + chunk) - 1;
+      const part = await blockGet(source.address, source.dataKey ?? objectKey, source, { start, end });
+      if (!part) {
+        await writer.abort();
+        throw new ControlError('BLOCK_UNAVAILABLE', `missing range ${start} of ${objectKey}`);
+      }
+      await writer.write(part.value);
+    }
+    const ev = await writer.finish({ compressType: source.compressType, origSize: source.size, origCrc: source.crc });
+    return {
+      v: 3,
+      replica: 0,
+      replicaCount: 0,
+      nodeId: node.nodeId,
+      address: node.address,
+      recId: ev.recId,
+      chained: ev.chained,
+      generation: ev.generation,
+      extentCount: ev.extentCount,
+      size: source.size,
+      storedSize: ev.size,
+      compressType: source.compressType,
+      crc: source.crc,
+      mtimeMs: ev.mtimeMs,
+      segments: source.segments,
+      segmentBytes: source.segmentBytes,
+      dataKey: source.dataKey,
+    };
+  }
+
+  private async readSegments(objectKey: string, locs: ObjectLocator[]): Promise<ObjectValue | null> {
+    const sample = locs.find((loc) => (loc.segments?.length ?? 0) > 1);
+    if (!sample?.segments) {
+      return null;
+    }
+    const span = sample.segmentBytes || SEGMENT_BYTES;
+    const parts: Buffer[] = [];
+    for (let i = 0; i < sample.segments.length; i++) {
+      const start = i * span;
+      const end = Math.min(sample.size, start + span) - 1;
+      let piece: Buffer | null = null;
+      for (const loc of locs) {
+        const expect = loc.segments?.[i] ?? sample.segments[i]!;
+        try {
+          const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc, { start, end });
+          if (got && crc32(got.value) === expect) {
+            piece = got.value;
+            break;
+          }
+        } catch {
+          // Try the next replica for this segment only.
+        }
+      }
+      if (!piece) {
+        throw new ControlError('BLOCK_UNAVAILABLE', `segment ${i} failed for ${objectKey}`);
+      }
+      parts.push(piece);
+    }
+    const value = Buffer.concat(parts);
+    return { value, size: value.length, crc: sample.crc, mtimeMs: sample.mtimeMs, compressType: sample.compressType };
+  }
+
+  private refStorageKey(loc: ObjectLocator): string {
+    return `$ref/${loc.nodeId}/${loc.recId}`;
+  }
+
+  private async heldByOthers(locs: ObjectLocator[]): Promise<boolean> {
+    for (const loc of locs) {
+      const raw = await this.kv.get(this.refStorageKey(loc));
+      if (raw && Number(raw.value.toString('utf8')) > 1) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private async releaseShare(loc: ObjectLocator): Promise<void> {
+    const storage = this.refStorageKey(loc);
+    const raw = await this.kv.get(storage);
+    if (!raw) {
+      return;
+    }
+    const next = Number(raw.value.toString('utf8')) - 1;
+    if (next <= 0) {
+      await this.kv.delete(storage);
+    } else {
+      await this.kv.put(storage, Buffer.from(String(next)));
+    }
+  }
+
+  private async releaseLocator(loc: ObjectLocator, objectKey: string): Promise<void> {
+    const storage = this.refStorageKey(loc);
+    const raw = await this.kv.get(storage);
+    if (!raw) {
+      await blockTombstone(loc.address, loc.dataKey ?? objectKey);
+      return;
+    }
+    const next = Number(raw.value.toString('utf8')) - 1;
+    if (next <= 0) {
+      await this.kv.delete(storage);
+      await blockTombstone(loc.address, loc.dataKey ?? objectKey);
+    } else {
+      await this.kv.put(storage, Buffer.from(String(next)));
+    }
+  }
+
+  async shareCopy(srcBucket: string, srcKey: string, dstBucket: string, dstKey: string): Promise<boolean> {
+    const srcObject = this.objectKey(srcBucket, srcKey);
+    const locs = await this.locators(srcObject);
+    if (locs.length === 0) {
+      return false;
+    }
+    const dstObject = this.objectKey(dstBucket, dstKey);
+    for (const loc of locs) {
+      const storage = this.refStorageKey(loc);
+      const raw = await this.kv.get(storage);
+      const next = raw ? Number(raw.value.toString('utf8')) + 1 : 2;
+      await this.kv.put(storage, Buffer.from(String(next)));
+      const shared: ObjectLocator = { ...loc, dataKey: loc.dataKey ?? srcObject };
+      await this.kv.put(locatorKey(srcObject, loc.replica), Buffer.from(JSON.stringify(shared)));
+      await this.kv.put(locatorKey(dstObject, loc.replica), Buffer.from(JSON.stringify(shared)));
+    }
+    await this.noteChange('put', dstBucket, dstKey);
+    return true;
+  }
+
+  async scrub(opts: { maxObjects?: number } = {}): Promise<{ checked: number; repaired: number; lost: number }> {
+    const report = { checked: 0, repaired: 0, lost: 0 };
+    const maxObjects = Math.max(1, opts.maxObjects ?? Number.MAX_SAFE_INTEGER);
+    let startAfter: string | undefined;
+    while (report.checked < maxObjects) {
+      const listed = await this.kv.scan({ prefix: '', startAfter, maxKeys: Math.min(1000, maxObjects - report.checked) });
+      if (listed.objects.length === 0) {
+        break;
+      }
+      for (const obj of listed.objects) {
+        startAfter = obj.key;
+        if (!isVisibleObjectKey(obj.key)) {
+          continue;
+        }
+        report.checked++;
+        const outcome = await this.scrubObject(obj.key);
+        if (outcome === 'repaired') {
+          report.repaired++;
+        }
+        if (outcome === 'lost') {
+          report.lost++;
+        }
+        if (report.checked >= maxObjects) {
+          break;
+        }
+      }
+      if (!listed.truncated || report.checked >= maxObjects) {
+        break;
+      }
+    }
+    return report;
+  }
+
+  private async scrubObject(objectKey: string): Promise<'ok' | 'repaired' | 'lost' | 'skipped'> {
+    const locs = await this.locators(objectKey);
+    if (locs.length === 0 || locs[0]?.v !== 3) {
+      return 'skipped';
+    }
+    let good: Buffer | null = null;
+    const bad: ObjectLocator[] = [];
+    for (const loc of locs) {
+      try {
+        const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc);
+        if (!got) {
+          bad.push(loc);
+          continue;
+        }
+        const value = decompressValue(got.value, loc.compressType ?? 'none');
+        if (loc.crc && crc32(value) !== loc.crc) {
+          bad.push(loc);
+          continue;
+        }
+        if (!good) {
+          good = value;
+        }
+      } catch {
+        bad.push(loc);
+      }
+    }
+    if (!good) {
+      await this.noteLost(objectKey);
+      return 'lost';
+    }
+    for (const loc of bad) {
+      const ev = await blockPut(loc.address, loc.dataKey ?? objectKey, good, {
+        compressType: loc.compressType,
+        origSize: good.length,
+        origCrc: loc.crc,
+      });
+      const replaced: ObjectLocator = { ...loc, recId: ev.recId, mtimeMs: ev.mtimeMs, storedSize: ev.size };
+      await this.kv.put(locatorKey(objectKey, loc.replica), Buffer.from(JSON.stringify(replaced)));
+    }
+    if (bad.length > 0) {
+      return 'repaired';
+    }
+    await this.clearLost(objectKey);
+    return 'ok';
+  }
+
+  async rebalance(nodeId: string): Promise<{ moved: number; bytes: number }> {
+    const node = this.registry.list().find((item) => item.nodeId === nodeId);
+    if (!node) {
+      throw new ControlError('BAD_REQUEST', `unknown block node ${nodeId}`);
+    }
+    let moved = 0;
+    let bytes = 0;
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: '', startAfter, maxKeys: 1000 });
+      if (listed.objects.length === 0) {
+        break;
+      }
+      for (const obj of listed.objects) {
+        startAfter = obj.key;
+        if (!isVisibleObjectKey(obj.key)) {
+          continue;
+        }
+        const locs = await this.locators(obj.key);
+        if (locs.length === 0 || locs.some((loc) => loc.nodeId === nodeId)) {
+          continue;
+        }
+        const source = locs.find((loc) => !this.registry.isDown(loc.nodeId));
+        if (!source) {
+          continue;
+        }
+        const got = await blockGet(source.address, source.dataKey ?? obj.key, source);
+        if (!got) {
+          continue;
+        }
+        const ev = await blockPut(node.address, source.dataKey ?? obj.key, got.value, {
+          compressType: source.compressType,
+          origSize: got.value.length,
+          origCrc: source.crc,
+        });
+        const fresh: ObjectLocator = {
+          ...source,
+          nodeId: node.nodeId,
+          address: node.address,
+          recId: ev.recId,
+          storedSize: ev.size,
+          mtimeMs: ev.mtimeMs,
+        };
+        const retired = locs[locs.length - 1]!;
+        await this.kv.delete(locatorKey(obj.key, retired.replica));
+        const keep = locs.slice(0, -1);
+        keep.push(fresh);
+        for (let i = 0; i < keep.length; i++) {
+          keep[i] = { ...keep[i]!, replica: i, replicaCount: keep.length };
+          await this.kv.put(locatorKey(obj.key, i), Buffer.from(JSON.stringify(keep[i])));
+        }
+        moved++;
+        bytes += got.value.length;
+      }
+      if (!listed.truncated) {
+        break;
+      }
+    }
+    return { moved, bytes };
+  }
+
+  async sendChanges(target: { put(bucket: string, key: string, value: Buffer): Promise<void> }): Promise<{ sent: number }> {
+    const changes = await this.listChanges();
+    let sent = 0;
+    for (const change of changes) {
+      if (change.op === 'delete') {
+        continue;
+      }
+      const got = await this.get(change.bucket, change.key);
+      if (!got) {
+        continue;
+      }
+      await target.put(change.bucket, change.key, got.value);
+      sent++;
+    }
+    return { sent };
+  }
+
+  async lostKeys(): Promise<string[]> {
+    const keys: string[] = [];
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: LOST_PREFIX, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        keys.push(obj.key.slice(LOST_PREFIX.length));
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    return keys;
+  }
+
+  private async noteLost(objectKey: string): Promise<void> {
+    await this.kv.put(lostKey(objectKey), Buffer.from(JSON.stringify({ v: 1, mtimeMs: Date.now() })));
+  }
+
+  private async clearLost(objectKey: string): Promise<void> {
+    await this.kv.delete(lostKey(objectKey));
+  }
+
+  private async noteChange(op: 'put' | 'delete', bucket: string, key: string): Promise<void> {
+    this.changeSeq += 1;
+    const id = `${String(Date.now()).padStart(16, '0')}-${String(this.changeSeq).padStart(6, '0')}`;
+    await this.kv.put(
+      `${CHANGE_PREFIX}${id}`,
+      Buffer.from(JSON.stringify({ op, bucket, key, mtimeMs: Date.now() })),
+    );
+  }
+
+  private async bucketMarker(bucket: string): Promise<{ quotaBytes?: number; compress?: boolean }> {
+    const raw = await this.kv.get(this.objectKey(bucket));
+    if (!raw) {
+      return {};
+    }
+    try {
+      const parsed = JSON.parse(raw.value.toString('utf8')) as { kind?: string; quotaBytes?: number; compress?: boolean };
+      return parsed.kind === 'bucket' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  private async compressFor(bucket: string): Promise<CompressType> {
+    const marker = await this.bucketMarker(bucket);
+    return marker.compress === false ? 'none' : this.compressType;
+  }
+
+  private async usage(bucket: string): Promise<number> {
+    const raw = await this.kv.get(usageKey(bucket));
+    if (!raw) {
+      return 0;
+    }
+    const n = Number(raw.value.toString('utf8'));
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  private async addUsage(bucket: string, delta: number): Promise<void> {
+    if (delta === 0) {
+      return;
+    }
+    const next = Math.max(0, (await this.usage(bucket)) + delta);
+    await this.kv.put(usageKey(bucket), Buffer.from(String(next)));
+  }
+
+  private async assertQuota(bucket: string, delta: number): Promise<void> {
+    const marker = await this.bucketMarker(bucket);
+    if (typeof marker.quotaBytes !== 'number' || delta <= 0) {
+      return;
+    }
+    const used = await this.usage(bucket);
+    if (used + delta > marker.quotaBytes) {
+      throw new ControlError('BAD_REQUEST', `bucket ${bucket} quota ${marker.quotaBytes}`);
+    }
   }
 
   private pickAdditional(objectKey: string, need: number, held: Set<string>) {

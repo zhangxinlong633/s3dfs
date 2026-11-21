@@ -43,6 +43,52 @@ export class AdminController {
     return { ok: true, report, stats: await this.engine.stats() };
   }
 
+  @Post('bucket-limits')
+  async bucketLimits(@Req() req: Request) {
+    this.allow(req);
+    const url = new URL(req.originalUrl || req.url, 'http://127.0.0.1');
+    const bucket = url.searchParams.get('bucket') ?? '';
+    if (!bucket) {
+      return { ok: false, error: 'missing bucket' };
+    }
+    const quota = url.searchParams.get('quotaBytes');
+    const compress = url.searchParams.get('compress');
+    const limits: { quotaBytes?: number; compress?: boolean } = {};
+    if (quota !== null && quota !== '') {
+      limits.quotaBytes = Number(quota);
+    }
+    if (compress === 'false' || compress === '0') {
+      limits.compress = false;
+    } else if (compress === 'true' || compress === '1') {
+      limits.compress = true;
+    }
+    await this.engine.setBucketLimits(bucket, limits);
+    return { ok: true };
+  }
+
+  @Post('scrub')
+  async scrub(@Req() req: Request) {
+    this.allow(req);
+    return { ok: true, report: await this.engine.scrub() };
+  }
+
+  @Post('rebalance')
+  async rebalance(@Req() req: Request) {
+    this.allow(req);
+    const url = new URL(req.originalUrl || req.url, 'http://127.0.0.1');
+    const nodeId = url.searchParams.get('nodeId') ?? '';
+    if (!nodeId) {
+      return { ok: false, error: 'missing nodeId' };
+    }
+    return { ok: true, report: await this.engine.rebalance(nodeId) };
+  }
+
+  @Get('changes')
+  async changes(@Req() req: Request) {
+    this.allow(req);
+    return { changes: await this.engine.listChanges() };
+  }
+
   private allow(req: Request): void {
     const path = new URL(req.originalUrl || req.url, 'http://127.0.0.1').pathname;
     if (!adminWriteAllowed({ headers: req.headers, env: process.env, path })) {

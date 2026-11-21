@@ -68,10 +68,12 @@ export class S3Controller {
       if (url.pathname === '/_s3dfs/health' && req.method === 'GET') {
         const indexOk = await this.engine.index().ping();
         const layout = await this.engine.probeLayout();
-        const lost = this.engine.lostCount();
+        const lost = await this.engine.syncLost();
+        const lostKeys = await this.engine.lostKeys();
+        const zones = this.engine.zoneDisks();
         const ok = serviceHealthy(indexOk, layout, lost);
         status = ok ? 200 : 503;
-        res.status(status).json({ indexOk, lost, ...layout, layout, ok });
+        res.status(status).json({ indexOk, lost, lostKeys, zones, ...layout, layout, ok });
         return;
       }
       if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {

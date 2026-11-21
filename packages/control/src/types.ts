@@ -11,6 +11,8 @@ export interface BlockNodeInfo {
   zone?: string;
   /** New writes skip this node until a scale-down finishes or is cancelled. */
   draining?: boolean;
+  /** Bytes still available on the node's data volume. */
+  freeBytes?: number;
 }
 
 export interface BlockStats {
@@ -52,6 +54,11 @@ export interface ObjectLocator extends ExtentLocator {
   address: string;
   storedSize: number;
   compressType: CompressType;
+  /** CRC-32 of each fixed-size slice of the logical bytes. */
+  segments?: number[];
+  segmentBytes?: number;
+  /** Engine key when this locator shares another object's record. */
+  dataKey?: string;
 }
 
 export interface ObjectValue {

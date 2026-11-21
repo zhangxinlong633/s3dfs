@@ -50,6 +50,7 @@ export interface S3Backend {
   ): Promise<{ truncated: boolean; objects: ListedObject[]; prefixes: string[]; nextToken?: string }>;
   put(bucket: string, key: string, value: Buffer): Promise<void>;
   putStream?(bucket: string, key: string, chunks: AsyncIterable<Buffer>, extraKey?: string): Promise<{ size: number; crc: number }>;
+  shareCopy?(srcBucket: string, srcKey: string, dstBucket: string, dstKey: string): Promise<boolean>;
   head(bucket: string, key: string): Promise<Omit<ObjectValue, 'value'> | null>;
   get(bucket: string, key: string): Promise<ObjectValue | null>;
   getRange(
@@ -478,8 +479,13 @@ async function handleObject(
     return empty(200, { ETag: etag });
   }
   if (uploadId && method === 'POST') {
-    const body = await uploads.complete(bucket, key, uploadId, parseCompleteParts(payload(req).toString('utf8')));
-    await backend.put(bucket, key, await maybeSeal(req, body, options));
+    const declared = parseCompleteParts(payload(req).toString('utf8'));
+    if (backend.putStream && !header(req.headers, 'x-amz-server-side-encryption')) {
+      await backend.putStream(bucket, key, uploads.eachPart(bucket, key, uploadId, declared));
+    } else {
+      const body = await uploads.complete(bucket, key, uploadId, declared);
+      await backend.put(bucket, key, await maybeSeal(req, body, options));
+    }
     await uploads.finish(uploadId);
     const meta = await backend.head(bucket, key);
     const etag = meta ? etagFromCrc(meta.crc) : `"00000000"`;
@@ -514,12 +520,17 @@ async function handleObject(
       if (slash <= 0) {
         return xml(400, errorXml('InvalidArgument', 'x-amz-copy-source must be bucket/key'));
       }
-      const src = await backend.get(decoded.slice(0, slash), decoded.slice(slash + 1));
-      if (!src) {
-        return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', copySource));
-      }
+      const srcBucket = decoded.slice(0, slash);
+      const srcKey = decoded.slice(slash + 1);
       await backend.createBucket(bucket);
-      await backend.put(bucket, key, src.value);
+      const shared = backend.shareCopy ? await backend.shareCopy(srcBucket, srcKey, bucket, key) : false;
+      if (!shared) {
+        const src = await backend.get(srcBucket, srcKey);
+        if (!src) {
+          return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', copySource));
+        }
+        await backend.put(bucket, key, src.value);
+      }
       if (options.meta) {
         await options.meta.save(bucket, key, await options.meta.load(decoded.slice(0, slash), decoded.slice(slash + 1)));
       }

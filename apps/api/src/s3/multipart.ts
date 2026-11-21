@@ -118,8 +118,21 @@ export class MultipartUploads {
       .map(([partNumber, part]) => ({ partNumber, etag: part.etag, size: part.body.length }));
   }
 
+  /** Yield each declared part. The session stays until `finish`, so a failed Put can be retried. */
+  async *eachPart(bucket: string, key: string, uploadId: string, declared: CompletePart[]): AsyncGenerator<Buffer> {
+    const parts = await this.checkedParts(bucket, key, uploadId, declared);
+    for (const part of parts) {
+      yield part.body;
+    }
+  }
+
   /** Concatenate the declared parts. The session stays until `finish`, so a failed Put can be retried. */
   async complete(bucket: string, key: string, uploadId: string, declared: CompletePart[]): Promise<Buffer> {
+    const parts = await this.checkedParts(bucket, key, uploadId, declared);
+    return Buffer.concat(parts.map((part) => part.body));
+  }
+
+  private async checkedParts(bucket: string, key: string, uploadId: string, declared: CompletePart[]) {
     const upload = await this.require(bucket, key, uploadId);
     if (declared.length === 0) {
       throw new S3HttpError(400, 'MalformedXML', 'CompleteMultipartUpload has no parts');
@@ -129,15 +142,15 @@ export class MultipartUploads {
         throw new S3HttpError(400, 'InvalidPartOrder', 'Part numbers must be in ascending order');
       }
     }
-    const bufs: Buffer[] = [];
+    const bufs: { body: Buffer }[] = [];
     for (const part of declared) {
       const got = upload.parts.get(part.partNumber);
       if (!got || stripEtag(got.etag) !== stripEtag(part.etag)) {
         throw new S3HttpError(400, 'InvalidPart', `Part ${part.partNumber} is missing or the ETag does not match`);
       }
-      bufs.push(got.body);
+      bufs.push(got);
     }
-    return Buffer.concat(bufs);
+    return bufs;
   }
 
   async finish(uploadId: string): Promise<void> {

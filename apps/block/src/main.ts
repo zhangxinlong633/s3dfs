@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { statfsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
@@ -89,12 +90,22 @@ function metaHeaders(res: ServerResponse, meta: { size: number; crc: number; mti
   res.setHeader('x-s3dfs-mtime', String(meta.mtimeMs));
 }
 
-function snapshot(): BlockNodeInfo & { stats: ReturnType<Store['stats']> } {
+function volumeFreeBytes(dir: string): number {
+  try {
+    const stat = statfsSync(dir);
+    return Number(stat.bavail) * Number(stat.bsize);
+  } catch {
+    return 0;
+  }
+}
+
+function snapshot(): BlockNodeInfo & { stats: ReturnType<Store['stats']>; freeBytes: number } {
   return {
     nodeId,
     address: advertise,
     status: 'up',
     lastSeenMs: Date.now(),
+    freeBytes: volumeFreeBytes(dataDir),
     stats: store.stats(),
   };
 }
