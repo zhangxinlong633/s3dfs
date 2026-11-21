@@ -4,7 +4,11 @@ import type { Request, Response } from 'express';
 import { ControlError, serviceHealthy } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
 import { alertBodies, postAlerts } from './alerts';
+import { adminWriteAllowed } from './admin-auth';
 import { handleS3, type S3Options } from './handle';
+import { IamDirectory } from './iam';
+import { S3HttpError } from './multipart';
+import { verifySigV4 } from './sigv4';
 import type { AccessAccount } from './product';
 import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
 import { RequestMetrics } from './metrics';
@@ -37,6 +41,38 @@ function replicaFromEnv(): S3Options['replica'] {
       await fetch(`${root}/${bucket}/${encodeURI(key)}`, { method: 'DELETE' });
     },
   };
+}
+
+function accessKeyFrom(headers: Request['headers']): string | undefined {
+  const raw = headers.authorization ?? headers.Authorization;
+  const auth = Array.isArray(raw) ? raw[0] : raw;
+  const cred = /Credential=([^,\s]+)/.exec(auth ?? '')?.[1] ?? '';
+  return cred.split('/')[0] || undefined;
+}
+
+function iamFromIndex(index: {
+  get(key: string): Promise<{ value: Buffer } | null>;
+  put(key: string, value: Buffer): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  scan(opts: { prefix?: string; startAfter?: string; maxKeys?: number }): Promise<{ objects: { key: string }[]; truncated: boolean }>;
+}): IamDirectory {
+  return new IamDirectory({
+    get: (key) => index.get(key),
+    put: (key, value) => index.put(key, value),
+    delete: (key) => index.delete(key),
+    async scan(prefix) {
+      const keys: string[] = [];
+      let startAfter: string | undefined;
+      for (;;) {
+        const listed = await index.scan({ prefix, startAfter, maxKeys: 1000 });
+        keys.push(...listed.objects.map((item) => item.key));
+        if (!listed.truncated || listed.objects.length === 0) {
+          return keys;
+        }
+        startAfter = listed.objects[listed.objects.length - 1]?.key;
+      }
+    },
+  });
 }
 
 function sendServiceError(res: Response, err: unknown): boolean {
@@ -72,6 +108,7 @@ export class S3Controller {
       credentials: accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined,
       accounts: accountsFromEnv(),
       replica: replicaFromEnv(),
+      iam: iamFromIndex(this.engine.index()),
       domain: process.env.S3DFS_DOMAIN,
       sseSecret: process.env.S3DFS_SSE_KEY,
       config: new IndexConfigStore(this.engine.index()),
@@ -161,6 +198,41 @@ export class S3Controller {
           return;
         }
         res.status(status).json(incident);
+        return;
+      }
+      if (url.pathname === '/_s3dfs/iam' && req.method === 'POST') {
+        const directory = iamFromIndex(this.engine.index());
+        const body = JSON.parse((req.rawBody ?? Buffer.alloc(0)).toString('utf8') || '{}') as Parameters<IamDirectory['apply']>[0];
+        const admin = adminWriteAllowed({ headers: req.headers, env: process.env, path: url.pathname });
+        if (body.op === 'assumeRole' && !admin) {
+          const accessKeyId = accessKeyFrom(req.headers);
+          const resolved = accessKeyId ? await directory.resolve(accessKeyId, Date.now()) : null;
+          if (!accessKeyId || !resolved || typeof resolved === 'string') {
+            status = 401;
+            res.status(status).end();
+            return;
+          }
+          verifySigV4(
+            { method: 'POST', path: url.pathname, query: url.searchParams, headers: req.headers, body: req.rawBody ?? Buffer.alloc(0) },
+            { accessKeyId, secretAccessKey: resolved.secretAccessKey },
+          );
+          body.parent = accessKeyId;
+        } else if (!admin) {
+          status = 401;
+          res.status(status).end();
+          return;
+        }
+        try {
+          const result = await directory.apply(body);
+          status = 200;
+          res.status(status).json(result);
+        } catch (err) {
+          if (!(err instanceof S3HttpError)) {
+            throw err;
+          }
+          status = err.status;
+          res.status(status).json({ code: err.code, message: err.message });
+        }
         return;
       }
       if (url.pathname === '/_s3dfs' || url.pathname.startsWith('/_s3dfs/')) {

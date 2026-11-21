@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { crc32, parseByteRange, type ObjectValue } from '@s3dfs/control';
 import { AwsChunkError, objectBytes } from './aws-chunked';
 import { MultipartUploads, S3HttpError, parseCompleteParts } from './multipart';
+import { grantAllows, type IamDirectory, type IamGrant } from './iam';
 import {
   accountAllowsBucket,
   accountExpired,
@@ -101,6 +102,7 @@ export interface S3Options {
   accounts?: AccessAccount[];
   replica?: { put(bucket: string, key: string, body: Buffer): Promise<void>; delete(bucket: string, key: string): Promise<void> };
   queue?: { push(event: Record<string, unknown>): void };
+  iam?: IamDirectory;
   /** Virtual-hosted buckets are `{bucket}.{domain}`. */
   domain?: string;
   sseSecret?: string;
@@ -232,22 +234,40 @@ function verifyStreaming(req: S3Request, secret: string, signed: { scope: string
   }
 }
 
-function authenticate(req: S3Request, options: S3Options): AccessAccount | undefined {
+async function authenticate(req: S3Request, options: S3Options): Promise<{ account?: AccessAccount; grant?: IamGrant }> {
+  const accessKeyId = accessKeyIdOf(req);
+  const now = req.now ?? Date.now();
+  if (options.credentials && accessKeyId === options.credentials.accessKeyId) {
+    verifyStreaming(req, options.credentials.secretAccessKey, verifySigV4({ ...req, now }, options.credentials));
+    return {};
+  }
   if (options.accounts && options.accounts.length > 0) {
-    const account = options.accounts.find((item) => item.accessKeyId === accessKeyIdOf(req));
-    if (!account) {
-      throw new S3HttpError(403, 'InvalidAccessKeyId', 'The access key id does not match');
+    const account = options.accounts.find((item) => item.accessKeyId === accessKeyId);
+    if (account) {
+      if (accountExpired(account, now)) {
+        throw new S3HttpError(403, 'AccessDenied', 'The security token has expired');
+      }
+      verifyStreaming(req, account.secretAccessKey, verifySigV4({ ...req, now }, account));
+      return { account };
     }
-    if (accountExpired(account, req.now ?? Date.now())) {
-      throw new S3HttpError(403, 'AccessDenied', 'The security token has expired');
+  }
+  if (options.iam && accessKeyId) {
+    const resolved = await options.iam.resolve(accessKeyId, now);
+    if (resolved === 'disabled' || resolved === 'expired') {
+      throw new S3HttpError(403, 'AccessDenied', 'The access key is disabled or expired');
     }
-    verifyStreaming(req, account.secretAccessKey, verifySigV4({ ...req, now: req.now }, account));
-    return account;
+    if (resolved) {
+      verifyStreaming(req, resolved.secretAccessKey, verifySigV4({ ...req, now }, { accessKeyId, secretAccessKey: resolved.secretAccessKey }));
+      return { grant: resolved };
+    }
+  }
+  if (options.accounts && options.accounts.length > 0) {
+    throw new S3HttpError(403, 'InvalidAccessKeyId', 'The access key id does not match');
   }
   if (options.credentials) {
-    verifyStreaming(req, options.credentials.secretAccessKey, verifySigV4({ ...req, now: req.now }, options.credentials));
+    verifyStreaming(req, options.credentials.secretAccessKey, verifySigV4({ ...req, now }, options.credentials));
   }
-  return undefined;
+  return {};
 }
 
 function customerKey(req: S3Request): Buffer | undefined {
@@ -410,12 +430,15 @@ export async function handleS3(
   options: S3Options = {},
 ): Promise<S3Response> {
   try {
-    const account = authenticate(req, options);
+    const auth = await authenticate(req, options);
     const { bucket, key } = resolveTarget(req, options.domain);
-    if (account && bucket && !accountAllowsBucket(account, bucket)) {
+    if (auth.account && bucket && !accountAllowsBucket(auth.account, bucket)) {
       throw new S3HttpError(403, 'AccessDenied', 'The access key is not allowed to use this bucket');
     }
     const method = req.method.toUpperCase();
+    if (auth.grant && bucket && !grantAllows(auth.grant, actionFor(method, key, req.query), key ? `${bucket}/${key}` : bucket)) {
+      throw new S3HttpError(403, 'AccessDenied', 'Denied by identity policy');
+    }
     if (bucket && !isBucketAdmin(req)) {
       const config = options.config ? await options.config.get(bucket) : {};
       checkPolicy(config.policy, actionFor(method, key, req.query), key ? `${bucket}/${key}` : bucket);
