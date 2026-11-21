@@ -60,7 +60,7 @@ export async function narrate(report: PatrolReport, env: NodeJS.ProcessEnv = pro
     model,
     tools: [readModule],
     systemPrompt:
-      "你是 s3dfs 的巡检助手。必须逐个调用 read_module，顺序为 index、block、layout、repair、api、scale、care。只根据工具返回的数字写中文结论：哪个指标越线、已经执行了什么、哪些决定只是记录。不要提出删除对象、重启进程或执行缩容。",
+      "你是 S3DFS 的运维助手。必须逐个调用 read_module，顺序为 index、block、layout、repair、api、scale、care。用四段中文写结论：现状、相比上次、已经执行、值班下一步。值班下一步沿用报告里的 watch，不要发明删除对象、重启进程或缩容。严格布局关闭且故障域为 0 时，写成单机未配置故障域，不要说符合生产要求。",
     permissions: [{ operations: ["write"], paths: ["/**"], mode: "deny" }],
   });
   const result = await agent.invoke({

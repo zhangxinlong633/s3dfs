@@ -53,4 +53,6 @@
 
 依赖是 npm 包 `deepagents`、`@langchain/openai` 和 `zod`，装在 `@s3dfs/patrol`。`S3DFS_PATROL_MODEL=off` 时不加载这些包。Deep Agents 的写入权限使用绝对路径 `/**`。
 
+每轮结束后，巡检进程把同一份结论写成 HTML。目录是 `S3DFS_PATROL_REPORT_DIR`，默认 `reports/`。文件名是本机时间 `patrol-YYYY-MM-DDTHHMMSS.html`，同一秒冲突时加 `-2`。页面自包含，动态文字转义，不含对象正文和巡检凭证。写入失败时 JSON 带 `reportError`，进程退出码为 1。
+
 block 统计带 `unflushedBytes`，表示写缓冲里尚未落盘的字节。引擎需要重新编译后，运行中的 block 进程才会报出这个字段。

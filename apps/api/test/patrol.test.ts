@@ -123,6 +123,43 @@ describe('patrol review', () => {
     expect(report.decisions.some((item) => item.summary.includes('只记录'))).toBe(true);
   });
 
+  test('briefs the operator with changes, a down node, errors, and the open incident', () => {
+    const first = reviewPatrol(snapshot());
+    const report = reviewPatrol(
+      snapshot({
+        block: {
+          nodes: [
+            { nodeId: 'b1', up: false, zone: 'a', bytesOnDisk: 100, deadBytes: 0, locators: 1, draining: false, unflushedBytes: 0 },
+          ],
+        },
+        api: { inflight: 1, latencyP99Ms: 80, maxInflight: 128, requests: 100, serverErrors: 10 },
+        care: {
+          open: 1,
+          incidents: [{ id: 'lost:logs:1', symptom: 'logs 有对象没有活副本', next: '联系值班确认是否接受丢失' }],
+        },
+      }),
+      first.findings,
+    );
+    expect(report.decisions.some((item) => item.summary.includes('b1'))).toBe(true);
+    expect(report.changes).toContainEqual({ module: 'api', metric: 'latencyP99Ms', previous: 5, current: 80 });
+    expect(report.watch.some((line) => line.includes('b1'))).toBe(true);
+    expect(report.watch.some((line) => line.includes('联系值班确认是否接受丢失'))).toBe(true);
+    expect(report.brief).toContain('现状');
+    expect(report.brief).toContain('相比上次');
+    expect(report.brief).toContain('已执行');
+    expect(report.brief).toContain('值班下一步');
+  });
+
+  test('says a single-node layout without zones is not a production failure', () => {
+    const report = reviewPatrol(
+      snapshot({
+        layout: { ok: true, strict: false, dataReplicas: 1, liveBlocks: 1, failureDomains: 0 },
+      }),
+    );
+    expect(report.brief).toContain('严格布局关闭');
+    expect(report.watch.some((line) => line.includes('故障域'))).toBe(false);
+  });
+
   test('requires the patrol token and a model of at least 26B', () => {
     expect(patrolAuthorized(undefined, {})).toBe(false);
     expect(patrolAuthorized('secret', { S3DFS_PATROL_TOKEN: 'secret' })).toBe(true);

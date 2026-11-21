@@ -1,5 +1,6 @@
 import { configuredModel, modelAllowed, modelParams } from "./config.js";
 import { narrate } from "./narrate.js";
+import { attachReport } from "./report.js";
 
 function apiUrl(path: string): string {
   const base = (process.env.S3DFS_PATROL_API_URL ?? "http://127.0.0.1:9000").replace(/\/$/, "");
@@ -41,7 +42,11 @@ async function main(): Promise<void> {
   const interval = raw === undefined || raw === "" ? 86_400_000 : Number(raw);
   for (;;) {
     try {
-      console.log(JSON.stringify(await once()));
+      const written = await attachReport(await once(), process.env);
+      console.log(JSON.stringify(written.body));
+      if (written.exitCode !== 0) {
+        process.exit(written.exitCode);
+      }
     } catch (err) {
       console.log(JSON.stringify({ ok: false, error: err instanceof Error ? err.message : String(err) }));
     }

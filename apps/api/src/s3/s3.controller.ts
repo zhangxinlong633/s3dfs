@@ -163,6 +163,7 @@ export class S3Controller {
       status = 503;
     } finally {
       this.engine.finishRequest(req.method ?? 'GET', Date.now() - started);
+      this.engine.noteHttp(status);
       this.metrics.record(status);
       console.log(
         JSON.stringify({

@@ -18,7 +18,7 @@ export interface PatrolSnapshot {
   block: { nodes: BlockView[] };
   layout: { ok: boolean; strict: boolean; dataReplicas: number; liveBlocks: number; failureDomains: number };
   repair: { lost: number; shortCopies: number };
-  api: { inflight: number; latencyP99Ms: number; maxInflight: number };
+  api: { inflight: number; latencyP99Ms: number; maxInflight: number; requests?: number; serverErrors?: number };
   scale: {
     wants: 'up' | 'down' | 'none';
     upConfigured: boolean;
@@ -28,10 +28,23 @@ export interface PatrolSnapshot {
     cooldownMs: number;
     draining: boolean;
   };
-  care: { open: number };
+  care: { open: number; incidents?: PatrolIncident[] };
   compactDeadRatio: number;
   highLatencyMs: number;
   truncated?: boolean;
+}
+
+export interface PatrolIncident {
+  id: string;
+  symptom: string;
+  next: string;
+}
+
+export interface PatrolChange {
+  module: PatrolModule;
+  metric: string;
+  previous: number;
+  current: number;
 }
 
 export interface PatrolFinding {
@@ -58,6 +71,10 @@ export interface PatrolReport {
   findings: PatrolFinding[];
   decisions: PatrolDecision[];
   apply: Array<'repair' | 'compact' | 'flush' | 'scale_up'>;
+  changes: PatrolChange[];
+  watch: string[];
+  brief: string;
+  modelSummary: string;
   summary: string;
   truncated: boolean;
 }
@@ -111,7 +128,26 @@ function decision(
   };
 }
 
-export function reviewPatrol(snapshot: PatrolSnapshot): PatrolReport {
+export function patrolChanges(current: PatrolFinding[], previous: PatrolFinding[]): PatrolChange[] {
+  if (previous.length === 0) {
+    return [];
+  }
+  const prior = new Map(previous.map((item) => [`${item.module}:${item.metric}`, item.value]));
+  const changes: PatrolChange[] = [];
+  for (const item of current) {
+    const key = `${item.module}:${item.metric}`;
+    if (!prior.has(key)) {
+      continue;
+    }
+    const before = prior.get(key)!;
+    if (before !== item.value) {
+      changes.push({ module: item.module, metric: item.metric, previous: before, current: item.value });
+    }
+  }
+  return changes;
+}
+
+export function reviewPatrol(snapshot: PatrolSnapshot, previous: PatrolFinding[] = []): PatrolReport {
   const findings: PatrolFinding[] = [
     finding('index', 'ok', snapshot.index.ok ? 1 : 0, 1, !snapshot.index.ok),
     finding('index', 'copiesMatch', snapshot.index.copiesMatch ? 1 : 0, 1, !snapshot.index.copiesMatch),
@@ -137,6 +173,12 @@ export function reviewPatrol(snapshot: PatrolSnapshot): PatrolReport {
   }
   findings.push(finding('block', 'deadRatio', maxDead, snapshot.compactDeadRatio, maxDead >= snapshot.compactDeadRatio && maxDead > 0));
   findings.push(finding('block', 'unflushedBytes', unflushed, 0, unflushed > 0));
+  const down = snapshot.block.nodes.filter((node) => !node.up);
+  findings.push(finding('block', 'down', down.length, 0, down.length > 0));
+  const requests = snapshot.api.requests ?? 0;
+  const serverErrors = snapshot.api.serverErrors ?? 0;
+  const errorRatio = requests > 0 ? serverErrors / requests : 0;
+  findings.push(finding('api', 'serverErrors', serverErrors, 0, requests >= 20 && errorRatio >= 0.05));
 
   const decisions: PatrolDecision[] = [];
   const short = findings.find((item) => item.module === 'repair' && item.metric === 'shortCopies' && item.over);
@@ -183,10 +225,54 @@ export function reviewPatrol(snapshot: PatrolSnapshot): PatrolReport {
   if (care) {
     decisions.push(decision(snapshot, care, 'note', false, '未恢复的故障事件已经在告警里', `还有 ${snapshot.care.open} 条未恢复事件`));
   }
+  const downFinding = findings.find((item) => item.module === 'block' && item.metric === 'down' && item.over);
+  if (downFinding) {
+    const names = down.map((node) => node.nodeId).join('、');
+    decisions.push(decision(snapshot, downFinding, 'note', false, '宕机节点上的副本要等节点恢复或由修复改写到其他节点', `block ${names} 不在线`));
+  }
 
   const apply = APPLY_ORDER.filter((action) => decisions.some((item) => item.apply && item.action === action));
-  const summary = decisions.length === 0 ? '各模块未越过执行阈值' : decisions.map((item) => item.summary).join('；');
-  return { findings, decisions, apply: [...apply], summary, truncated: Boolean(snapshot.truncated) };
+  const watch: string[] = [];
+  if (down.length > 0) {
+    watch.push(`查看 block ${down.map((node) => node.nodeId).join('、')} 是否仍在监听`);
+  }
+  for (const incident of snapshot.care.incidents ?? []) {
+    if (incident.next) {
+      watch.push(`打开故障事件 ${incident.id}：${incident.next}`);
+    }
+  }
+  if (requests >= 20 && errorRatio >= 0.05) {
+    watch.push(`API 5xx 为 ${serverErrors}/${requests}，查看最近的请求日志`);
+  }
+  if (snapshot.repair.lost > 0) {
+    watch.push('没有活副本的对象不能靠修复补回，联系值班确认是否接受丢失');
+  }
+  if (watch.length === 0) {
+    watch.push('无需额外值班动作');
+  }
+  const changes = patrolChanges(findings, previous);
+  const changeText =
+    previous.length === 0
+      ? '这是本进程的第一次巡检'
+      : changes.length === 0
+        ? '与上次相比，列出的指标没有变化'
+        : changes.map((item) => `${item.module}.${item.metric} ${item.previous} → ${item.current}`).join('；');
+  let status = decisions.length === 0 ? '各模块未越过执行阈值' : decisions.map((item) => item.summary).join('；');
+  if (!snapshot.layout.strict && snapshot.layout.failureDomains < snapshot.layout.dataReplicas) {
+    status += '。严格布局关闭，故障域不足不记为故障';
+  }
+  const brief = [`现状：${status}`, `相比上次：${changeText}`, `已执行：${apply.length === 0 ? '无' : apply.join('、')}`, `值班下一步：`, ...watch.map((line) => `- ${line}`)].join('\n');
+  return {
+    findings,
+    decisions,
+    apply: [...apply],
+    changes,
+    watch,
+    brief,
+    modelSummary: '',
+    summary: brief,
+    truncated: Boolean(snapshot.truncated),
+  };
 }
 
 export async function executePatrol(

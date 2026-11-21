@@ -10,7 +10,7 @@ The index is a standalone [dleveldb](https://github.com/zhangxinlong633/dleveldb
 
 Objects are packed into ~1 GiB `.blk` files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files. Placement lives in dleveldb locators. The control plane compresses with zstd by default and stores the original bytes, with `compressType=none`, when compression does not shrink the value.
 
-S3DFS ships with a patrol AI, `apps/patrol`. It is not on the write path. Once a day it reads the index, block nodes, layout, repair, API, scaling, and alerts. Rules repair short replicas, compact a hole-heavy node, flush a dirty buffer, and scale up when load stays high and a script is configured. The model turns those numbers and the actions already taken into a conclusion for the operator. It does not read object bytes, and it does not delete data, restart processes, or scale down. The default model is Gemma 4 26B in local LM Studio. `S3DFS_PATROL_MODEL=off` keeps the rule patrol. The conclusion is `GET /_s3dfs/decisions`.
+S3DFS ships with a patrol AI, `apps/patrol`. It is not on the write path. Once a day it reads the index, block nodes, layout, repair, API, scaling, and alerts. Rules repair short replicas, compact a hole-heavy node, flush a dirty buffer, and scale up when load stays high and a script is configured. The model turns those numbers and the actions already taken into a conclusion for the operator. It does not read object bytes, and it does not delete data, restart processes, or scale down. The default model is Gemma 4 26B in local LM Studio. `S3DFS_PATROL_MODEL=off` keeps the rule patrol. The conclusion is `GET /_s3dfs/decisions`, and the same round is written as HTML under `reports/`.
 
 ## Features
 
@@ -29,7 +29,7 @@ Behavior and environment variables are in [Capabilities](docs/capabilities.md).
 | Health and repair | Short replica sets are repaired. An object with no live copy is `lost`, and health returns 503 |
 | Space and scale | Compaction reclaims space after deletes. With operator scripts, index, block, and API scale on capacity and latency |
 | Console and mount | The console shows stats, buckets, and nodes. `s3dfs-fuse` mounts one bucket as a directory |
-| Built-in patrol AI | Rules run repair, compact, flush, and a configured scale-up. The model writes a conclusion for the seven modules |
+| Built-in patrol AI | Rules run repair, compact, flush, and a configured scale-up. The brief covers the current state, the change since last time, actions taken, and what to check next, and is written as HTML. The model writes from that brief |
 
 Not provided yet: a bounded buffer on a single Put, capacity numbers from the target cluster, erasure coding, site replication, Object Lock, quotas, audit logs, multi-user IAM, and KMS. See [Todo](docs/todo.md).
 

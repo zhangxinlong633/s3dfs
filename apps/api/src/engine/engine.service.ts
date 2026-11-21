@@ -50,6 +50,8 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   private inflight = 0;
   private putLatency: number[] = [];
   private apiLatency: number[] = [];
+  private httpTotal = 0;
+  private httpServerErrors = 0;
   private scaleMemory: ScaleMemory = emptyScaleMemory();
   private careState: CareState = emptyCareState();
   private readonly incidents = new Map<string, CareIncident>();
@@ -58,6 +60,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     findings: [],
     decisions: [],
     apply: [],
+    changes: [],
+    watch: [],
+    brief: '',
+    modelSummary: '',
     summary: '',
     truncated: false,
   };
@@ -119,6 +125,13 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
 
   beginRequest(): void {
     this.inflight += 1;
+  }
+
+  noteHttp(status: number): void {
+    this.httpTotal += 1;
+    if (status >= 500) {
+      this.httpServerErrors += 1;
+    }
   }
 
   finishRequest(method: string, ms: number): void {
@@ -220,7 +233,9 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   }
 
   notePatrolSummary(summary: string): PatrolReport {
-    this.patrolReport = { ...this.patrolReport, summary: summary.slice(0, 4000) };
+    const modelSummary = summary.slice(0, 4000);
+    const text = this.patrolReport.brief ? `${this.patrolReport.brief}\n\n模型结论：\n${modelSummary}` : modelSummary;
+    this.patrolReport = { ...this.patrolReport, modelSummary, summary: text };
     return this.patrolReport;
   }
 
@@ -276,6 +291,8 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
         inflight: this.inflight,
         latencyP99Ms: percentile99(this.apiLatency),
         maxInflight: config.apiMaxInflight,
+        requests: this.httpTotal,
+        serverErrors: this.httpServerErrors,
       },
       scale: {
         wants,
@@ -286,14 +303,21 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
         cooldownMs: config.cooldownMs,
         draining: Boolean(memory.draining),
       },
-      care: { open: Object.keys(this.careState.open).length },
+      care: {
+        open: Object.keys(this.careState.open).length,
+        incidents: Object.values(this.careState.open).slice(0, 5).map((item) => ({
+          id: item.incident.id,
+          symptom: item.incident.symptom,
+          next: item.incident.next[0] ?? '',
+        })),
+      },
       compactDeadRatio: Number(process.env.S3DFS_COMPACT_DEAD_RATIO ?? 0.2) || 0.2,
       highLatencyMs: config.highLatencyMs,
     });
   }
 
   async patrol(): Promise<PatrolReport> {
-    const report = reviewPatrol(await this.moduleSnapshot());
+    const report = reviewPatrol(await this.moduleSnapshot(), this.patrolReport.findings);
     await executePatrol(report, {
       repair: () => this.repair().then(() => undefined),
       compact: () => this.compact(),

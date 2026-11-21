@@ -10,7 +10,7 @@ S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js
 
 对象打进约 1 GiB 的 `.blk`，在内存里攒批后再 `write` + `fsync`。inode 和 IOPS 跟数据文件数走，不跟对象数走。定位信息是 dleveldb 里的 locator。写入前默认用 zstd；压不小则按原文落盘，并把 `compressType` 记成 `none`。
 
-系统自带巡检 AI，进程是 `apps/patrol`，不在写入路径上。它每天看索引、block、布局、修复、API、扩缩和告警。活副本不足、空洞过高、写缓冲未落盘，或负载持续高且已配置扩容脚本时，由规则直接做修复、compact、flush 或扩容。模型只把这些数字和已经执行的动作写成给值班人看的中文结论，不读对象正文，也不删除、重启或缩容。默认连本机 LM Studio 的 Gemma 4 26B。`S3DFS_PATROL_MODEL=off` 时仍做规则巡检。结论在 `GET /_s3dfs/decisions`。
+系统自带巡检 AI，进程是 `apps/patrol`，不在写入路径上。它每天看索引、block、布局、修复、API、扩缩和告警。活副本不足、空洞过高、写缓冲未落盘，或负载持续高且已配置扩容脚本时，由规则直接做修复、compact、flush 或扩容。模型只把这些数字和已经执行的动作写成给值班人看的中文结论，不读对象正文，也不删除、重启或缩容。默认连本机 LM Studio 的 Gemma 4 26B。`S3DFS_PATROL_MODEL=off` 时仍做规则巡检。结论在 `GET /_s3dfs/decisions`，同时写成 `reports/` 下的 HTML。
 
 ## 功能
 
@@ -29,7 +29,7 @@ S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js
 | 健康与修复 | 活副本不足时补齐。没有任何活副本记为 `lost`，健康检查返回 503 |
 | 空间与扩缩 | 删除后 compact 回收空洞。配置脚本后按容量和延迟扩缩索引、block 或 API |
 | 控制台与挂载 | 控制台看统计、桶和节点。`s3dfs-fuse` 把一个桶挂成本地目录 |
-| 自带巡检 AI | 规则执行修复、compact、flush 和已配置的扩容。模型按七个模块写中文结论 |
+| 自带巡检 AI | 规则执行修复、compact、flush 和已配置的扩容。简报含现状、相比上次、已执行和值班下一步，并写成 HTML。模型据此写中文结论 |
 
 尚未提供：单次 Put 的有界缓冲、目标集群上的容量数字，以及纠删码、站点复制、Object Lock、配额、审计、多用户 IAM 和 KMS。清单见 [待办](docs/todo.md)。
 

@@ -15,7 +15,7 @@
     "dev:web": "pnpm --filter @s3dfs/web dev",
     "dev:block": "pnpm --filter @s3dfs/block dev",
     "dev:index": "bash scripts/dev-index.sh",
-    "patrol": "pnpm --filter @s3dfs/patrol start",
+    "patrol": "bun apps/patrol/src/main.ts",
     "build": "pnpm --filter @s3dfs/engine build && pnpm --filter @s3dfs/control build && pnpm --filter @s3dfs/api build && pnpm --filter @s3dfs/web build",
     "build:engine": "pnpm --filter @s3dfs/engine build",
     "build:control": "pnpm --filter @s3dfs/control build",
