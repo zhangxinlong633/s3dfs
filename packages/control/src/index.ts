@@ -13,6 +13,7 @@ export {
 export { NodeRegistry, parseBlockNodes, parseIndexUrls, type SeedNode } from './registry.js';
 export { ObjectCluster, assessLayout, serviceHealthy, strictLayoutEnabled, writeQuorum, type ClusterStats, type LayoutReport, type RepairReport } from './cluster.js';
 export { PUT_CHUNK_BYTES, relayChunks } from './stream.js';
+export { LAYOUT_FILE_NAME, s3dfsLayout, writeLayoutFile } from './layout.js';
 export {
   apiStopAllowed,
   blockStopAllowed,

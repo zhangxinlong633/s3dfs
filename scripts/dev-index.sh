@@ -13,5 +13,6 @@ export DLEVELDB_NODE_ID="${DLEVELDB_NODE_ID:-index1}"
 export DLEVELDB_VNODES="${DLEVELDB_VNODES:-1}"
 export DLEVELDB_REPLICAS="${DLEVELDB_REPLICAS:-1}"
 mkdir -p "$DLEVELDB_DATA_DIR"
+bun -e "import { writeLayoutFile } from '$ROOT/packages/control/src/layout.ts'; writeLayoutFile(process.argv[1])" "$DLEVELDB_DATA_DIR"
 cd "$INDEX_ROOT"
 exec pnpm --filter dleveldb start

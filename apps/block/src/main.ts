@@ -2,10 +2,11 @@ import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
-import { IndexClient, nodeKey, parseIndexUrls, type BlockNodeInfo } from '@s3dfs/control';
+import { IndexClient, nodeKey, parseIndexUrls, writeLayoutFile, type BlockNodeInfo } from '@s3dfs/control';
 import { Store } from '@s3dfs/engine';
 
 const dataDir = path.resolve(process.env.S3DFS_DATA_DIR ?? './data/block');
+writeLayoutFile(dataDir);
 const nodeId = process.env.S3DFS_BLOCK_NODE_ID ?? 'block1';
 const port = Number(process.env.S3DFS_BLOCK_PORT ?? 9100);
 const host = process.env.S3DFS_BLOCK_HOST ?? '0.0.0.0';
