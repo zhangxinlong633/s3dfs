@@ -1,0 +1,640 @@
+{
+  "measuredAt": "2026-11-21T05:25:19.875Z",
+  "timeZone": "Asia/Shanghai",
+  "bun": "1.4.2",
+  "nodeCompat": "v26.3.0",
+  "platform": "darwin arm64",
+  "cpus": 15,
+  "model": "Apple M5 Pro",
+  "memoryBytes": 51539607552,
+  "ops": 5000,
+  "warmup": 500,
+  "results": [
+    {
+      "name": "direct block put 1KiB (no index)",
+      "ops": 5000,
+      "opsPerSec": 16686.734745718808,
+      "p50Ns": 53250,
+      "p99Ns": 156209,
+      "elapsedSec": 0.299639209
+    },
+    {
+      "name": "direct block get 1KiB (no index)",
+      "ops": 5000,
+      "opsPerSec": 18207.81397440619,
+      "p50Ns": 51833,
+      "p99Ns": 95416,
+      "elapsedSec": 0.274607375
+    },
+    {
+      "name": "cluster put 100B  N=1  none",
+      "ops": 5000,
+      "opsPerSec": 4821.045212244105,
+      "p50Ns": 190084,
+      "p99Ns": 491708,
+      "elapsedSec": 1.0371195
+    },
+    {
+      "name": "cluster get 100B  N=1  none",
+      "ops": 5000,
+      "opsPerSec": 7882.623013751433,
+      "p50Ns": 114041,
+      "p99Ns": 304167,
+      "elapsedSec": 0.634306625
+    },
+    {
+      "name": "cluster put 1KiB  N=1  none",
+      "ops": 5000,
+      "opsPerSec": 4782.196647034554,
+      "p50Ns": 191459,
+      "p99Ns": 530167,
+      "elapsedSec": 1.045544625
+    },
+    {
+      "name": "cluster get 1KiB  N=1  none",
+      "ops": 5000,
+      "opsPerSec": 7888.584783945468,
+      "p50Ns": 114250,
+      "p99Ns": 299750,
+      "elapsedSec": 0.63382725
+    },
+    {
+      "name": "cluster put 16KiB N=1  none",
+      "ops": 2000,
+      "opsPerSec": 3103.080455430368,
+      "p50Ns": 257292,
+      "p99Ns": 794583,
+      "elapsedSec": 0.644520833
+    },
+    {
+      "name": "cluster get 16KiB N=1  none",
+      "ops": 2000,
+      "opsPerSec": 6053.6130735377665,
+      "p50Ns": 150250,
+      "p99Ns": 441292,
+      "elapsedSec": 0.330381208
+    },
+    {
+      "name": "cluster put 1KiB  N=1  none  32-in-flight",
+      "ops": 5000,
+      "inflight": 32,
+      "opsPerSec": 15726.880699028392,
+      "p50Ns": 1945458,
+      "p99Ns": 3775250,
+      "elapsedSec": 0.317927
+    },
+    {
+      "name": "cluster get 1KiB  N=1  none  32-in-flight",
+      "ops": 5000,
+      "inflight": 32,
+      "opsPerSec": 39483.47715189886,
+      "p50Ns": 739583,
+      "p99Ns": 2004500,
+      "elapsedSec": 0.12663525
+    },
+    {
+      "name": "cluster put 1KiB  N=3  none",
+      "ops": 5000,
+      "opsPerSec": 3322.1413160845545,
+      "p50Ns": 260042,
+      "p99Ns": 807375,
+      "elapsedSec": 1.505053375
+    },
+    {
+      "name": "cluster get 1KiB  N=3  none",
+      "ops": 5000,
+      "opsPerSec": 3725.2665592693675,
+      "p50Ns": 247458,
+      "p99Ns": 557417,
+      "elapsedSec": 1.342185833
+    },
+    {
+      "name": "cluster put 1KiB  N=3  none  32-in-flight",
+      "ops": 5000,
+      "inflight": 32,
+      "opsPerSec": 6917.780962647269,
+      "p50Ns": 4321833,
+      "p99Ns": 9647958,
+      "elapsedSec": 0.722775125
+    },
+    {
+      "name": "cluster 1KiB repeated none put",
+      "ops": 5000,
+      "opsPerSec": 4460.800880877562,
+      "p50Ns": 203875,
+      "p99Ns": 524792,
+      "elapsedSec": 1.120874958
+    },
+    {
+      "name": "cluster 1KiB repeated none get",
+      "ops": 5000,
+      "opsPerSec": 8006.304163898653,
+      "p50Ns": 113500,
+      "p99Ns": 284083,
+      "elapsedSec": 0.624507875
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1KiB repeated none",
+      "logicalBytes": 1024,
+      "compressType": "none",
+      "sample": 100,
+      "avgLogical": 1024,
+      "avgStored": 1024,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 4460.800880877562,
+      "getOpsPerSec": 8006.304163898653,
+      "putMibPerSec": 4.356250860231994,
+      "getMibPerSec": 7.818656410057279,
+      "putP50Ns": 203875,
+      "putP99Ns": 524792,
+      "getP50Ns": 113500,
+      "getP99Ns": 284083
+    },
+    {
+      "name": "cluster 1KiB repeated zstd put",
+      "ops": 5000,
+      "opsPerSec": 4656.202317578141,
+      "p50Ns": 194000,
+      "p99Ns": 603667,
+      "elapsedSec": 1.0738365
+    },
+    {
+      "name": "cluster 1KiB repeated zstd get",
+      "ops": 5000,
+      "opsPerSec": 7855.738784116246,
+      "p50Ns": 111291,
+      "p99Ns": 543334,
+      "elapsedSec": 0.636477375
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1KiB repeated zstd",
+      "logicalBytes": 1024,
+      "compressType": "zstd",
+      "sample": 100,
+      "avgLogical": 1024,
+      "avgStored": 19,
+      "ratio": 53.89473684210526,
+      "savings": 0.9814453125,
+      "putOpsPerSec": 4656.202317578141,
+      "getOpsPerSec": 7855.738784116246,
+      "putMibPerSec": 4.547072575759904,
+      "getMibPerSec": 7.671619906363522,
+      "putP50Ns": 194000,
+      "putP99Ns": 603667,
+      "getP50Ns": 111291,
+      "getP99Ns": 543334
+    },
+    {
+      "name": "cluster 1KiB repeated gzip put",
+      "ops": 5000,
+      "opsPerSec": 4525.657365875072,
+      "p50Ns": 196542,
+      "p99Ns": 737375,
+      "elapsedSec": 1.104811875
+    },
+    {
+      "name": "cluster 1KiB repeated gzip get",
+      "ops": 5000,
+      "opsPerSec": 7794.1254466860055,
+      "p50Ns": 114125,
+      "p99Ns": 385917,
+      "elapsedSec": 0.641508792
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1KiB repeated gzip",
+      "logicalBytes": 1024,
+      "compressType": "gzip",
+      "sample": 100,
+      "avgLogical": 1024,
+      "avgStored": 30,
+      "ratio": 34.13333333333333,
+      "savings": 0.970703125,
+      "putOpsPerSec": 4525.657365875072,
+      "getOpsPerSec": 7794.1254466860055,
+      "putMibPerSec": 4.419587271362375,
+      "getMibPerSec": 7.611450631529302,
+      "putP50Ns": 196542,
+      "putP99Ns": 737375,
+      "getP50Ns": 114125,
+      "getP99Ns": 385917
+    },
+    {
+      "name": "cluster 1KiB random zstd put",
+      "ops": 5000,
+      "opsPerSec": 4442.28582522406,
+      "p50Ns": 200000,
+      "p99Ns": 598625,
+      "elapsedSec": 1.125546666
+    },
+    {
+      "name": "cluster 1KiB random zstd get",
+      "ops": 5000,
+      "opsPerSec": 8079.390247383869,
+      "p50Ns": 113208,
+      "p99Ns": 278334,
+      "elapsedSec": 0.618858583
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1KiB random zstd",
+      "logicalBytes": 1024,
+      "compressType": "none",
+      "sample": 100,
+      "avgLogical": 1024,
+      "avgStored": 1024,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 4442.28582522406,
+      "getOpsPerSec": 8079.390247383869,
+      "putMibPerSec": 4.338169751195371,
+      "getMibPerSec": 7.8900295384608095,
+      "putP50Ns": 200000,
+      "putP99Ns": 598625,
+      "getP50Ns": 113208,
+      "getP99Ns": 278334
+    },
+    {
+      "name": "cluster 1KiB random gzip put",
+      "ops": 5000,
+      "opsPerSec": 4217.9494628494085,
+      "p50Ns": 210792,
+      "p99Ns": 579375,
+      "elapsedSec": 1.185410125
+    },
+    {
+      "name": "cluster 1KiB random gzip get",
+      "ops": 5000,
+      "opsPerSec": 8296.08505904333,
+      "p50Ns": 111417,
+      "p99Ns": 243125,
+      "elapsedSec": 0.602693917
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1KiB random gzip",
+      "logicalBytes": 1024,
+      "compressType": "none",
+      "sample": 100,
+      "avgLogical": 1024,
+      "avgStored": 1024,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 4217.9494628494085,
+      "getOpsPerSec": 8296.08505904333,
+      "putMibPerSec": 4.1190912723138755,
+      "getMibPerSec": 8.101645565472001,
+      "putP50Ns": 210792,
+      "putP99Ns": 579375,
+      "getP50Ns": 111417,
+      "getP99Ns": 243125
+    },
+    {
+      "name": "cluster 16KiB repeated none put",
+      "ops": 2000,
+      "opsPerSec": 3433.8445855195237,
+      "p50Ns": 259333,
+      "p99Ns": 655208,
+      "elapsedSec": 0.582437542
+    },
+    {
+      "name": "cluster 16KiB repeated none get",
+      "ops": 2000,
+      "opsPerSec": 5875.583059812701,
+      "p50Ns": 150000,
+      "p99Ns": 432958,
+      "elapsedSec": 0.34039175
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 16KiB repeated none",
+      "logicalBytes": 16384,
+      "compressType": "none",
+      "sample": 100,
+      "avgLogical": 16384,
+      "avgStored": 16384,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 3433.8445855195237,
+      "getOpsPerSec": 5875.583059812701,
+      "putMibPerSec": 53.65382164874256,
+      "getMibPerSec": 91.80598530957346,
+      "putP50Ns": 259333,
+      "putP99Ns": 655208,
+      "getP50Ns": 150000,
+      "getP99Ns": 432958
+    },
+    {
+      "name": "cluster 16KiB repeated zstd put",
+      "ops": 2000,
+      "opsPerSec": 4402.08457369403,
+      "p50Ns": 191959,
+      "p99Ns": 813792,
+      "elapsedSec": 0.454330208
+    },
+    {
+      "name": "cluster 16KiB repeated zstd get",
+      "ops": 2000,
+      "opsPerSec": 7205.584327854087,
+      "p50Ns": 118958,
+      "p99Ns": 540417,
+      "elapsedSec": 0.2775625
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 16KiB repeated zstd",
+      "logicalBytes": 16384,
+      "compressType": "zstd",
+      "sample": 100,
+      "avgLogical": 16384,
+      "avgStored": 19,
+      "ratio": 862.3157894736842,
+      "savings": 0.99884033203125,
+      "putOpsPerSec": 4402.08457369403,
+      "getOpsPerSec": 7205.584327854087,
+      "putMibPerSec": 68.78257146396922,
+      "getMibPerSec": 112.58725512272011,
+      "putP50Ns": 191959,
+      "putP99Ns": 813792,
+      "getP50Ns": 118958,
+      "getP99Ns": 540417
+    },
+    {
+      "name": "cluster 16KiB random zstd put",
+      "ops": 2000,
+      "opsPerSec": 2990.008886799763,
+      "p50Ns": 278875,
+      "p99Ns": 859292,
+      "elapsedSec": 0.668894333
+    },
+    {
+      "name": "cluster 16KiB random zstd get",
+      "ops": 2000,
+      "opsPerSec": 6031.418400311686,
+      "p50Ns": 148208,
+      "p99Ns": 485166,
+      "elapsedSec": 0.331596959
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 16KiB random zstd",
+      "logicalBytes": 16384,
+      "compressType": "none",
+      "sample": 100,
+      "avgLogical": 16384,
+      "avgStored": 16384,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 2990.008886799763,
+      "getOpsPerSec": 6031.418400311686,
+      "putMibPerSec": 46.718888856246295,
+      "getMibPerSec": 94.2409125048701,
+      "putP50Ns": 278875,
+      "putP99Ns": 859292,
+      "getP50Ns": 148208,
+      "getP99Ns": 485166
+    },
+    {
+      "name": "cluster 1MiB repeated none put",
+      "ops": 80,
+      "opsPerSec": 199.13407790809651,
+      "p50Ns": 4837000,
+      "p99Ns": 6344292,
+      "elapsedSec": 0.401739375
+    },
+    {
+      "name": "cluster 1MiB repeated none get",
+      "ops": 80,
+      "opsPerSec": 378.1799616620064,
+      "p50Ns": 2499667,
+      "p99Ns": 4125166,
+      "elapsedSec": 0.2115395
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1MiB repeated none",
+      "logicalBytes": 1048576,
+      "compressType": "none",
+      "sample": 80,
+      "avgLogical": 1048576,
+      "avgStored": 1048576,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 199.13407790809651,
+      "getOpsPerSec": 378.1799616620064,
+      "putMibPerSec": 199.13407790809651,
+      "getMibPerSec": 378.1799616620064,
+      "putP50Ns": 4837000,
+      "putP99Ns": 6344292,
+      "getP50Ns": 2499667,
+      "getP99Ns": 4125166
+    },
+    {
+      "name": "cluster 1MiB repeated zstd put",
+      "ops": 80,
+      "opsPerSec": 1650.5196330960875,
+      "p50Ns": 588209,
+      "p99Ns": 855250,
+      "elapsedSec": 0.048469584
+    },
+    {
+      "name": "cluster 1MiB repeated zstd get",
+      "ops": 80,
+      "opsPerSec": 1690.9699562197309,
+      "p50Ns": 453042,
+      "p99Ns": 1622292,
+      "elapsedSec": 0.047310125
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1MiB repeated zstd",
+      "logicalBytes": 1048576,
+      "compressType": "zstd",
+      "sample": 80,
+      "avgLogical": 1048576,
+      "avgStored": 50,
+      "ratio": 20971.52,
+      "savings": 0.9999523162841797,
+      "putOpsPerSec": 1650.5196330960875,
+      "getOpsPerSec": 1690.9699562197309,
+      "putMibPerSec": 1650.5196330960875,
+      "getMibPerSec": 1690.9699562197309,
+      "putP50Ns": 588209,
+      "putP99Ns": 855250,
+      "getP50Ns": 453042,
+      "getP99Ns": 1622292
+    },
+    {
+      "name": "cluster 1MiB random zstd put",
+      "ops": 80,
+      "opsPerSec": 183.20367711398004,
+      "p50Ns": 5303375,
+      "p99Ns": 7560709,
+      "elapsedSec": 0.436672458
+    },
+    {
+      "name": "cluster 1MiB random zstd get",
+      "ops": 80,
+      "opsPerSec": 381.7523174835132,
+      "p50Ns": 2494792,
+      "p99Ns": 4196250,
+      "elapsedSec": 0.209559959
+    },
+    {
+      "kind": "compress",
+      "label": "cluster 1MiB random zstd",
+      "logicalBytes": 1048576,
+      "compressType": "none",
+      "sample": 80,
+      "avgLogical": 1048576,
+      "avgStored": 1048576,
+      "ratio": 1,
+      "savings": 0,
+      "putOpsPerSec": 183.20367711398004,
+      "getOpsPerSec": 381.7523174835132,
+      "putMibPerSec": 183.20367711398004,
+      "getMibPerSec": 381.7523174835132,
+      "putP50Ns": 5303375,
+      "putP99Ns": 7560709,
+      "getP50Ns": 2494792,
+      "getP99Ns": 4196250
+    }
+  ],
+  "codecResults": [
+    {
+      "name": "codec 1MiB repeated  zstd",
+      "prefer": "zstd",
+      "applied": "zstd",
+      "logicalBytes": 1048576,
+      "storedBytes": 50,
+      "ratio": 20971.52,
+      "savings": 0.9999523162841797,
+      "rounds": 200,
+      "compressMibPerSec": 7881.553492024735,
+      "decompressMibPerSec": 4332.802565019118
+    },
+    {
+      "name": "codec 1MiB repeated  gzip",
+      "prefer": "gzip",
+      "applied": "gzip",
+      "logicalBytes": 1048576,
+      "storedBytes": 1052,
+      "ratio": 996.745247148289,
+      "savings": 0.9989967346191406,
+      "rounds": 200,
+      "compressMibPerSec": 3711.6769356395216,
+      "decompressMibPerSec": 3328.188508597127
+    },
+    {
+      "name": "codec 1MiB random    zstd",
+      "prefer": "zstd",
+      "applied": "none",
+      "logicalBytes": 1048576,
+      "storedBytes": 1048576,
+      "ratio": 1,
+      "savings": 0,
+      "rounds": 200,
+      "compressMibPerSec": 3073.380792786874,
+      "decompressMibPerSec": 38707180.18192375
+    },
+    {
+      "name": "codec 1MiB random    gzip",
+      "prefer": "gzip",
+      "applied": "none",
+      "logicalBytes": 1048576,
+      "storedBytes": 1048576,
+      "ratio": 1,
+      "savings": 0,
+      "rounds": 200,
+      "compressMibPerSec": 91.7990145490537,
+      "decompressMibPerSec": 43243243.24324325
+    },
+    {
+      "name": "codec 16KiB repeated zstd",
+      "prefer": "zstd",
+      "applied": "zstd",
+      "logicalBytes": 16384,
+      "storedBytes": 19,
+      "ratio": 862.3157894736842,
+      "savings": 0.99884033203125,
+      "rounds": 2000,
+      "compressMibPerSec": 3183.969665378543,
+      "decompressMibPerSec": 2239.501218288663
+    },
+    {
+      "name": "codec 16KiB random   zstd",
+      "prefer": "zstd",
+      "applied": "none",
+      "logicalBytes": 16384,
+      "storedBytes": 16384,
+      "ratio": 1,
+      "savings": 0,
+      "rounds": 2000,
+      "compressMibPerSec": 1223.3633189795953,
+      "decompressMibPerSec": 5281392.597600135
+    }
+  ],
+  "layoutResults": [
+    {
+      "name": "layout 5000 x 1KiB raw repeated",
+      "objects": 5000,
+      "fileCount": 1,
+      "files": [
+        {
+          "name": "00000000000000000001.blk",
+          "size": 5533890
+        }
+      ],
+      "logicalBytes": 5120000,
+      "storedPayloadBytes": 5120000,
+      "onDiskBytes": 5533890,
+      "ratio": 0.9252081266523187,
+      "flushes": 6,
+      "fsyncs": 6,
+      "indexDir": false
+    },
+    {
+      "name": "layout 5000 x 1KiB zstd repeated",
+      "objects": 5000,
+      "fileCount": 1,
+      "files": [
+        {
+          "name": "00000000000000000001.blk",
+          "size": 508890
+        }
+      ],
+      "logicalBytes": 5120000,
+      "storedPayloadBytes": 95000,
+      "onDiskBytes": 508890,
+      "ratio": 10.061113403682524,
+      "flushes": 1,
+      "fsyncs": 1,
+      "indexDir": false,
+      "applied": "zstd",
+      "avgStoredPayload": 19
+    },
+    {
+      "name": "layout 5000 x 1KiB zstd random",
+      "objects": 5000,
+      "fileCount": 1,
+      "files": [
+        {
+          "name": "00000000000000000001.blk",
+          "size": 5533890
+        }
+      ],
+      "logicalBytes": 5120000,
+      "storedPayloadBytes": 5120000,
+      "onDiskBytes": 5533890,
+      "ratio": 0.9252081266523187,
+      "flushes": 6,
+      "fsyncs": 6,
+      "indexDir": false,
+      "applied": "none",
+      "avgStoredPayload": 1024
+    }
+  ]
+}

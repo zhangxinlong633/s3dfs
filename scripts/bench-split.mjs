@@ -370,6 +370,47 @@ if (focus === 'n3') {
   process.exit(0);
 }
 
+if (focus === 'grid') {
+  const results = [];
+  const sizes = [
+    { label: '1KiB', bytes: 1024, ops: 1000, warm: 100 },
+    { label: '10KiB', bytes: 10 * 1024, ops: 400, warm: 40 },
+    { label: '100KiB', bytes: 100 * 1024, ops: 80, warm: 8 },
+    { label: '1MiB', bytes: 1024 * 1024, ops: 40, warm: 4 },
+  ];
+  for (const copies of [1, 3]) {
+    const { cluster } = await startCluster(copies, copies);
+    await cluster.createBucket('bench');
+    for (const size of sizes) {
+      const body = randomPayload(size.bytes);
+      const prefix = `n${copies}-${size.label}-`;
+      results.push(
+        await measure(`cluster put ${size.label}  N=${copies}  none`, size.ops, async (i, warm) => {
+          await cluster.put('bench', `${prefix}${warm ? 'w' : 'p'}${i}`, body);
+        }, size.warm),
+      );
+      results.push(
+        await measure(`cluster get ${size.label}  N=${copies}  none`, size.ops, async (i) => {
+          const got = await cluster.get('bench', `${prefix}p${i}`);
+          if (!got || got.value.length !== body.length) throw new Error('missing');
+        }, size.warm),
+      );
+    }
+    await stopChildren();
+  }
+  const summary = {
+    at: new Date().toISOString(),
+    host: `${os.cpus()[0]?.model ?? ''} ${os.arch()}`,
+    bun: process.versions.bun,
+    note: 'localhost, compress=none, random bytes. N is object copies on one machine. Not a target-cluster capacity number.',
+    results,
+  };
+  writeFileSync(outFile, JSON.stringify(summary, null, 2));
+  console.log(`\nwrote ${outFile}`);
+  await cleanup();
+  process.exit(0);
+}
+
 const results = [];
 const codecResults = [];
 const layoutResults = [];

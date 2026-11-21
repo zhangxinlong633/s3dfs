@@ -72,6 +72,10 @@ export function assessLayout(
   };
 }
 
+const LIMITS_TTL_MS = 1000;
+
+type BucketLimits = { quotaBytes?: number; compress?: boolean; shared?: boolean };
+
 /** Logical bytes covered by one segment checksum. */
 export const SEGMENT_BYTES = 64 * 1024;
 
@@ -158,6 +162,8 @@ export class ObjectCluster {
 
   private lostTotal = 0;
   private changeSeq = 0;
+  private readonly limitsCache = new Map<string, { at: number; limits: BucketLimits }>();
+  private readonly usageMem = new Map<string, number>();
 
   lostCount(): number {
     return this.lostTotal;
@@ -213,7 +219,23 @@ export class ObjectCluster {
     const markerKey = this.objectKey(bucket);
     const raw = await this.kv.get(markerKey);
     const prev = raw ? (JSON.parse(raw.value.toString('utf8')) as Record<string, unknown>) : { v: 1, kind: 'bucket', mtimeMs: Date.now() };
-    await this.kv.put(markerKey, Buffer.from(JSON.stringify({ ...prev, ...limits })));
+    const next = { ...prev, ...limits };
+    await this.kv.put(markerKey, Buffer.from(JSON.stringify(next)));
+    const parsed: BucketLimits = {
+      quotaBytes: typeof next.quotaBytes === 'number' ? next.quotaBytes : undefined,
+      compress: typeof next.compress === 'boolean' ? next.compress : undefined,
+      shared: next.shared === true ? true : undefined,
+    };
+    this.limitsCache.set(bucket, { at: Date.now(), limits: parsed });
+    if (typeof parsed.quotaBytes === 'number' && !this.usageMem.has(bucket)) {
+      const rawUsage = await this.kv.get(usageKey(bucket));
+      const used = rawUsage ? Number(rawUsage.value.toString('utf8')) : await this.sumVisibleBytes(bucket);
+      const total = Number.isFinite(used) ? used : 0;
+      this.usageMem.set(bucket, total);
+      if (!rawUsage) {
+        await this.kv.put(usageKey(bucket), Buffer.from(String(total)));
+      }
+    }
   }
 
   objectKey(bucket: string, key?: string): string {
@@ -226,11 +248,16 @@ export class ObjectCluster {
       throw new ControlError('BLOCK_UNAVAILABLE', layout.reasons.join('; '));
     }
     const objectKey = this.objectKey(bucket, key);
-    const previous = await this.locators(objectKey);
-    const oldSize = previous[0]?.size ?? 0;
-    await this.assertQuota(bucket, value.length - oldSize);
-    const blockKey = (await this.heldByOthers(previous)) ? `$obj/${Date.now().toString(36)}-${this.changeSeq + 1}` : objectKey;
-    const packed = compressValue(value, await this.compressFor(bucket));
+    const limits = await this.limitsFor(bucket);
+    let previous: ObjectLocator[] | undefined;
+    if (typeof limits.quotaBytes === 'number' || limits.shared) {
+      previous = await this.locators(objectKey);
+      if (typeof limits.quotaBytes === 'number') {
+        await this.assertQuota(bucket, value.length - (previous[0]?.size ?? 0), limits);
+      }
+    }
+    const blockKey = previous && (await this.heldByOthers(previous)) ? this.freshDataKey() : objectKey;
+    const packed = compressValue(value, limits.compress === false ? 'none' : this.compressType);
     const digest = crc32(value);
     const targets = this.registry.pick(objectKey, this.dataReplicas);
     const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
@@ -259,10 +286,11 @@ export class ObjectCluster {
         `wrote ${accepted.length} of ${targets.length} replicas for ${objectKey}`,
       );
     }
-    const written: string[] = [];
-    try {
-      for (let i = 0; i < accepted.length; i++) {
-        const ev = accepted[i]!;
+    const segments = segmentCrcs(value);
+    const changeP = this.noteChange('put', bucket, key);
+    const locatorKeys = accepted.map((_, i) => locatorKey(objectKey, i));
+    const indexed = await Promise.allSettled(
+      accepted.map(async (ev, i) => {
         const loc: ObjectLocator = {
           v: 3,
           replica: i,
@@ -278,25 +306,32 @@ export class ObjectCluster {
           compressType: packed.compressType,
           crc: digest,
           mtimeMs: ev.mtimeMs,
-          segments: segmentCrcs(value),
+          segments,
           segmentBytes: SEGMENT_BYTES,
           ...(blockKey === objectKey ? {} : { dataKey: blockKey }),
         };
-        const indexKey = locatorKey(objectKey, i);
-        await this.kv.put(indexKey, Buffer.from(JSON.stringify(loc)));
-        written.push(indexKey);
-      }
+        await this.kv.put(locatorKeys[i]!, Buffer.from(JSON.stringify(loc)));
+      }),
+    );
+    const failed = indexed.find((item) => item.status === 'rejected');
+    if (failed && failed.status === 'rejected') {
+      const changeKey = await changeP.catch(() => undefined);
+      await Promise.all([
+        ...locatorKeys.map((indexKey) => this.kv.delete(indexKey).catch(() => false)),
+        changeKey ? this.kv.delete(changeKey).catch(() => false) : Promise.resolve(false),
+      ]);
+      throw failed.reason;
+    }
+    try {
+      await changeP;
     } catch (err) {
-      await Promise.all(written.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
+      await Promise.all(locatorKeys.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
       throw err;
     }
-    if (blockKey !== objectKey) {
-      for (const loc of previous) {
-        await this.releaseShare(loc);
-      }
+    if (previous && blockKey !== objectKey) {
+      await Promise.all(previous.map((loc) => this.releaseLocator(loc, objectKey)));
     }
-    await this.addUsage(bucket, value.length - oldSize);
-    await this.noteChange('put', bucket, key);
+    await this.addUsage(bucket, value.length - (previous?.[0]?.size ?? 0), limits);
   }
 
   /**
@@ -505,8 +540,7 @@ export class ObjectCluster {
     for (const loc of locs) {
       await this.kv.delete(locatorKey(objectKey, loc.replica));
     }
-    await this.addUsage(bucket, -size);
-    await this.noteChange('delete', bucket, key);
+    await Promise.all([this.addUsage(bucket, -size), this.noteChange('delete', bucket, key)]);
     return true;
   }
 
@@ -953,20 +987,6 @@ export class ObjectCluster {
     return false;
   }
 
-  private async releaseShare(loc: ObjectLocator): Promise<void> {
-    const storage = this.refStorageKey(loc);
-    const raw = await this.kv.get(storage);
-    if (!raw) {
-      return;
-    }
-    const next = Number(raw.value.toString('utf8')) - 1;
-    if (next <= 0) {
-      await this.kv.delete(storage);
-    } else {
-      await this.kv.put(storage, Buffer.from(String(next)));
-    }
-  }
-
   private async releaseLocator(loc: ObjectLocator, objectKey: string): Promise<void> {
     const storage = this.refStorageKey(loc);
     const raw = await this.kv.get(storage);
@@ -990,7 +1010,29 @@ export class ObjectCluster {
       return false;
     }
     const dstObject = this.objectKey(dstBucket, dstKey);
-    for (const loc of locs) {
+    let sharedLocs = locs;
+    if (locs.some((loc) => (loc.dataKey ?? srcObject) === srcObject)) {
+      const blockKey = this.freshDataKey();
+      const moved: ObjectLocator[] = [];
+      for (const loc of locs) {
+        const got = await blockGet(loc.address, loc.dataKey ?? srcObject, loc);
+        if (!got) {
+          return false;
+        }
+        const ev = await blockPut(loc.address, blockKey, got.value, {
+          compressType: loc.compressType,
+          origSize: loc.size,
+          origCrc: loc.crc,
+        });
+        moved.push({ ...loc, recId: ev.recId, storedSize: ev.size, mtimeMs: ev.mtimeMs, dataKey: blockKey });
+      }
+      for (const loc of moved) {
+        await this.kv.put(locatorKey(srcObject, loc.replica), Buffer.from(JSON.stringify(loc)));
+      }
+      await Promise.all(locs.map((loc) => blockTombstone(loc.address, loc.dataKey ?? srcObject)));
+      sharedLocs = moved;
+    }
+    for (const loc of sharedLocs) {
       const storage = this.refStorageKey(loc);
       const raw = await this.kv.get(storage);
       const next = raw ? Number(raw.value.toString('utf8')) + 1 : 2;
@@ -999,6 +1041,8 @@ export class ObjectCluster {
       await this.kv.put(locatorKey(srcObject, loc.replica), Buffer.from(JSON.stringify(shared)));
       await this.kv.put(locatorKey(dstObject, loc.replica), Buffer.from(JSON.stringify(shared)));
     }
+    await this.markShared(srcBucket);
+    await this.markShared(dstBucket);
     await this.noteChange('put', dstBucket, dstKey);
     return true;
   }
@@ -1184,31 +1228,110 @@ export class ObjectCluster {
     await this.kv.delete(lostKey(objectKey));
   }
 
-  private async noteChange(op: 'put' | 'delete', bucket: string, key: string): Promise<void> {
+  private freshDataKey(): string {
     this.changeSeq += 1;
-    const id = `${String(Date.now()).padStart(16, '0')}-${String(this.changeSeq).padStart(6, '0')}`;
-    await this.kv.put(
-      `${CHANGE_PREFIX}${id}`,
-      Buffer.from(JSON.stringify({ op, bucket, key, mtimeMs: Date.now() })),
-    );
+    return `$obj/${Date.now().toString(36)}-${this.changeSeq}`;
   }
 
-  private async bucketMarker(bucket: string): Promise<{ quotaBytes?: number; compress?: boolean }> {
+  private changeRecord(op: 'put' | 'delete', bucket: string, key: string): { key: string; value: Buffer } {
+    this.changeSeq += 1;
+    const id = `${String(Date.now()).padStart(16, '0')}-${String(this.changeSeq).padStart(6, '0')}`;
+    return {
+      key: `${CHANGE_PREFIX}${id}`,
+      value: Buffer.from(JSON.stringify({ op, bucket, key, mtimeMs: Date.now() })),
+    };
+  }
+
+  private async noteChange(op: 'put' | 'delete', bucket: string, key: string): Promise<string> {
+    const record = this.changeRecord(op, bucket, key);
+    await this.kv.put(record.key, record.value);
+    return record.key;
+  }
+
+  private async markShared(bucket: string): Promise<void> {
+    const markerKey = this.objectKey(bucket);
+    const raw = await this.kv.get(markerKey);
+    let prev: Record<string, unknown> = { v: 1, kind: 'bucket', mtimeMs: Date.now() };
+    if (raw) {
+      try {
+        prev = JSON.parse(raw.value.toString('utf8')) as Record<string, unknown>;
+      } catch {
+        prev = { v: 1, kind: 'bucket', mtimeMs: Date.now() };
+      }
+    }
+    if (prev.shared !== true) {
+      await this.kv.put(markerKey, Buffer.from(JSON.stringify({ ...prev, shared: true })));
+    }
+    const hit = this.limitsCache.get(bucket);
+    if (hit) {
+      hit.limits = { ...hit.limits, shared: true };
+    } else {
+      this.limitsCache.set(bucket, { at: Date.now(), limits: { shared: true } });
+    }
+  }
+
+  private async bucketMarker(bucket: string): Promise<BucketLimits> {
     const raw = await this.kv.get(this.objectKey(bucket));
     if (!raw) {
       return {};
     }
     try {
-      const parsed = JSON.parse(raw.value.toString('utf8')) as { kind?: string; quotaBytes?: number; compress?: boolean };
-      return parsed.kind === 'bucket' ? parsed : {};
+      const parsed = JSON.parse(raw.value.toString('utf8')) as { kind?: string; quotaBytes?: number; compress?: boolean; shared?: boolean };
+      if (parsed.kind !== 'bucket') {
+        return {};
+      }
+      return {
+        quotaBytes: typeof parsed.quotaBytes === 'number' ? parsed.quotaBytes : undefined,
+        compress: typeof parsed.compress === 'boolean' ? parsed.compress : undefined,
+        shared: parsed.shared === true ? true : undefined,
+      };
     } catch {
       return {};
     }
   }
 
-  private async compressFor(bucket: string): Promise<CompressType> {
-    const marker = await this.bucketMarker(bucket);
-    return marker.compress === false ? 'none' : this.compressType;
+  private async limitsFor(bucket: string): Promise<BucketLimits> {
+    const hit = this.limitsCache.get(bucket);
+    if (hit && Date.now() - hit.at < LIMITS_TTL_MS) {
+      return hit.limits;
+    }
+    const limits = await this.bucketMarker(bucket);
+    this.limitsCache.set(bucket, { at: Date.now(), limits });
+    return limits;
+  }
+
+  private async usageCached(bucket: string): Promise<number> {
+    const mem = this.usageMem.get(bucket);
+    if (mem !== undefined) {
+      return mem;
+    }
+    const n = await this.usage(bucket);
+    this.usageMem.set(bucket, n);
+    return n;
+  }
+
+  private async sumVisibleBytes(bucket: string): Promise<number> {
+    let total = 0;
+    let startAfter: string | undefined;
+    const prefix = this.objectKey(bucket);
+    for (;;) {
+      const listed = await this.kv.scan({ prefix, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        if (!isVisibleObjectKey(obj.key)) {
+          continue;
+        }
+        const raw = await this.kv.get(obj.key);
+        const loc = raw ? parseLocator(raw.value) : null;
+        if (loc) {
+          total += loc.size;
+        }
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    return total;
   }
 
   private async usage(bucket: string): Promise<number> {
@@ -1220,20 +1343,25 @@ export class ObjectCluster {
     return Number.isFinite(n) ? n : 0;
   }
 
-  private async addUsage(bucket: string, delta: number): Promise<void> {
+  private async addUsage(bucket: string, delta: number, limits?: BucketLimits): Promise<void> {
     if (delta === 0) {
       return;
     }
-    const next = Math.max(0, (await this.usage(bucket)) + delta);
+    const marker = limits ?? (await this.limitsFor(bucket));
+    if (typeof marker.quotaBytes !== 'number') {
+      return;
+    }
+    const next = Math.max(0, (await this.usageCached(bucket)) + delta);
+    this.usageMem.set(bucket, next);
     await this.kv.put(usageKey(bucket), Buffer.from(String(next)));
   }
 
-  private async assertQuota(bucket: string, delta: number): Promise<void> {
-    const marker = await this.bucketMarker(bucket);
+  private async assertQuota(bucket: string, delta: number, limits?: BucketLimits): Promise<void> {
+    const marker = limits ?? (await this.limitsFor(bucket));
     if (typeof marker.quotaBytes !== 'number' || delta <= 0) {
       return;
     }
-    const used = await this.usage(bucket);
+    const used = await this.usageCached(bucket);
     if (used + delta > marker.quotaBytes) {
       throw new ControlError('BAD_REQUEST', `bucket ${bucket} quota ${marker.quotaBytes}`);
     }

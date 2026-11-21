@@ -45,7 +45,7 @@ Design documents are in Chinese.
 | [Launch criteria](docs/diff/production.md) | Someone deciding whether a cluster may hold the only copy | Acceptance tests and the on-cluster drill |
 | [Scale](docs/scale.md) | Someone sizing capacity | How 100 EB of business data becomes block and index machines, plus a 50 PB disk case |
 | [Recovery](docs/design-recovery.md) | Someone judging failure impact | Which requests continue |
-| [Benchmarks](docs/benchmarks.md) | Someone citing numbers | Full tables from the 2026-11-17 single-host run |
+| [Benchmarks](docs/benchmarks.md) | Someone citing numbers | One file per date under `docs/benchmarks/` |
 | [Todo](docs/todo.md) | Someone scheduling work | Items that are still open |
 | [First patrol](docs/milestones/2026-11-20-first-patrol.md) | Someone looking for the first end-to-end run | 2026-11-20, from process start to the local model's conclusion |
 

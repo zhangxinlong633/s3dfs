@@ -1,0 +1,136 @@
+{
+  "at": "2026-11-21T05:05:52.231Z",
+  "host": "Apple M5 Pro arm64",
+  "bun": "1.4.2",
+  "note": "localhost, compress=none, random bytes. N is object copies on one machine. Not a target-cluster capacity number.",
+  "results": [
+    {
+      "name": "cluster put 1KiB  N=1  none",
+      "ops": 1000,
+      "opsPerSec": 2900.971000539125,
+      "p50Ns": 326375,
+      "p99Ns": 746375,
+      "elapsedSec": 0.344712167
+    },
+    {
+      "name": "cluster get 1KiB  N=1  none",
+      "ops": 1000,
+      "opsPerSec": 7531.266504770545,
+      "p50Ns": 120500,
+      "p99Ns": 272208,
+      "elapsedSec": 0.132779792
+    },
+    {
+      "name": "cluster put 10KiB  N=1  none",
+      "ops": 400,
+      "opsPerSec": 2659.1906535192384,
+      "p50Ns": 347417,
+      "p99Ns": 773416,
+      "elapsedSec": 0.150421708
+    },
+    {
+      "name": "cluster get 10KiB  N=1  none",
+      "ops": 400,
+      "opsPerSec": 6708.75954851457,
+      "p50Ns": 140709,
+      "p99Ns": 279834,
+      "elapsedSec": 0.059623541
+    },
+    {
+      "name": "cluster put 100KiB  N=1  none",
+      "ops": 80,
+      "opsPerSec": 1215.3021734919807,
+      "p50Ns": 769167,
+      "p99Ns": 1599209,
+      "elapsedSec": 0.06582725
+    },
+    {
+      "name": "cluster get 100KiB  N=1  none",
+      "ops": 80,
+      "opsPerSec": 2784.2226732198915,
+      "p50Ns": 341375,
+      "p99Ns": 843125,
+      "elapsedSec": 0.028733334
+    },
+    {
+      "name": "cluster put 1MiB  N=1  none",
+      "ops": 40,
+      "opsPerSec": 195.03335375088756,
+      "p50Ns": 5006125,
+      "p99Ns": 6407583,
+      "elapsedSec": 0.205093125
+    },
+    {
+      "name": "cluster get 1MiB  N=1  none",
+      "ops": 40,
+      "opsPerSec": 385.140787011127,
+      "p50Ns": 2462958,
+      "p99Ns": 3504042,
+      "elapsedSec": 0.103858125
+    },
+    {
+      "name": "cluster put 1KiB  N=3  none",
+      "ops": 1000,
+      "opsPerSec": 2215.5268213936833,
+      "p50Ns": 411833,
+      "p99Ns": 956083,
+      "elapsedSec": 0.451359916
+    },
+    {
+      "name": "cluster get 1KiB  N=3  none",
+      "ops": 1000,
+      "opsPerSec": 3562.327663938729,
+      "p50Ns": 257375,
+      "p99Ns": 590167,
+      "elapsedSec": 0.280715334
+    },
+    {
+      "name": "cluster put 10KiB  N=3  none",
+      "ops": 400,
+      "opsPerSec": 1933.9838668419616,
+      "p50Ns": 452666,
+      "p99Ns": 1214875,
+      "elapsedSec": 0.206826958
+    },
+    {
+      "name": "cluster get 10KiB  N=3  none",
+      "ops": 400,
+      "opsPerSec": 3396.9170243485833,
+      "p50Ns": 276583,
+      "p99Ns": 581792,
+      "elapsedSec": 0.117753833
+    },
+    {
+      "name": "cluster put 100KiB  N=3  none",
+      "ops": 80,
+      "opsPerSec": 953.1359949449479,
+      "p50Ns": 943541,
+      "p99Ns": 2134625,
+      "elapsedSec": 0.083933458
+    },
+    {
+      "name": "cluster get 100KiB  N=3  none",
+      "ops": 80,
+      "opsPerSec": 1924.5959196593792,
+      "p50Ns": 480333,
+      "p99Ns": 1136667,
+      "elapsedSec": 0.041567167
+    },
+    {
+      "name": "cluster put 1MiB  N=3  none",
+      "ops": 40,
+      "opsPerSec": 162.40390256577865,
+      "p50Ns": 5852333,
+      "p99Ns": 7957917,
+      "elapsedSec": 0.2462995
+    },
+    {
+      "name": "cluster get 1MiB  N=3  none",
+      "ops": 40,
+      "opsPerSec": 361.1109147570512,
+      "p50Ns": 2671792,
+      "p99Ns": 3661875,
+      "elapsedSec": 0.110769291
+    }
+  ]
+}

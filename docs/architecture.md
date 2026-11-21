@@ -58,7 +58,7 @@ magic u32 | rec_len u32 | tags… | crc32 u32 | rec_len u32 | magic u32
 
 能放进当前块剩余空间的对象，仍是一条记录。更大的对象会切成多段，后一段用 prev tag 记下前一段的 `recId`，dleveldb 只存最后一段的 locator。读取时从 last 往前走完链条，再从前向后取数。详细说明见 [大文件跨 block 存放](design-large-object.md)。
 
-## Compaction
+## 压缩整理
 
 删除和覆盖会立刻对用户不可见，但 `.blk` 里的空洞不在当时重写。节点先出一张清理票；空闲时、按空洞比例，或手动调用 `POST /_s3dfs/block/compact` / 控制面 `compact()` 时，把还活着的记录（保留原来的 `recId`）写到新文件，更新内存映射，再删除旧文件，这一步不写 dleveldb。后台周期由 `S3DFS_COMPACT_INTERVAL_MS`（默认 30 秒，0 表示关闭）和 `S3DFS_COMPACT_DEAD_RATIO`（默认 0.2）控制。说明见 [删除空洞与 compact（虚拟记录 ID）](design-compaction.md)。
 

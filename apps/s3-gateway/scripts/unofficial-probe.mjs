@@ -328,7 +328,7 @@ console.log(capOk ? '\ncapability: ALL PASS' : '\ncapability: FAILED');
 const bench = await perf();
 
 const published = {
-  source: 'docs/bench-2026-11-17.json (official, do not treat this probe as a replacement)',
+  source: 'docs/benchmarks/bench-2026-11-17.json (official, do not treat this probe as a replacement)',
   measuredAt: '2026-11-17T00:40+08:00',
   method: 'in-process ObjectCluster.put/get, HTTP to index+block, not via S3 gateway',
   'cluster put 1KiB N=1 none seq': 6937,
@@ -358,7 +358,7 @@ const report = {
     concurrency: [1, 32],
     s3Client: 'node:http keep-alive Agent against C gateway',
     clusterClient: 'packages/control ObjectCluster against the same index+block (no S3 gateway)',
-    note: 'Not official pnpm bench. Official file docs/bench-2026-11-17.json was not modified.',
+    note: 'Not official pnpm bench. Official file docs/benchmarks/bench-2026-11-17.json was not modified.',
   },
   capability: { allPass: capOk, results },
   bench,

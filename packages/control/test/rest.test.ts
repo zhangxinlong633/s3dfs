@@ -208,13 +208,25 @@ describe('remaining designs', () => {
     const box = open();
     try {
       await box.cluster.put('logs', 'a.txt', Buffer.from('one'));
-      const puts = box.calls.filter((url) => url.includes('/_s3dfs/block/put')).length;
       expect(await box.cluster.shareCopy('logs', 'a.txt', 'logs', 'b.txt')).toBe(true);
-      expect(box.calls.filter((url) => url.includes('/_s3dfs/block/put')).length).toBe(puts);
+      expect((await box.cluster.locators('logs/b.txt'))[0]?.dataKey).toMatch(/^\$obj\//);
       expect((await box.cluster.get('logs', 'b.txt'))?.value.toString('utf8')).toBe('one');
       await box.cluster.put('logs', 'a.txt', Buffer.from('two'));
       expect((await box.cluster.get('logs', 'a.txt'))?.value.toString('utf8')).toBe('two');
       expect((await box.cluster.get('logs', 'b.txt'))?.value.toString('utf8')).toBe('one');
+    } finally {
+      box.restore();
+    }
+  });
+
+  test('overwrite keeps the new bytes', async () => {
+    const box = open();
+    try {
+      await box.cluster.put('logs', 'a.txt', Buffer.from('one'));
+      expect((await box.cluster.locators('logs/a.txt'))[0]?.dataKey).toBeUndefined();
+      await box.cluster.put('logs', 'a.txt', Buffer.from('two'));
+      expect((await box.cluster.get('logs', 'a.txt'))?.value.toString('utf8')).toBe('two');
+      expect((await box.cluster.locators('logs/a.txt'))[0]?.dataKey).toBeUndefined();
     } finally {
       box.restore();
     }

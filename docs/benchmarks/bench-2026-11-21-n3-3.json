@@ -1,0 +1,40 @@
+{
+  "at": "2026-11-21T05:01:55.956Z",
+  "host": "Apple M5 Pro arm64",
+  "bun": "1.4.2",
+  "note": "localhost, three block processes on one machine, compress=none. Not a target-cluster capacity number.",
+  "results": [
+    {
+      "name": "cluster put 1KiB  N=3  none",
+      "ops": 1000,
+      "opsPerSec": 2175.427566691811,
+      "p50Ns": 409916,
+      "p99Ns": 1036833,
+      "elapsedSec": 0.45967975
+    },
+    {
+      "name": "cluster get 1KiB  N=3  none",
+      "ops": 1000,
+      "opsPerSec": 3707.061793684017,
+      "p50Ns": 251459,
+      "p99Ns": 562959,
+      "elapsedSec": 0.269755417
+    },
+    {
+      "name": "cluster put 1MiB  N=3  none",
+      "ops": 40,
+      "opsPerSec": 157.79336457126493,
+      "p50Ns": 6217042,
+      "p99Ns": 7743250,
+      "elapsedSec": 0.253496084
+    },
+    {
+      "name": "cluster get 1MiB  N=3  none",
+      "ops": 40,
+      "opsPerSec": 349.9614849887696,
+      "p50Ns": 2752334,
+      "p99Ns": 3916083,
+      "elapsedSec": 0.114298292
+    }
+  ]
+}

@@ -16,7 +16,7 @@
 
 | 事项 | 状态 | 关闭条件 |
 | --- | --- | --- |
-| 上线容量 | 本机已测，目标集群未测 | 在准备上线的机器和网络上测出 1 KiB 与 1 MiB、3 副本的读写数字，写入 [benchmarks.md](benchmarks.md)。2026-11-21 的两次 localhost 测量只说明形状，不能用来定容量 |
+| 上线容量 | 本机已测，目标集群未测 | 在准备上线的机器和网络上测出 1 KiB 与 1 MiB、3 副本的读写数字，写入 [benchmarks.md](benchmarks.md)。2026-11-21 的三次 localhost 测量只说明形状，不能用来定容量 |
 | 目标集群演练 | 本机已演练，目标集群未做 | 在准备承接流量的集群上完成下面五步，把命令、时间和结果写入部署笔记。本机笔记见 [2026-11-21 本机演练](milestones/2026-11-21-local-drill.md)。没有目标集群的笔记，该集群不能当作唯一副本 |
 
 演练步骤与上线标准第 3 节相同：
@@ -139,7 +139,7 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 | 变更只记名字 | [NTFS](diff/ntfs.md) 的 USN，[SMB](diff/smb.md) 的变更通知 | 追加一条日志：操作、bucket、key、时间。不写正文。增量备份和审计从这个日志读，而不是扫全部 key。代码已补：Put 和 Delete 写 `$chg/` | 小文件不因此写进索引。不替代对象正文的 3 副本 | 连续 Put、覆盖、Delete 之后，日志顺序与操作一致，条目里没有正文 |
 | 坏段不要整对象重读 | [GFS](diff/gfs.md) 的 64 KiB 校验和 | 代码已补：Put 在 locator 上记下每 64 KiB 的 CRC。Get 对不上时只向下一份重取那一段 | 不引入主副本租约，写不等齐 3 份 | `packages/control/test/rest.test.ts`：坏段重取两次，好段只取一次 |
 | 同集群 Copy 先共享记录 | [APFS](diff/apfs.md) 克隆，[Ceph Block](diff/ceph-block.md) 从快照克隆 | 代码已补：`shareCopy` 让目标 locator 指向已有记录并记 `$ref/`。覆盖改走新的 `dataKey`，不退役仍被引用的记录。引用归零才墓碑 | 不代替跨 zone 的 3 副本。共享只发生在已经写成功的记录上 | `packages/control/test/rest.test.ts`：Copy 不再 Put；改一边之后另一边字节不变 |
-| 桶是配额和压缩的边界 | [ZFS](diff/zfs.md) 数据集，[Btrfs](diff/btrfs.md) 子卷 | 桶上可以关掉压缩，并设逻辑字节上限。超过上限的 Put 失败，其他桶不受影响。代码已补：`setBucketLimits` | 不做目录配额，不做子卷和 POSIX | 一个桶达到上限后继续 Put 得到明确错误，另一个桶仍可写 |
+| 桶是配额和压缩的边界 | [ZFS](diff/zfs.md) 数据集，[Btrfs](diff/btrfs.md) 子卷 | 桶上可以关掉压缩，并设逻辑字节上限。超过上限的 Put 失败，其他桶不受影响。代码已补：`setBucketLimits`。没设配额时不写 `$usage/`，设上之后按 locator 合计已有字节再往下记 | 不做目录配额，不做子卷和 POSIX | 一个桶达到上限后继续 Put 得到明确错误，另一个桶仍可写 |
 | 故障域按最紧的盘记账 | [FastDFS](diff/fastdfs.md) 的组容量 | 健康检查按 zone 给出可写字节，并标出同 zone 里明显更小的盘。加一块大盘不把这个数抬高。代码已补：block 报 `freeBytes`，健康检查带 `zones` | 不改成单台落盘就返回 | 同 zone 两块盘容量差一倍时，健康输出里的可写字节等于较小的那块 |
 | 搬旧数据是单独任务，默认关闭 | [Btrfs](diff/btrfs.md) 的 balance | 代码已补：`POST /_s3dfs/rebalance?nodeId=` 把还没在该节点上的对象复制过去，并去掉一份旧 locator。加节点不会自动调用 | 不在加节点时自动 balance。不做 RAID 5/6 | `packages/control/test/rest.test.ts`：不调用时新节点没有 locator；调用后报告字节数，份数不变 |
 | 另一场地要送出去 | [ZFS](diff/zfs.md) 的 send/recv，[Longhorn](diff/longhorn.md) 的备份目标 | 代码已补：`sendChanges` 按 `$chg/` 把 Put 送到另一套集群的 `put`。之后的 Delete 不删目标。默认不调用 | 不默认开启，不把本集群的 3 副本叫作异地备份 | `packages/control/test/rest.test.ts`：源 Delete 之后，已经送出的对象仍留在目标 |
