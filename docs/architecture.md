@@ -70,7 +70,7 @@ S3 层把对象记成字面量 `bucket/key`。Put 时按 key 的哈希从存活�
 
 ## 故障与恢复
 
-没有测过确定的恢复时间上限。Get 会在本次请求里尝试剩余的数据副本，新的 Put 会躲开已标记为 down 的 block。后台或 `POST /_s3dfs/repair` 会把活副本不足的对象再写到空闲的存活节点，并退役 down 的 locator。没有活副本的对象记为 `lost`，补不回来，本进程的健康检查随之返回 503。索引在剩余副本达到法定人数时仍可写入，节点回来后由 dleveldb 按较新的 mtime 追平。block 重启优先读 `recmap.s3m` 并补扫尾巴，快照不可用才全量扫描。完整说明见 [故障与恢复](design-recovery.md)。一套部署是否可以承接业务，见 [部署](deploy.md) 和 [上线标准](diff/production.md)。
+没有测过确定的恢复时间上限。Get 会在本次请求里尝试剩余的数据副本，新的 Put 会躲开已标记为 down 的 block。后台或 `POST /_s3dfs/repair` 会把活副本不足的对象再写到空闲的存活节点，并退役 down 的 locator。没有活副本的对象记为 `lost`，补不回来，本进程的健康检查随之返回 503。索引在剩余副本达到法定人数时仍可写入，节点回来后由 dleveldb 按较新的 mtime 追平。block 重启优先读 `recmap.s3m` 并补扫尾巴，快照不可用才全量扫描。完整说明见 [故障与恢复](design-recovery.md)。一套部署是否可以承接业务，见 [部署](deploy.md) 和 [上线标准](diff/production.md)。从压缩包启动的步骤在 [部署](deploy.md) 第 8 节，压缩包里也有一份 `使用说明.md`。
 
 ## 对象规模与分布
 

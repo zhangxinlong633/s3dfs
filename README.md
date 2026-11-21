@@ -41,7 +41,7 @@ Design documents are in Chinese.
 | --- | --- | --- |
 | [Architecture](docs/architecture.md) | Someone tracing process boundaries | What the console, API, index, block nodes, and engine each own |
 | [Capabilities](docs/capabilities.md) | Someone integrating or configuring | S3 operations and environment variables |
-| [Deploy](docs/deploy.md) | Someone planning machines | Roles, replicas, and the public entry |
+| [Deploy](docs/deploy.md) | Someone planning machines or on call | Roles, replicas, the public entry, and systemd, Docker, and Kubernetes examples |
 | [Launch criteria](docs/diff/production.md) | Someone deciding whether a cluster may hold the only copy | Acceptance tests and the on-cluster drill |
 | [Scale](docs/scale.md) | Someone sizing capacity | How 100 EB of business data becomes block and index machines, plus a 50 PB disk case |
 | [Recovery](docs/design-recovery.md) | Someone judging failure impact | Which requests continue |
@@ -99,7 +99,35 @@ S3DFS_PATROL_TOKEN=local-token S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
 
 `pnpm dev:api` sets one replica and turns strict layout off, for a single machine. The patrol process and the API share `S3DFS_PATROL_TOKEN`. Production layout is in [Deploy](docs/deploy.md). The first boot-to-conclusion run is in [First patrol](docs/milestones/2026-11-20-first-patrol.md).
 
-A release is the top-level `dist/` directory, not the per-app build folders. `pnpm dist` compiles, then gathers the API, console, block, patrol, and engine there. Runtime dependencies sit only in `dist/node_modules`. From `dist/`, run `npm run start:api`, `start:block`, `start:web`, or `start:patrol`. `pnpm dev` still starts each package from its own directory.
+What you install on a machine is the GitHub Release file `s3dfs-<version>-<os>-<arch>.tar.gz`. The archive contains `使用说明.md`. `pnpm dev` still starts each package from its own directory.
+
+## Run from the archive
+
+Download the archive that matches the machine, and extract it to `/opt/s3dfs`. The index is a separate dleveldb process. Data stays in `/var/lib/s3dfs`; do not delete that directory when replacing a version. This example is one machine and one replica. Several machines, systemd, Docker, and Kubernetes are in [Deploy](docs/deploy.md) section 8.
+
+```bash
+sudo mkdir -p /opt/s3dfs /var/lib/s3dfs/block/block1
+sudo tar -C /opt/s3dfs -xzf s3dfs-0.1.1-linux-x64.tar.gz
+cd /opt/s3dfs
+export S3DFS_INDEX_URLS=http://127.0.0.1:9800
+export S3DFS_DATA_REPLICAS=1
+export S3DFS_STRICT_LAYOUT=0
+S3DFS_BLOCK_NODE_ID=block1 S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1 S3DFS_ADVERTISE_ADDR=127.0.0.1:9100 bun block/main.js
+```
+
+In another terminal, start the API and check health:
+
+```bash
+cd /opt/s3dfs
+export S3DFS_INDEX_URLS=http://127.0.0.1:9800
+export S3DFS_BLOCK_NODES=block1=127.0.0.1:9100
+export S3DFS_DATA_REPLICAS=1
+export S3DFS_STRICT_LAYOUT=0
+bun api/main.js
+curl -fsS http://127.0.0.1:9000/_s3dfs/health
+```
+
+A production process keeps `S3DFS_STRICT_LAYOUT` on and sets `S3DFS_ACCESS_KEY` and `S3DFS_SECRET_KEY`. Patrol is `bun patrol/main.js`. The console is `npm run start:web`.
 
 ## Connect with the AWS CLI
 

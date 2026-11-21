@@ -18,6 +18,8 @@
     "patrol": "bun apps/patrol/src/main.ts",
     "build": "pnpm --filter @s3dfs/engine build && pnpm --filter @s3dfs/control build && pnpm --filter @s3dfs/api build && pnpm --filter @s3dfs/web build",
     "dist": "pnpm build && bun scripts/stage-dist.mjs",
+    "release": "bun scripts/release.mjs",
+    "deploy:render": "bun scripts/deploy.mjs render --env deploy/envs/prod.env --out deploy/out/prod",
     "build:engine": "pnpm --filter @s3dfs/engine build",
     "build:control": "pnpm --filter @s3dfs/control build",
     "typecheck": "pnpm -r typecheck",

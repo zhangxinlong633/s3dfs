@@ -18,4 +18,4 @@ jobs:
           cache: pnpm
       - uses: oven-sh/setup-bun@v2
       - run: pnpm install --frozen-lockfile
-      - run: bun test packages/control/test apps/api/test
+      - run: bun test packages/control/test apps/api/test scripts/deploy.test.mjs

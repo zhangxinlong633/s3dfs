@@ -1,6 +1,7 @@
 node_modules/
 .pnpm-store/
 dist/
+release/*.tar.gz
 build/
 .next/
 out/

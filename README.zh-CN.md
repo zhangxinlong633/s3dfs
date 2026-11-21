@@ -39,7 +39,7 @@ S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js
 | --- | --- | --- |
 | [架构](docs/architecture.md) | 需要看进程边界的人 | 控制台、API、索引、block、引擎各管什么 |
 | [能力](docs/capabilities.md) | 对接接口和配置的人 | 已提供的 S3 能力与环境变量 |
-| [部署](docs/deploy.md) | 规划机器的人 | 角色、副本、入口 |
+| [部署](docs/deploy.md) | 规划机器和值班的人 | 角色、副本、入口，以及 systemd、Docker、Kubernetes 的例子 |
 | [上线标准](docs/diff/production.md) | 决定能否承接业务数据的人 | 验收项和目标集群演练 |
 | [规模说明](docs/scale.md) | 评估容量和排机器的人 | 100 EB 业务容量如何换成 block 与索引，以及 50 PB 磁盘的案例 |
 | [故障与恢复](docs/design-recovery.md) | 评估故障影响的人 | 哪些请求还能继续 |
@@ -98,7 +98,35 @@ S3DFS_PATROL_TOKEN=本机凭证 S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
 
 `pnpm dev:api` 把副本设为 1 并关闭严格布局，供单机开发。巡检进程和 API 使用同一个 `S3DFS_PATROL_TOKEN`。生产部署见 [部署](docs/deploy.md)。第一次从自启到模型结论的记录见 [里程碑](docs/milestones/2026-11-20-first-patrol.md)。
 
-发版用仓库根的 `dist/`，不要到各个 `apps/*/dist` 里取文件。`pnpm dist` 先编译，再把 API、控制台、block、巡检和引擎收进去。运行时依赖只放在 `dist/node_modules`。在 `dist/` 里用 `npm run start:api`、`start:block`、`start:web`、`start:patrol`。开发时的 `pnpm dev` 仍从各包目录启动。
+发给机器的是 GitHub Release 上的 `s3dfs-<版本>-<系统>-<架构>.tar.gz`。压缩包里有 `使用说明.md`。开发时的 `pnpm dev` 仍从各包目录启动。
+
+## 用压缩包运行
+
+从标签页下载和这台机器系统一致的包，解压到 `/opt/s3dfs`。索引要另外准备好。数据在 `/var/lib/s3dfs`，换版本不要删。下面是一台机器、一份副本的启动。多台机器、systemd、Docker 和 Kubernetes 见 [部署](docs/deploy.md) 第 8 节。
+
+```bash
+sudo mkdir -p /opt/s3dfs /var/lib/s3dfs/block/block1
+sudo tar -C /opt/s3dfs -xzf s3dfs-0.1.1-linux-x64.tar.gz
+cd /opt/s3dfs
+export S3DFS_INDEX_URLS=http://127.0.0.1:9800
+export S3DFS_DATA_REPLICAS=1
+export S3DFS_STRICT_LAYOUT=0
+S3DFS_BLOCK_NODE_ID=block1 S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1 S3DFS_ADVERTISE_ADDR=127.0.0.1:9100 bun block/main.js
+```
+
+另一个终端启动接口，然后看健康检查：
+
+```bash
+cd /opt/s3dfs
+export S3DFS_INDEX_URLS=http://127.0.0.1:9800
+export S3DFS_BLOCK_NODES=block1=127.0.0.1:9100
+export S3DFS_DATA_REPLICAS=1
+export S3DFS_STRICT_LAYOUT=0
+bun api/main.js
+curl -fsS http://127.0.0.1:9000/_s3dfs/health
+```
+
+正式环境把 `S3DFS_STRICT_LAYOUT` 保持开启，并设置 `S3DFS_ACCESS_KEY` 和 `S3DFS_SECRET_KEY`。巡检是 `bun patrol/main.js`，控制台是 `npm run start:web`。
 
 ## 用 AWS CLI 接入
 
