@@ -44,6 +44,8 @@ export {
   type BlockNodeInfo,
   type BlockStats,
   type CompressType,
+  type DiskState,
+  type BlockState,
   type ExtentLocator,
   type ObjectLocator,
   type ObjectValue,

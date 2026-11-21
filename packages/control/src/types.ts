@@ -1,5 +1,9 @@
 export type BlockNodeStatus = 'up' | 'down' | 'unknown';
 export type CompressType = 'none' | 'zstd' | 'gzip';
+/** Whether this node's volume can take another appended record. */
+export type DiskState = 'ok' | 'low' | 'full' | 'readonly' | 'error';
+/** Whether the block process is ready to append. */
+export type BlockState = 'starting' | 'serving' | 'compacting';
 
 export interface BlockNodeInfo {
   nodeId: string;
@@ -13,6 +17,11 @@ export interface BlockNodeInfo {
   draining?: boolean;
   /** Bytes still available on the node's data volume. */
   freeBytes?: number;
+  disk?: DiskState;
+  block?: BlockState;
+  /** Set while a maintenance leave is still inside its window. */
+  maintenanceReason?: string;
+  maintenanceUntilMs?: number;
 }
 
 export interface BlockStats {

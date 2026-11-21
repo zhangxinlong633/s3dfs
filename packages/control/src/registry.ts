@@ -43,6 +43,11 @@ export class NodeRegistry {
     return candidates.filter((n) => n.status === 'unknown');
   }
 
+  /** Nodes that can accept a new appended record. Reads still use live(). */
+  writable(): BlockNodeInfo[] {
+    return this.live().filter((node) => acceptsWrites(node));
+  }
+
   noteDraining(nodeId: string, draining: boolean): void {
     const node = this.nodes.get(nodeId);
     if (!node) {
@@ -79,6 +84,10 @@ export class NodeRegistry {
           lastSeenMs: parsed.lastSeenMs ?? prev?.lastSeenMs ?? 0,
           lastError: parsed.lastError,
           zone: parsed.zone ?? prev?.zone,
+          draining: parsed.draining ?? prev?.draining,
+          freeBytes: parsed.freeBytes ?? prev?.freeBytes,
+          disk: parsed.disk ?? prev?.disk,
+          block: parsed.block ?? prev?.block,
         });
       }
     } catch {
@@ -105,6 +114,8 @@ export class NodeRegistry {
             zone: node.zone,
             draining: node.draining,
             freeBytes: health.freeBytes,
+            disk: health.disk,
+            block: health.block,
           }
         : {
             ...node,
@@ -124,9 +135,12 @@ export class NodeRegistry {
 
   /** Pick `n` distinct live block nodes, starting from a hash of the object key. */
   pick(objectKey: string, n: number): BlockNodeInfo[] {
-    const live = this.live();
+    const live = this.writable();
     if (live.length === 0) {
-      throw new ControlError('BLOCK_UNAVAILABLE', 'no live block nodes');
+      const why = this.list()
+        .map((node) => `${node.nodeId}:${node.status}/${node.disk ?? 'disk?'}/${node.block ?? 'block?'}`)
+        .join(',');
+      throw new ControlError('BLOCK_UNAVAILABLE', `no block node can take a write (${why || 'none'})`);
     }
     const want = Math.max(1, Math.min(n, live.length));
     const digest = createHash('sha1').update(objectKey).digest();
@@ -156,6 +170,23 @@ export class NodeRegistry {
     }
     return out;
   }
+}
+
+/** A new record needs a process that is up and a volume that can be appended. */
+export function acceptsWrites(node: { draining?: boolean; status?: string; disk?: string; block?: string }): boolean {
+  if (node.draining) {
+    return false;
+  }
+  if (node.status !== 'up' && node.status !== 'unknown') {
+    return false;
+  }
+  if (node.disk === 'low' || node.disk === 'full' || node.disk === 'readonly' || node.disk === 'error') {
+    return false;
+  }
+  if (node.block === 'starting' || node.block === 'compacting') {
+    return false;
+  }
+  return true;
 }
 
 export function parseBlockNodes(raw: string | undefined): SeedNode[] {

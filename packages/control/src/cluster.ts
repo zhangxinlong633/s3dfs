@@ -452,11 +452,17 @@ export class ObjectCluster {
   }
 
   private prefer(locs: ObjectLocator[]): ObjectLocator[] {
-    return [...locs].sort((a, b) => {
-      const ad = this.registry.isDown(a.nodeId) ? 1 : 0;
-      const bd = this.registry.isDown(b.nodeId) ? 1 : 0;
-      return ad - bd || a.replica - b.replica;
-    });
+    const rank = (nodeId: string): number => {
+      const node = this.registry.get(nodeId);
+      if (!node || node.status === 'down' || node.disk === 'error') {
+        return 2;
+      }
+      if (node.block === 'starting') {
+        return 1;
+      }
+      return 0;
+    };
+    return [...locs].sort((a, b) => rank(a.nodeId) - rank(b.nodeId) || a.replica - b.replica);
   }
 
   async get(bucket: string, key: string): Promise<ObjectValue | null> {
@@ -785,6 +791,12 @@ export class ObjectCluster {
       acc.flushes += s.flushes;
       acc.fsyncs += s.fsyncs;
     }
+    const leaves = await this.maintenanceLeaves();
+    for (const node of blockNodes) {
+      const leave = leaves.find((item) => item.nodeId === node.nodeId);
+      node.maintenanceReason = leave?.reason;
+      node.maintenanceUntilMs = leave?.untilMs;
+    }
     return acc;
   }
 
@@ -1048,9 +1060,14 @@ export class ObjectCluster {
     }
   }
 
+  private canTombstone(nodeId: string): boolean {
+    const disk = this.registry.get(nodeId)?.disk;
+    return disk !== 'error' && disk !== 'readonly' && disk !== 'full';
+  }
+
   /** Tombstone a copy the index no longer names. A down node keeps a ticket until it returns. */
   private async releaseOrQueue(loc: ObjectLocator, objectKey: string): Promise<void> {
-    if (this.registry.isDown(loc.nodeId)) {
+    if (this.registry.isDown(loc.nodeId) || !this.canTombstone(loc.nodeId)) {
       await this.queueGc(loc, objectKey);
       return;
     }
@@ -1082,6 +1099,9 @@ export class ObjectCluster {
     for (;;) {
       const listed = await this.kv.scan({ prefix: BACK_PREFIX, startAfter, maxKeys: 1000 });
       for (const obj of listed.objects) {
+        if (!obj.key.startsWith(BACK_PREFIX)) {
+          continue;
+        }
         const raw = await this.kv.get(obj.key);
         if (!raw) {
           continue;
@@ -1109,11 +1129,18 @@ export class ObjectCluster {
       let records: { key: string; locator: { recId?: number } }[];
       try {
         records = await blockScan(notice.address);
+        if (!Array.isArray(records)) {
+          continue;
+        }
       } catch {
         continue;
       }
       const known = this.registry.get(notice.nodeId);
+      if (known?.disk === 'error') {
+        continue;
+      }
       await this.registry.upsert({
+        ...known,
         nodeId: notice.nodeId,
         address: notice.address,
         status: 'up',
@@ -1133,6 +1160,29 @@ export class ObjectCluster {
         if (referenced.has(`${notice.nodeId}/${recId}`)) {
           kept++;
           await this.kv.delete(`${GC_PREFIX}${notice.nodeId}/${recId}`);
+          continue;
+        }
+        if (!this.canTombstone(notice.nodeId)) {
+          await this.queueGc(
+            {
+              v: 3,
+              replica: 0,
+              replicaCount: 1,
+              nodeId: notice.nodeId,
+              address: notice.address,
+              recId,
+              chained: false,
+              generation: 1,
+              extentCount: 1,
+              size: 0,
+              storedSize: 0,
+              compressType: 'none',
+              crc: 0,
+              mtimeMs: 0,
+              dataKey: record.key,
+            },
+            record.key,
+          );
           continue;
         }
         try {
@@ -1176,6 +1226,9 @@ export class ObjectCluster {
     for (;;) {
       const listed = await this.kv.scan({ prefix: GC_PREFIX, startAfter, maxKeys: 1000 });
       for (const obj of listed.objects) {
+        if (!obj.key.startsWith(GC_PREFIX)) {
+          continue;
+        }
         const raw = await this.kv.get(obj.key);
         if (!raw) {
           continue;
@@ -1532,6 +1585,9 @@ export class ObjectCluster {
     for (;;) {
       const listed = await this.kv.scan({ prefix: MAINT_PREFIX, startAfter, maxKeys: 1000 });
       for (const obj of listed.objects) {
+        if (!obj.key.startsWith(MAINT_PREFIX)) {
+          continue;
+        }
         const raw = await this.kv.get(obj.key);
         if (!raw) {
           continue;
@@ -1791,7 +1847,7 @@ export class ObjectCluster {
   }
 
   private pickAdditional(objectKey: string, need: number, held: Set<string>) {
-    const live = this.registry.live().filter((n) => !held.has(n.nodeId));
+    const live = this.registry.writable().filter((n) => !held.has(n.nodeId));
     if (live.length === 0 || need <= 0) {
       return [];
     }

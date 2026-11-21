@@ -339,6 +339,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
           locators: counts === 'incomplete' ? 1 : (counts.get(node.nodeId) ?? 0),
           draining: Boolean(node.draining),
           unflushedBytes: node.stats?.unflushedBytes ?? 0,
+          disk: node.disk,
+          block: node.block,
+          freeBytes: node.freeBytes,
+          maintenanceReason: node.maintenanceReason,
         })),
       },
       layout: {

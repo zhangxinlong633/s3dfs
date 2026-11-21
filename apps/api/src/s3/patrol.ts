@@ -10,6 +10,10 @@ export interface BlockView {
   locators: number;
   draining: boolean;
   unflushedBytes: number;
+  disk?: 'ok' | 'low' | 'full' | 'readonly' | 'error';
+  block?: 'starting' | 'serving' | 'compacting';
+  freeBytes?: number;
+  maintenanceReason?: string;
 }
 
 export interface PatrolSnapshot {
@@ -230,11 +234,43 @@ export function reviewPatrol(snapshot: PatrolSnapshot, previous: PatrolFinding[]
     const names = down.map((node) => node.nodeId).join('、');
     decisions.push(decision(snapshot, downFinding, 'note', false, '宕机节点上的副本要等节点恢复或由修复改写到其他节点', `block ${names} 不在线`));
   }
+  const blocked = snapshot.block.nodes.flatMap((node) => {
+    if (!node.up) {
+      return [];
+    }
+    const parts: string[] = [];
+    if (node.draining) {
+      parts.push(node.maintenanceReason ? `维护（${node.maintenanceReason}）` : '退出中');
+    }
+    if (node.disk === 'low') {
+      parts.push('磁盘空间偏低');
+    } else if (node.disk === 'full') {
+      parts.push('磁盘已满');
+    } else if (node.disk === 'readonly') {
+      parts.push('磁盘只读');
+    } else if (node.disk === 'error') {
+      parts.push('磁盘不可读');
+    }
+    if (node.block === 'starting') {
+      parts.push('block 启动中');
+    } else if (node.block === 'compacting') {
+      parts.push('block 合并中');
+    }
+    return parts.length > 0 ? [`${node.nodeId} ${parts.join('，')}`] : [];
+  });
+  if (blocked.length > 0) {
+    const marker = finding('block', 'notWritable', blocked.length, 0, true);
+    findings.push(marker);
+    decisions.push(decision(snapshot, marker, 'note', false, '这些节点在线，但当前不接收新写入', blocked.join('；')));
+  }
 
   const apply = APPLY_ORDER.filter((action) => decisions.some((item) => item.apply && item.action === action));
   const watch: string[] = [];
   if (down.length > 0) {
     watch.push(`查看 block ${down.map((node) => node.nodeId).join('、')} 是否仍在监听`);
+  }
+  for (const line of blocked) {
+    watch.push(`${line}，新写入会避开它`);
   }
   for (const incident of snapshot.care.incidents ?? []) {
     if (incident.next) {

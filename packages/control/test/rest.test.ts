@@ -436,4 +436,19 @@ describe('remaining designs', () => {
       box.restore();
     }
   });
+
+  test('a full or compacting node is not used for a new copy', async () => {
+    const box = open();
+    try {
+      await box.registry.upsert({ nodeId: 'a', address: '10.0.0.1:9100', status: 'up', lastSeenMs: 1, zone: 'z1', disk: 'full', block: 'serving' });
+      await box.registry.upsert({ nodeId: 'b', address: '10.0.0.2:9100', status: 'up', lastSeenMs: 1, zone: 'z2', disk: 'ok', block: 'serving' });
+      await box.cluster.put('logs', 'a.txt', Buffer.from('x'));
+      const locs = await box.cluster.locators('logs/a.txt');
+      expect(locs.every((loc) => loc.nodeId !== 'a')).toBe(true);
+      await box.registry.upsert({ nodeId: 'b', address: '10.0.0.2:9100', status: 'up', lastSeenMs: 1, zone: 'z2', disk: 'ok', block: 'compacting' });
+      await expect(box.cluster.put('logs', 'b.txt', Buffer.from('y'))).rejects.toThrow(/no block node can take a write/);
+    } finally {
+      box.restore();
+    }
+  });
 });

@@ -1,9 +1,9 @@
 import http from 'node:http';
-import { statfsSync } from 'node:fs';
+import { accessSync, constants, statfsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
-import { IndexClient, nodeKey, parseIndexUrls, writeLayoutFile, BACK_PREFIX, type BlockNodeInfo } from '@s3dfs/control';
+import { IndexClient, nodeKey, parseIndexUrls, writeLayoutFile, BACK_PREFIX, type BlockNodeInfo, type BlockState, type DiskState } from '@s3dfs/control';
 import { Store } from '@s3dfs/engine';
 
 const dataDir = path.resolve(process.env.S3DFS_DATA_DIR ?? './data/block');
@@ -23,6 +23,7 @@ const store = Store.open({
   bufferSize: Number(process.env.S3DFS_BUFFER_SIZE ?? 1_048_576) || undefined,
   fsyncOnFlush: process.env.S3DFS_FSYNC_ON_FLUSH !== '0',
 });
+let blockState: BlockState = 'starting';
 
 const indexUrls = parseIndexUrls(process.env.S3DFS_INDEX_URLS);
 const kv = indexUrls.length > 0 ? new IndexClient(indexUrls) : null;
@@ -91,21 +92,51 @@ function metaHeaders(res: ServerResponse, meta: { size: number; crc: number; mti
 }
 
 function volumeFreeBytes(dir: string): number {
+  return diskView(dir).freeBytes;
+}
+
+function diskView(dir: string): { disk: DiskState; freeBytes: number } {
+  let freeBytes = 0;
   try {
     const stat = statfsSync(dir);
-    return Number(stat.bavail) * Number(stat.bsize);
+    freeBytes = Number(stat.bavail) * Number(stat.bsize);
   } catch {
-    return 0;
+    return { disk: 'error', freeBytes: 0 };
+  }
+  try {
+    accessSync(dir, constants.W_OK);
+  } catch {
+    return { disk: 'readonly', freeBytes };
+  }
+  const reserve = Number(process.env.S3DFS_DISK_RESERVE_BYTES ?? 1_073_741_824);
+  if (freeBytes <= 0) {
+    return { disk: 'full', freeBytes };
+  }
+  if (Number.isFinite(reserve) && reserve > 0 && freeBytes < reserve) {
+    return { disk: 'low', freeBytes };
+  }
+  return { disk: 'ok', freeBytes };
+}
+
+function runCompact(): ReturnType<Store['compact']> {
+  blockState = 'compacting';
+  try {
+    return store.compact();
+  } finally {
+    blockState = 'serving';
   }
 }
 
 function snapshot(): BlockNodeInfo & { stats: ReturnType<Store['stats']>; freeBytes: number } {
+  const disk = diskView(dataDir);
   return {
     nodeId,
     address: advertise,
     status: 'up',
     lastSeenMs: Date.now(),
-    freeBytes: volumeFreeBytes(dataDir),
+    freeBytes: disk.freeBytes,
+    disk: disk.disk,
+    block: blockState,
     stats: store.stats(),
   };
 }
@@ -282,7 +313,7 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     return;
   }
   if (pathname === '/_s3dfs/block/compact' && method === 'POST') {
-    const stats = store.compact();
+    const stats = runCompact();
     sendJson(res, 200, stats);
     return;
   }
@@ -319,7 +350,7 @@ function maybeCompact(): void {
     return;
   }
   if (st.deadBytes / disk >= compactDeadRatio) {
-    store.compact();
+    runCompact();
   }
 }
 
@@ -333,6 +364,7 @@ const compactTimer =
     : null;
 
 server.listen(port, host, () => {
+  blockState = 'serving';
   console.log(`s3dfs block ${nodeId} listening on ${host}:${port} (advertise ${advertise}, data ${dataDir})`);
   void announce(true);
 });

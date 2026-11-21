@@ -8,6 +8,13 @@ type BlockNode = {
   status: 'up' | 'down' | 'unknown';
   lastSeenMs: number;
   lastError?: string;
+  zone?: string;
+  draining?: boolean;
+  freeBytes?: number;
+  disk?: 'ok' | 'low' | 'full' | 'readonly' | 'error';
+  block?: 'starting' | 'serving' | 'compacting';
+  maintenanceReason?: string;
+  maintenanceUntilMs?: number;
 };
 
 type Stats = {
@@ -36,7 +43,42 @@ function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  if (n < 1024 * 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  return `${(n / 1024 / 1024 / 1024 / 1024).toFixed(2)} TB`;
+}
+
+function nodeText(status: BlockNode['status']): string {
+  if (status === 'up') return '在线';
+  if (status === 'down') return '离线';
+  return '尚未探活';
+}
+
+function diskText(disk: BlockNode['disk']): string {
+  if (disk === 'ok') return '正常';
+  if (disk === 'low') return '空间偏低';
+  if (disk === 'full') return '已满';
+  if (disk === 'readonly') return '只读';
+  if (disk === 'error') return '不可读';
+  return '未知';
+}
+
+function blockText(block: BlockNode['block']): string {
+  if (block === 'serving') return '服务中';
+  if (block === 'compacting') return '合并中';
+  if (block === 'starting') return '启动中';
+  return '未知';
+}
+
+function writeText(node: BlockNode): string {
+  if (node.status !== 'up') return '不可用';
+  if (node.maintenanceReason) {
+    const until = node.maintenanceUntilMs ? `，至 ${new Date(node.maintenanceUntilMs).toLocaleString()}` : '';
+    return `维护中：${node.maintenanceReason}${until}`;
+  }
+  if (node.draining) return '退出中';
+  if (node.disk === 'low' || node.disk === 'full' || node.disk === 'readonly' || node.disk === 'error') return '磁盘不接收新写入';
+  if (node.block === 'starting' || node.block === 'compacting') return '暂不追加';
+  return '可写';
 }
 
 export default function Page() {
@@ -135,27 +177,35 @@ export default function Page() {
           Compact
         </button>
       </section>
-      <section className="card" style={{ marginTop: 24, padding: 0 }}>
+      <section className="card nodes" style={{ marginTop: 24, padding: 0 }}>
         <table>
           <thead>
             <tr>
-              <th>Block 节点</th>
+              <th>编号</th>
               <th>地址</th>
-              <th>状态</th>
+              <th>节点</th>
+              <th>磁盘</th>
+              <th>剩余空间</th>
+              <th>block</th>
+              <th>写入</th>
               <th>最近一次检查</th>
             </tr>
           </thead>
           <tbody>
             {nodes.length === 0 ? (
               <tr>
-                <td colSpan={4}>还没有 block 节点</td>
+                <td colSpan={8}>还没有 block 节点</td>
               </tr>
             ) : (
               nodes.map((n) => (
                 <tr key={n.nodeId}>
                   <td>{n.nodeId}</td>
                   <td>{n.address}</td>
-                  <td>{n.status}</td>
+                  <td>{nodeText(n.status)}{n.lastError ? `（${n.lastError}）` : ''}</td>
+                  <td>{diskText(n.disk)}</td>
+                  <td>{typeof n.freeBytes === 'number' ? fmtBytes(n.freeBytes) : '-'}</td>
+                  <td>{blockText(n.block)}</td>
+                  <td className="write">{writeText(n)}</td>
                   <td>{n.lastSeenMs ? new Date(n.lastSeenMs).toLocaleString() : '-'}</td>
                 </tr>
               ))

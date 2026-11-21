@@ -150,6 +150,33 @@ describe('patrol review', () => {
     expect(report.brief).toContain('值班下一步');
   });
 
+  test('notes a full disk for the operator and does not repair it', () => {
+    const report = reviewPatrol(
+      snapshot({
+        block: {
+          nodes: [
+            {
+              nodeId: 'b1',
+              up: true,
+              zone: 'a',
+              bytesOnDisk: 100,
+              deadBytes: 0,
+              locators: 1,
+              draining: true,
+              unflushedBytes: 0,
+              disk: 'full',
+              block: 'compacting',
+              maintenanceReason: '更换系统盘',
+            },
+          ],
+        },
+      }),
+    );
+    expect(report.apply).toEqual([]);
+    expect(report.decisions.some((item) => item.summary.includes('更换系统盘') && item.summary.includes('磁盘已满'))).toBe(true);
+    expect(report.watch.some((line) => line.includes('新写入会避开它'))).toBe(true);
+  });
+
   test('says a single-node layout without zones is not a production failure', () => {
     const report = reviewPatrol(
       snapshot({
