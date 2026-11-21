@@ -5,7 +5,7 @@
 | 日期 | 2026-11-21 |
 | 读者 | 需要逐项确认 S3 与运维能力差异的人 |
 | s3dfs | 以当时仓库的 [架构](../architecture.md)、[能力](../capabilities.md)、[网关](../design-s3-gateway.md) 为准 |
-| RustFS | 以公开材料为准，功能表会继续变化 |
+| RustFS | 对照本机源码：`rustfs/src/server/http.rs` 的配置子资源，`rustfs/src/app` 与 `crates/` 下的实现。README 的功能表会继续变化 |
 
 两边都提供 S3 兼容的对象存储，解决的不是同一件事。RustFS 把纠删码、数据面、控制台和运维放在一个 Rust 进程里。s3dfs 把索引和正文分开扩容，面向大量小对象。Nest API 覆盖 AWS CLI 常用的签名、分片、拷贝、版本、生命周期和单密钥加密；运维面比 RustFS 窄。未关闭事项见 [todo.md](../todo.md)。
 
@@ -59,7 +59,54 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 
 这些和 RustFS 同名的能力，深度不一样。RustFS 的签名背后是 IAM，加密可以接到 Vault / AWS KMS，版本和生命周期是产品功能，通知、复制、配额、审计都在数据面上。s3dfs 这边是一条主路径加一组最小实现：一把密钥、一条策略、一个 webhook。Nest API 已有条件请求、用户元数据和批量删除。
 
-还没做的部分见 [todo.md](../todo.md)。和这次对照直接相关的缺口是：分片完成仍在 API 里拼成一段、`aws-chunked` 仍整段缓冲、C 网关的分块签名、dleveldb 在目标集群上的演练、多机吞吐对照，以及纠删码、站点复制、远程分层、Object Lock、配额、审计、Helm、Swift / SFTP。
+还没做的部分见 [todo.md](../todo.md)，以及下一节按源码逐项列出的缺口。s3dfs 自己的写入路径上仍开着：分片完成时在 API 里拼成一段、`aws-chunked` 仍整段缓冲、C 网关不校验分块签名。
+
+## 源码里有、s3dfs 还没有
+
+`handle.ts` 只认 `policy`、`versioning`、`lifecycle`、`notification` 四个桶配置查询。生命周期是按前缀的天数过期，通知是一个 webhook。RustFS 在 `rustfs/src/server/http.rs` 里为下面这些查询名接了 PUT。其中访问日志和所有权控制，RustFS 自己写明还在计划中；ACL 的 XML grant 返回 `NotImplemented`。其余几项在 `rustfs/src/app` 或 `crates/` 里有对应模块。
+
+| 查询名 | RustFS 源码 | s3dfs |
+| --- | --- | --- |
+| tagging | `rustfs/src/app/object_meta/tagging.rs`，桶和对象标签 | `?tagging` 读写桶标签和对象标签。对象标签存在索引 `$tags/`，不进 `.blk` |
+| cors | `rustfs/src/server/cors.rs`，`rustfs/src/app/bucket_usecase.rs` 的 cors 模块 | `?cors` 保存规则。`OPTIONS` 按来源和方法回预检头 |
+| website | `rustfs/src/app/website.rs` | 没有 |
+| replication | `crates/replication`，桶复制配置 | 没有。`sendChanges` 只把变更送到另一套集群，默认不调用，也没有 S3 复制配置 |
+| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | 没有 |
+| encryption | `crates/kms`：SSE-S3、SSE-KMS、SSE-C，后端可以是本地、Vault KV2、Vault Transit | 桶上的一把 AES-256-GCM。没有 KMS，也没有按对象换密钥 |
+| inventory | `rustfs/src/connect/inventory` | 没有 |
+| requestPayment、accelerate、intelligent-tiering、analytics、metrics、publicAccessBlock | 路由接了这些查询名 | 没有 |
+| logging、ownershipControls | 路由接了；README 写明还在计划中 | 没有 |
+| acl | 路由接了；授权故意不做，XML grant 返回 `NotImplemented` | 没有 |
+
+身份、分层和旁边的协议不在这四个查询里，源码是独立 crate：
+
+| 能力 | RustFS 源码 | s3dfs |
+| --- | --- | --- |
+| IAM | `crates/iam`：用户、组、服务账号、策略、LDAP、多因素 | 一对 `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY`。一份桶策略 |
+| OIDC | README 标可用，认证走 IAM 旁边的登录 | 没有 |
+| Keystone | `crates/keystone` | 没有 |
+| 桶配额 | README 标可用；用量在 `crates/data-usage`、`crates/object-capacity` | 管理接口可以设 `quotaBytes`。没有 S3 的桶配额查询 |
+| 生命周期分层 | `crates/lifecycle` 含转移到远端 S3 的准入；scanner 负责到期和转移 | 按前缀过期删除，并按 `NoncurrentDays` 删掉非当前版本。不把对象转到远端。`GET ?usage` 返回对象个数和字节 |
+| 站点复制 | `crates/replication` 与 `.docker/test/site-replication` | 没有 |
+| S3 Select | `crates/s3select-api`、`crates/s3select-query`。README 写明只收未压缩输入 | 没有 |
+| 审计 | `crates/audit` | 没有。访问日志是每个响应一行 JSON |
+| 可观测性 | `crates/obs`、`crates/io-metrics` | `GET /_s3dfs/metrics` 只计本进程状态码 |
+| 事件通知 | `crates/notify` | 一个 webhook URL |
+| 多租户 | README 标可用 | 没有 |
+| Swift | `crates/protocols` 的 swift，编译 feature，默认不进 | 没有 |
+| FTPS、WebDAV | 默认 feature：`ftps`、`webdav` | 没有。挂载是自带的 `s3dfs-fuse` |
+| SFTP | 可选 feature | 没有 |
+| Helm | `helm/` | 没有。部署脚本会生成 Kubernetes 清单 |
+| S3 Tables | README 标为预览 | 没有 |
+| TLS | `crates/tls-runtime`，进程自己可以终止 TLS | 证书在反向代理上 |
+
+数据放置是另一条路线，不把缺的接口补上就能对齐：
+
+| 能力 | RustFS 源码 | s3dfs |
+| --- | --- | --- |
+| 冗余 | `crates/ecstore`、`crates/ecstore/src/erasure`，Reed-Solomon | 默认 3 份整对象副本。纠删不替换 `.blk` |
+| 没人读过的数据 | `crates/scanner` 后台扫用量、生命周期、复制和 bitrot，并排队 `crates/heal` | `Store.audit` 与 `POST /_s3dfs/block/audit` 把盘上每条记录再读一遍，帧校验和不对的计入 `bad`。不改写坏记录，计数也不写入索引。Get 时仍会换一份好副本 |
+| 扩容 | 存储池在后面追加，已有纠删集宽度不能改 | 加 block 机器。旧对象不自动搬到新机器 |
 
 ## 可靠性对照
 
@@ -97,5 +144,5 @@ s3dfs 现在停在规则自动。下面两档还没有。纠删、IAM、KMS、Ob
 
 - 不要把默认冗余改成纠删码来对齐 RustFS。3 副本和打包块是小对象路径的选择；纠删码适合大对象和容量效率，编码、修复和读放大都另一套。若要做，应是另一种存储类，而不是替换 `.blk`。
 - 不要改成一对象一文件。那是 s3dfs 故意避开的本地文件系统上限。RustFS 用内联和 XFS inode 尺寸缓解，s3dfs 用大块文件去掉这个问题。
-- Swift、Keystone、SFTP、Iceberg REST、MinIO 盘兼容、多租户，仍然不在当前缺口里。AWS CLI 主路径上还缺的是单次 Put 的有界缓冲，以及在目标集群上做索引演练。
+- 上一节列出的 Swift、Keystone、SFTP、Iceberg REST、多租户和纠删，是对照里还没有的能力，不因此改默认路径，也不挡上线八项。AWS CLI 主路径上还缺的是单次 Put 的有界缓冲，以及在目标集群上做索引演练。
 - RustFS README 里「Rust 更安全、别的语言有 GC / 泄漏」一类对比，不拿来当 s3dfs 的结论。s3dfs 热路径在 C 引擎里，控制面在 TypeScript。

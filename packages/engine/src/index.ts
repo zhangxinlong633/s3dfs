@@ -94,6 +94,7 @@ interface NativeStore {
   head(key: string, locator: ExtentLocator): ObjectMeta | null;
   tombstone(key: string): void;
   scan(): ScanEntry[];
+  audit(): { records: number; bad: number; bytes: number };
   flush(): void;
   compact(): StoreStats;
   stats(): StoreStats;
@@ -164,6 +165,10 @@ export class Store {
 
   scan(): ScanEntry[] {
     return this.inner.scan();
+  }
+
+  audit(): { records: number; bad: number; bytes: number } {
+    return this.inner.audit();
   }
 
   flush(): void {

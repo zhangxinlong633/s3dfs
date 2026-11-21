@@ -11,6 +11,15 @@ export interface LifecycleRule {
   prefix: string;
   days?: number;
   abortDays?: number;
+  noncurrentDays?: number;
+}
+
+export interface CorsRule {
+  origins: string[];
+  methods: string[];
+  headers: string[];
+  expose: string[];
+  maxAge?: number;
 }
 
 export interface BucketConfig {
@@ -18,6 +27,8 @@ export interface BucketConfig {
   policy?: PolicyStatement[];
   lifecycle?: LifecycleRule[];
   notifyUrl?: string;
+  tags?: Record<string, string>;
+  cors?: CorsRule[];
 }
 
 export interface ConfigStore {
@@ -50,6 +61,8 @@ export interface VersionStore {
   put(bucket: string, key: string, version: ObjectVersion): Promise<void>;
   get(bucket: string, key: string, versionId: string): Promise<ObjectVersion | null>;
   list(bucket: string, key: string): Promise<ObjectVersion[]>;
+  listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number }[]>;
+  remove(bucket: string, key: string, versionId: string): Promise<void>;
 }
 
 export class MemoryVersionStore implements VersionStore {
@@ -68,6 +81,27 @@ export class MemoryVersionStore implements VersionStore {
 
   async list(bucket: string, key: string): Promise<ObjectVersion[]> {
     return this.versions.get(`${bucket}/${key}`) ?? [];
+  }
+
+  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number }[]> {
+    const prefix = `${bucket}/`;
+    const out: { key: string; id: string; mtimeMs: number }[] = [];
+    for (const [id, versions] of this.versions) {
+      if (!id.startsWith(prefix)) {
+        continue;
+      }
+      const key = id.slice(prefix.length);
+      for (const version of versions) {
+        out.push({ bucket, key, id: version.id, mtimeMs: version.mtimeMs });
+      }
+    }
+    return out;
+  }
+
+  async remove(bucket: string, key: string, versionId: string): Promise<void> {
+    const id = `${bucket}/${key}`;
+    const list = (this.versions.get(id) ?? []).filter((version) => version.id !== versionId);
+    this.versions.set(id, list);
   }
 }
 
@@ -156,9 +190,12 @@ export async function applyLifecycle(opts: {
   deleteObject: (bucket: string, key: string) => Promise<void>;
   uploads: { id: string; bucket: string; key: string; createdMs: number }[];
   abortUpload: (bucket: string, key: string, id: string) => Promise<void>;
-}): Promise<{ expired: number; aborted: number }> {
+  versions?: { bucket: string; key: string; id: string; mtimeMs: number }[];
+  dropVersion?: (bucket: string, key: string, id: string) => Promise<void>;
+}): Promise<{ expired: number; aborted: number; noncurrent: number }> {
   let expired = 0;
   let aborted = 0;
+  let noncurrent = 0;
   for (const object of opts.objects) {
     for (const rule of opts.rules) {
       if (rule.days === undefined || !object.key.startsWith(rule.prefix)) {
@@ -183,7 +220,29 @@ export async function applyLifecycle(opts: {
       }
     }
   }
-  return { expired, aborted };
+  const groups = new Map<string, { bucket: string; key: string; id: string; mtimeMs: number }[]>();
+  for (const version of opts.versions ?? []) {
+    const id = `${version.bucket}\0${version.key}`;
+    const list = groups.get(id) ?? [];
+    list.push(version);
+    groups.set(id, list);
+  }
+  for (const list of groups.values()) {
+    list.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    for (const version of list.slice(1)) {
+      for (const rule of opts.rules) {
+        if (rule.noncurrentDays === undefined || !version.key.startsWith(rule.prefix)) {
+          continue;
+        }
+        if (opts.now - version.mtimeMs >= rule.noncurrentDays * 86_400_000) {
+          await opts.dropVersion?.(version.bucket, version.key, version.id);
+          noncurrent++;
+          break;
+        }
+      }
+    }
+  }
+  return { expired, aborted, noncurrent };
 }
 
 export async function postEvent(
@@ -209,12 +268,103 @@ export function parseVersioningStatus(xml: string): 'Enabled' | 'Suspended' {
   return status;
 }
 
+function xmlText(value: string): string {
+  return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+}
+
+export function parseTags(body: string): Record<string, string> {
+  const tags: Record<string, string> = {};
+  for (const block of body.matchAll(/<Tag\b[^>]*>([\s\S]*?)<\/Tag>/gi)) {
+    const xml = block[1] ?? '';
+    const key = /<Key>\s*([^<]*?)\s*<\/Key>/i.exec(xml)?.[1] ?? '';
+    const value = /<Value>\s*([^<]*?)\s*<\/Value>/i.exec(xml)?.[1] ?? '';
+    if (!key || key.length > 128 || value.length > 256) {
+      throw new S3HttpError(400, 'InvalidTag', 'A tag key is required and must fit the S3 size limits');
+    }
+    tags[key] = value;
+  }
+  if (Object.keys(tags).length > 10) {
+    throw new S3HttpError(400, 'InvalidTag', 'A bucket or object can have at most 10 tags');
+  }
+  return tags;
+}
+
+export function tagsXml(tags: Record<string, string>): string {
+  const rows = Object.entries(tags).map(
+    ([key, value]) => `<Tag><Key>${xmlText(key)}</Key><Value>${xmlText(value)}</Value></Tag>`,
+  );
+  return `<?xml version="1.0" encoding="UTF-8"?><Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>${rows.join('')}</TagSet></Tagging>`;
+}
+
+export function parseCors(body: string): CorsRule[] {
+  const rules: CorsRule[] = [];
+  for (const block of body.matchAll(/<CORSRule\b[^>]*>([\s\S]*?)<\/CORSRule>/gi)) {
+    const xml = block[1] ?? '';
+    const take = (name: string) => [...xml.matchAll(new RegExp(`<${name}>\\s*([^<]*?)\\s*</${name}>`, 'gi'))].map((m) => m[1] ?? '');
+    const maxAge = /<MaxAgeSeconds>\s*(\d+)\s*<\/MaxAgeSeconds>/i.exec(xml)?.[1];
+    rules.push({
+      origins: take('AllowedOrigin'),
+      methods: take('AllowedMethod').map((method) => method.toUpperCase()),
+      headers: take('AllowedHeader'),
+      expose: take('ExposeHeader'),
+      maxAge: maxAge ? Number(maxAge) : undefined,
+    });
+  }
+  if (rules.length === 0) {
+    throw new S3HttpError(400, 'MalformedXML', 'CORS configuration needs at least one rule');
+  }
+  return rules;
+}
+
+export function matchCors(
+  rules: CorsRule[] | undefined,
+  method: string,
+  headers: Record<string, string | string[] | undefined>,
+): Record<string, string> | null {
+  const read = (name: string): string => {
+    const raw = headers[name] ?? headers[name.toLowerCase()];
+    return Array.isArray(raw) ? (raw[0] ?? '') : (raw ?? '');
+  };
+  const origin = read('origin');
+  if (!origin || !rules || rules.length === 0) {
+    return null;
+  }
+  const asked = method.toUpperCase() === 'OPTIONS' ? read('access-control-request-method').toUpperCase() : method.toUpperCase();
+  for (const rule of rules) {
+    const originOk = rule.origins.includes('*') || rule.origins.includes(origin);
+    if (!originOk || (asked && !rule.methods.includes(asked) && !rule.methods.includes('*'))) {
+      continue;
+    }
+    const out: Record<string, string> = {
+      'Access-Control-Allow-Origin': rule.origins.includes('*') ? '*' : origin,
+      'Access-Control-Allow-Methods': rule.methods.join(','),
+      Vary: 'Origin',
+    };
+    if (rule.headers.length > 0) {
+      out['Access-Control-Allow-Headers'] = rule.headers.join(',');
+    }
+    if (rule.expose.length > 0) {
+      out['Access-Control-Expose-Headers'] = rule.expose.join(',');
+    }
+    if (rule.maxAge !== undefined) {
+      out['Access-Control-Max-Age'] = String(rule.maxAge);
+    }
+    return out;
+  }
+  return null;
+}
+
 export function parseLifecycle(body: string): LifecycleRule[] {
   const trimmed = body.trim();
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
     const parsed = JSON.parse(trimmed) as { rules?: LifecycleRule[] } | LifecycleRule[];
     const rules = Array.isArray(parsed) ? parsed : parsed.rules ?? [];
-    return rules.map((rule) => ({ prefix: rule.prefix ?? '', days: rule.days, abortDays: rule.abortDays }));
+    return rules.map((rule) => ({
+      prefix: rule.prefix ?? '',
+      days: rule.days,
+      abortDays: rule.abortDays,
+      noncurrentDays: rule.noncurrentDays,
+    }));
   }
   const rules: LifecycleRule[] = [];
   for (const block of body.matchAll(/<Rule\b[^>]*>([\s\S]*?)<\/Rule>/gi)) {
@@ -222,7 +372,13 @@ export function parseLifecycle(body: string): LifecycleRule[] {
     const prefix = /<Prefix>\s*([^<]*)\s*<\/Prefix>/i.exec(xml)?.[1] ?? '';
     const days = /<Days>\s*(\d+)\s*<\/Days>/i.exec(xml)?.[1];
     const abort = /<AbortIncompleteMultipartUpload>[\s\S]*?<DaysAfterInitiation>\s*(\d+)/i.exec(xml)?.[1];
-    rules.push({ prefix, days: days ? Number(days) : undefined, abortDays: abort ? Number(abort) : undefined });
+    const noncurrent = /<NoncurrentVersionExpiration>[\s\S]*?<NoncurrentDays>\s*(\d+)/i.exec(xml)?.[1];
+    rules.push({
+      prefix,
+      days: days ? Number(days) : undefined,
+      abortDays: abort ? Number(abort) : undefined,
+      noncurrentDays: noncurrent ? Number(noncurrent) : undefined,
+    });
   }
   return rules;
 }
@@ -231,10 +387,14 @@ export interface ObjectUserMeta {
   save(bucket: string, key: string, meta: Record<string, string>): Promise<void>;
   load(bucket: string, key: string): Promise<Record<string, string>>;
   remove(bucket: string, key: string): Promise<void>;
+  saveTags(bucket: string, key: string, tags: Record<string, string>): Promise<void>;
+  loadTags(bucket: string, key: string): Promise<Record<string, string>>;
+  removeTags(bucket: string, key: string): Promise<void>;
 }
 
 export class MemoryObjectMeta implements ObjectUserMeta {
   readonly rows = new Map<string, Record<string, string>>();
+  readonly tagRows = new Map<string, Record<string, string>>();
 
   async save(bucket: string, key: string, meta: Record<string, string>): Promise<void> {
     this.rows.set(`${bucket}/${key}`, { ...meta });
@@ -246,5 +406,18 @@ export class MemoryObjectMeta implements ObjectUserMeta {
 
   async remove(bucket: string, key: string): Promise<void> {
     this.rows.delete(`${bucket}/${key}`);
+    this.tagRows.delete(`${bucket}/${key}`);
+  }
+
+  async saveTags(bucket: string, key: string, tags: Record<string, string>): Promise<void> {
+    this.tagRows.set(`${bucket}/${key}`, { ...tags });
+  }
+
+  async loadTags(bucket: string, key: string): Promise<Record<string, string>> {
+    return { ...(this.tagRows.get(`${bucket}/${key}`) ?? {}) };
+  }
+
+  async removeTags(bucket: string, key: string): Promise<void> {
+    this.tagRows.delete(`${bucket}/${key}`);
   }
 }

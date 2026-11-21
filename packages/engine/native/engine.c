@@ -3123,6 +3123,101 @@ int s3dfs_scan(s3dfs_store *s, s3dfs_scan_cb cb, void *user)
     return rc;
 }
 
+static int audit_block(s3dfs_store *s, uint64_t id, uint64_t file_end, s3dfs_audit_report *out)
+{
+    uint64_t off = 0;
+    while (off + 8 <= file_end) {
+        uint8_t head[8];
+        char path[4096];
+        block_path(s, id, path, sizeof(path));
+        int same = (s->wr_fd >= 0 && id == s->wr_block_id);
+        int fd = same ? s->wr_fd : open(path, O_RDONLY);
+        if (fd < 0) {
+            return S3DFS_ERR_IO;
+        }
+        ssize_t nread = pread(fd, head, 8, (off_t)off);
+        if (!same) {
+            close(fd);
+        }
+        if (nread != 8) {
+            out->bad++;
+            break;
+        }
+        if (rd_u32(head) != S3DFS_REC_MAGIC) {
+            out->bad++;
+            break;
+        }
+        uint32_t total = rd_u32(head + 4);
+        if (total < S3DFS_FRAME_OVERHEAD || off + total > file_end) {
+            out->bad++;
+            break;
+        }
+        uint8_t *raw = (uint8_t *)malloc(total);
+        if (!raw) {
+            return S3DFS_ERR_NOMEM;
+        }
+        int read_fd = same ? s->wr_fd : open(path, O_RDONLY);
+        if (read_fd < 0 || pread(read_fd, raw, total, (off_t)off) != (ssize_t)total) {
+            free(raw);
+            if (read_fd >= 0 && !same) {
+                close(read_fd);
+            }
+            return S3DFS_ERR_IO;
+        }
+        if (!same) {
+            close(read_fd);
+        }
+        s3dfs_rec_view view;
+        if (parse_record(raw, total, &view) != 0) {
+            out->bad++;
+        } else if (view.kind == S3DFS_KIND_OBJECT || view.kind == S3DFS_KIND_EXTENT_LAST ||
+                   view.kind == S3DFS_KIND_TOMBSTONE) {
+            out->records++;
+            out->bytes += total;
+        }
+        free(raw);
+        off += total;
+    }
+    return S3DFS_OK;
+}
+
+int s3dfs_audit(s3dfs_store *s, s3dfs_audit_report *out)
+{
+    if (!s || !out) {
+        return S3DFS_ERR_ARGS;
+    }
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&s->mu);
+    uint64_t *ids = NULL;
+    uint32_t n = 0;
+    int rc = list_block_ids(s, &ids, &n);
+    if (rc != S3DFS_OK) {
+        pthread_mutex_unlock(&s->mu);
+        return rc;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t end = 0;
+        char path[4096];
+        block_path(s, ids[i], path, sizeof(path));
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            rc = S3DFS_ERR_IO;
+            break;
+        }
+        end = (uint64_t)st.st_size;
+        if (s->wr_fd >= 0 && ids[i] == s->wr_block_id && s->wr_size + s->buf_used > end) {
+            end = s->wr_size + s->buf_used;
+        }
+        rc = audit_block(s, ids[i], end, out);
+        if (rc != S3DFS_OK) {
+            break;
+        }
+    }
+    free(ids);
+    pthread_mutex_unlock(&s->mu);
+    return rc;
+}
+
 int s3dfs_flush(s3dfs_store *s)
 {
     if (!s) {

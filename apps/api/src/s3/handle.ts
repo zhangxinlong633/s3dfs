@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { parseByteRange, type ObjectValue } from '@s3dfs/control';
+import { crc32, parseByteRange, type ObjectValue } from '@s3dfs/control';
 import { AwsChunkError, objectBytes } from './aws-chunked';
 import { MultipartUploads, S3HttpError, parseCompleteParts } from './multipart';
 import {
@@ -7,8 +7,12 @@ import {
   checkPolicy,
   isSealed,
   openObject,
+  matchCors,
+  parseCors,
   parseLifecycle,
+  parseTags,
   parseVersioningStatus,
+  tagsXml,
   postEvent,
   sealObject,
   sseKeyFromSecret,
@@ -137,7 +141,33 @@ function payload(req: S3Request): Buffer {
   if (md5 && createHash('md5').update(body).digest('base64') !== md5.trim()) {
     throw new S3HttpError(400, 'BadDigest', 'Content-MD5 does not match the body');
   }
+  assertChecksum(body, req.headers);
   return body;
+}
+
+function assertChecksum(body: Buffer, headers: S3Request['headers']): void {
+  const crcHeader = header(headers, 'x-amz-checksum-crc32');
+  if (crcHeader) {
+    const got = Buffer.from(crcHeader.trim(), 'base64');
+    const expect = Buffer.alloc(4);
+    expect.writeUInt32BE(crc32(body));
+    if (got.length !== 4 || !got.equals(expect)) {
+      throw new S3HttpError(400, 'BadDigest', 'x-amz-checksum-crc32 does not match the body');
+    }
+  }
+  const sha = header(headers, 'x-amz-checksum-sha256');
+  if (sha && createHash('sha256').update(body).digest('base64') !== sha.trim()) {
+    throw new S3HttpError(400, 'BadDigest', 'x-amz-checksum-sha256 does not match the body');
+  }
+}
+
+function checksumHeaders(crc: number, headers: S3Request['headers']): Record<string, string> {
+  if ((header(headers, 'x-amz-checksum-mode') ?? '').toUpperCase() !== 'ENABLED') {
+    return {};
+  }
+  const bytes = Buffer.alloc(4);
+  bytes.writeUInt32BE(crc >>> 0);
+  return { 'x-amz-checksum-crc32': bytes.toString('base64') };
 }
 
 async function* matchMd5(source: AsyncIterable<Buffer>, md5: string): AsyncIterable<Buffer> {
@@ -167,7 +197,15 @@ function resolveTarget(req: S3Request, domain: string | undefined): { bucket?: s
 }
 
 function isBucketAdmin(req: S3Request): boolean {
-  return req.query.has('policy') || req.query.has('versioning') || req.query.has('lifecycle') || req.query.has('notification');
+  return (
+    req.query.has('policy') ||
+    req.query.has('versioning') ||
+    req.query.has('lifecycle') ||
+    req.query.has('notification') ||
+    req.query.has('tagging') ||
+    req.query.has('cors') ||
+    req.query.has('usage')
+  );
 }
 
 function etagHeaders(crc: number): Record<string, string> {
@@ -251,10 +289,22 @@ export async function handleS3(
       }
       return xml(405, errorXml('MethodNotAllowed', 'Method not allowed'));
     }
-    if (key === undefined) {
-      return await handleBucket(method, bucket, req, backend, uploads, options);
+    if (method === 'OPTIONS' && options.config) {
+      const cors = matchCors((await options.config.get(bucket)).cors, method, req.headers);
+      if (!cors) {
+        return xml(403, errorXml('AccessForbidden', 'CORS rule does not allow this origin', bucket));
+      }
+      return empty(200, cors);
     }
-    return await handleObject(method, bucket, key, req, backend, uploads, options);
+    const response =
+      key === undefined
+        ? await handleBucket(method, bucket, req, backend, uploads, options)
+        : await handleObject(method, bucket, key, req, backend, uploads, options);
+    if (!options.config) {
+      return response;
+    }
+    const cors = matchCors((await options.config.get(bucket)).cors, method, req.headers);
+    return cors ? { ...response, headers: { ...response.headers, ...cors } } : response;
   } catch (err) {
     if (err instanceof S3HttpError) {
       return xml(err.status, errorXml(err.code, err.message));
@@ -278,6 +328,53 @@ async function handleBucket(
   options: S3Options,
 ): Promise<S3Response> {
   const configStore = options.config;
+  if (req.query.has('tagging') && configStore) {
+    if (method === 'GET') {
+      const config = await configStore.get(bucket);
+      return xml(200, tagsXml(config.tags ?? {}));
+    }
+    if (method === 'PUT') {
+      const config = await configStore.get(bucket);
+      config.tags = parseTags(req.body.toString('utf8'));
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+    if (method === 'DELETE') {
+      const config = await configStore.get(bucket);
+      delete config.tags;
+      await configStore.put(bucket, config);
+      return empty(204);
+    }
+  }
+  if (req.query.has('cors') && configStore) {
+    if (method === 'GET') {
+      const config = await configStore.get(bucket);
+      const rules = config.cors ?? [];
+      const body = rules
+        .map((rule) => {
+          const origins = rule.origins.map((origin) => `<AllowedOrigin>${origin}</AllowedOrigin>`).join('');
+          const methods = rule.methods.map((item) => `<AllowedMethod>${item}</AllowedMethod>`).join('');
+          const allowed = rule.headers.map((item) => `<AllowedHeader>${item}</AllowedHeader>`).join('');
+          const expose = rule.expose.map((item) => `<ExposeHeader>${item}</ExposeHeader>`).join('');
+          const age = rule.maxAge === undefined ? '' : `<MaxAgeSeconds>${rule.maxAge}</MaxAgeSeconds>`;
+          return `<CORSRule>${origins}${methods}${allowed}${expose}${age}</CORSRule>`;
+        })
+        .join('');
+      return xml(200, `<?xml version="1.0" encoding="UTF-8"?><CORSConfiguration>${body}</CORSConfiguration>`);
+    }
+    if (method === 'PUT') {
+      const config = await configStore.get(bucket);
+      config.cors = parseCors(req.body.toString('utf8'));
+      await configStore.put(bucket, config);
+      return empty(200);
+    }
+    if (method === 'DELETE') {
+      const config = await configStore.get(bucket);
+      delete config.cors;
+      await configStore.put(bucket, config);
+      return empty(204);
+    }
+  }
   if (req.query.has('versioning') && configStore) {
     if (method === 'GET') {
       const config = await configStore.get(bucket);
@@ -357,6 +454,8 @@ async function handleBucket(
       deleteObject: (b, k) => backend.delete(b, k).then(() => undefined),
       uploads: (await uploads.store.list()).filter((u) => u.bucket === bucket),
       abortUpload: (b, k, id) => uploads.abort(b, k, id).then(() => undefined),
+      versions: options.versions ? await options.versions.listBucket(bucket) : [],
+      dropVersion: (b, k, id) => options.versions?.remove(b, k, id) ?? Promise.resolve(),
     });
     return {
       status: 200,
@@ -391,6 +490,15 @@ async function handleBucket(
       return xml(409, errorXml('BucketNotEmpty', 'The bucket you tried to delete is not empty', bucket));
     }
     return empty(204);
+  }
+  if (req.query.has('usage') && method === 'GET') {
+    const listed = await backend.list(bucket, '', undefined, 10_000, '');
+    const bytes = listed.objects.reduce((sum, object) => sum + object.size, 0);
+    return {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+      body: Buffer.from(JSON.stringify({ objects: listed.objects.length, bytes })),
+    };
   }
   if (method === 'GET' || method === 'HEAD') {
     if (!(await backend.bucketExists(bucket))) {
@@ -454,6 +562,19 @@ async function handleObject(
   const config = options.config ? await options.config.get(bucket) : {};
   const versioning = config.versioning === 'Enabled' ? options.versions : undefined;
   const uploadId = req.query.get('uploadId');
+  if (req.query.has('tagging') && options.meta) {
+    if (method === 'GET') {
+      return xml(200, tagsXml(await options.meta.loadTags(bucket, key)));
+    }
+    if (method === 'PUT') {
+      await options.meta.saveTags(bucket, key, parseTags(req.body.toString('utf8')));
+      return empty(200);
+    }
+    if (method === 'DELETE') {
+      await options.meta.removeTags(bucket, key);
+      return empty(204);
+    }
+  }
   if (req.query.has('versions') && method === 'GET' && options.versions) {
     const versions = await options.versions.list(bucket, key);
     return xml(200, listVersionsXml(bucket, key, versions));
@@ -533,6 +654,7 @@ async function handleObject(
       }
       if (options.meta) {
         await options.meta.save(bucket, key, await options.meta.load(decoded.slice(0, slash), decoded.slice(slash + 1)));
+        await options.meta.saveTags(bucket, key, await options.meta.loadTags(decoded.slice(0, slash), decoded.slice(slash + 1)));
       }
       const meta = await backend.head(bucket, key);
       const etag = meta ? etagFromCrc(meta.crc) : '"00000000"';
@@ -625,6 +747,7 @@ async function handleObject(
     const headers: Record<string, string> = {
       'Accept-Ranges': 'bytes',
       ...etagHeaders(meta.crc),
+      ...checksumHeaders(meta.crc, req.headers),
       'Last-Modified': new Date(meta.mtimeMs).toUTCString(),
       'Content-Type': 'application/octet-stream',
       ...saved,

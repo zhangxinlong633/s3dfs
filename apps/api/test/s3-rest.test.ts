@@ -241,4 +241,25 @@ describe('s3 surface that was still open', () => {
     await call(backend, { method: 'PUT', path: '/logs/note.txt', body: Buffer.from('n') }, options);
     expect(events.some((event) => (event as { event: string }).event === 's3:ObjectCreated:Put')).toBe(true);
   });
+
+  test('expires noncurrent versions and reports how much the bucket holds', async () => {
+    const backend = new MemBackend();
+    const versions = new MemoryVersionStore();
+    const config = new MemoryConfigStore();
+    const options = { config, versions };
+    const day = 86_400_000;
+    await versions.put('logs', 'a.txt', { id: 'old', body: Buffer.from('old'), deleteMarker: false, mtimeMs: 1 });
+    await versions.put('logs', 'a.txt', { id: 'new', body: Buffer.from('new'), deleteMarker: false, mtimeMs: day * 3 });
+    const xml =
+      '<LifecycleConfiguration><Rule><Prefix>a</Prefix><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?lifecycle', body: Buffer.from(xml) }, options);
+    const ran = await call(backend, { method: 'POST', path: '/logs?lifecycle', now: day * 5 }, options);
+    expect(JSON.parse(ran.body.toString()).noncurrent).toBe(1);
+    expect(await versions.get('logs', 'a.txt', 'old')).toBeNull();
+    expect((await versions.get('logs', 'a.txt', 'new'))?.id).toBe('new');
+
+    await backend.put('logs', 'a.txt', Buffer.from('abcd'));
+    const usage = await call(backend, { method: 'GET', path: '/logs?usage' });
+    expect(JSON.parse(usage.body.toString())).toEqual({ objects: 1, bytes: 4 });
+  });
 });

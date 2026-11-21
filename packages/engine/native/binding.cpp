@@ -161,6 +161,7 @@ public:
             InstanceMethod("head", &Store::Head),
             InstanceMethod("tombstone", &Store::Tombstone),
             InstanceMethod("scan", &Store::Scan),
+            InstanceMethod("audit", &Store::Audit),
             InstanceMethod("flush", &Store::Flush),
             InstanceMethod("compact", &Store::Compact),
             InstanceMethod("stats", &Store::Stats),
@@ -497,6 +498,22 @@ private:
             ErrFrom(env, rc).ThrowAsJavaScriptException();
         }
         return env.Undefined();
+    }
+
+    Napi::Value Audit(const Napi::CallbackInfo &info)
+    {
+        Napi::Env env = info.Env();
+        s3dfs_audit_report report;
+        int rc = s3dfs_audit(store_, &report);
+        if (rc != S3DFS_OK) {
+            ErrFrom(env, rc).ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Object out = Napi::Object::New(env);
+        out.Set("records", Napi::Number::New(env, (double)report.records));
+        out.Set("bad", Napi::Number::New(env, (double)report.bad));
+        out.Set("bytes", Napi::Number::New(env, (double)report.bytes));
+        return out;
     }
 
     Napi::Value Scan(const Napi::CallbackInfo &info)

@@ -180,6 +180,43 @@ export class IndexVersionStore implements VersionStore {
     }
     return out;
   }
+
+  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number }[]> {
+    const prefix = `$ver/${bucket}/`;
+    const scanned = await this.kv.scan({ prefix, maxKeys: 10_000 });
+    const out: { key: string; id: string; mtimeMs: number }[] = [];
+    for (const obj of scanned.objects) {
+      if (obj.key.endsWith('/list')) {
+        continue;
+      }
+      const rest = obj.key.slice(prefix.length);
+      const slash = rest.lastIndexOf('/');
+      if (slash <= 0) {
+        continue;
+      }
+      const raw = await this.kv.get(obj.key);
+      if (!raw) {
+        continue;
+      }
+      const meta = JSON.parse(raw.value.toString('utf8')) as { mtimeMs: number };
+      out.push({
+        bucket,
+        key: decodeURIComponent(rest.slice(0, slash)),
+        id: rest.slice(slash + 1),
+        mtimeMs: meta.mtimeMs,
+      });
+    }
+    return out;
+  }
+
+  async remove(bucket: string, key: string, versionId: string): Promise<void> {
+    const base = `$ver/${bucket}/${encodeURIComponent(key)}`;
+    const raw = await this.kv.get(`${base}/list`);
+    const ids = raw ? (JSON.parse(raw.value.toString('utf8')) as string[]).filter((id) => id !== versionId) : [];
+    await this.kv.put(`${base}/list`, Buffer.from(JSON.stringify(ids)));
+    await this.kv.delete(`${base}/${versionId}`);
+    await this.objects.delete(bucket, this.bodyKey(key, versionId));
+  }
 }
 
 export class IndexObjectMeta implements ObjectUserMeta {
@@ -211,5 +248,30 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async remove(bucket: string, key: string): Promise<void> {
     await this.kv.delete(this.key(bucket, key));
+    await this.removeTags(bucket, key);
+  }
+
+  private tagKey(bucket: string, objectKey: string): string {
+    return `$tags/${bucket}/${encodeURIComponent(objectKey)}`;
+  }
+
+  async saveTags(bucket: string, key: string, tags: Record<string, string>): Promise<void> {
+    if (Object.keys(tags).length === 0) {
+      await this.removeTags(bucket, key);
+      return;
+    }
+    await this.kv.put(this.tagKey(bucket, key), Buffer.from(JSON.stringify(tags)));
+  }
+
+  async loadTags(bucket: string, key: string): Promise<Record<string, string>> {
+    const raw = await this.kv.get(this.tagKey(bucket, key));
+    if (!raw) {
+      return {};
+    }
+    return JSON.parse(raw.value.toString('utf8')) as Record<string, string>;
+  }
+
+  async removeTags(bucket: string, key: string): Promise<void> {
+    await this.kv.delete(this.tagKey(bucket, key));
   }
 }

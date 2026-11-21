@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { crc32 } from '@s3dfs/control';
 import { handleS3, type S3Backend } from '../src/s3/handle';
 import { MultipartUploads } from '../src/s3/multipart';
-import { MemoryObjectMeta } from '../src/s3/product';
+import { MemoryConfigStore, MemoryObjectMeta } from '../src/s3/product';
 
 class MemBackend implements S3Backend {
   objects = new Map<string, Buffer>();
@@ -91,6 +91,65 @@ describe('production request checks', () => {
     expect(res.status).toBe(200);
     expect(res.body.toString()).toContain('<Key>a.txt</Key>');
     expect(backend.objects.size).toBe(0);
+  });
+
+  test('bucket and object tagging round-trip through the tagging query', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const meta = new MemoryObjectMeta();
+    const bucketXml = '<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>';
+    const putBucket = await call(backend, 'PUT', '/logs?tagging', Buffer.from(bucketXml), {}, { config });
+    expect(putBucket.status).toBe(200);
+    const gotBucket = await call(backend, 'GET', '/logs?tagging', Buffer.alloc(0), {}, { config });
+    expect(gotBucket.body.toString()).toContain('<Key>env</Key>');
+    expect(gotBucket.body.toString()).toContain('<Value>prod</Value>');
+
+    await call(backend, 'PUT', '/logs/a.txt', Buffer.from('m'), { 'x-amz-meta-color': 'blue' }, { meta });
+    const objectXml = '<Tagging><TagSet><Tag><Key>kind</Key><Value>log</Value></Tag></TagSet></Tagging>';
+    const putObject = await call(backend, 'PUT', '/logs/a.txt?tagging', Buffer.from(objectXml), {}, { meta });
+    expect(putObject.status).toBe(200);
+    const head = await call(backend, 'HEAD', '/logs/a.txt', Buffer.alloc(0), {}, { meta });
+    expect(head.headers['x-amz-meta-color']).toBe('blue');
+    const gotObject = await call(backend, 'GET', '/logs/a.txt?tagging', Buffer.alloc(0), {}, { meta });
+    expect(gotObject.body.toString()).toContain('<Value>log</Value>');
+    const removed = await call(backend, 'DELETE', '/logs/a.txt?tagging', Buffer.alloc(0), {}, { meta });
+    expect(removed.status).toBe(204);
+    const emptyTags = await call(backend, 'GET', '/logs/a.txt?tagging', Buffer.alloc(0), {}, { meta });
+    expect(emptyTags.body.toString()).not.toContain('<Key>');
+  });
+
+  test('a matching CORS rule answers the browser preflight', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const xml =
+      '<CORSConfiguration><CORSRule><AllowedOrigin>https://app.example</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedHeader>*</AllowedHeader><ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>30</MaxAgeSeconds></CORSRule></CORSConfiguration>';
+    const put = await call(backend, 'PUT', '/logs?cors', Buffer.from(xml), {}, { config });
+    expect(put.status).toBe(200);
+    const preflight = await call(
+      backend,
+      'OPTIONS',
+      '/logs/a.txt',
+      Buffer.alloc(0),
+      { origin: 'https://app.example', 'access-control-request-method': 'GET' },
+      { config },
+    );
+    expect(preflight.status).toBe(200);
+    expect(preflight.headers['Access-Control-Allow-Origin']).toBe('https://app.example');
+    expect(preflight.headers['Access-Control-Allow-Methods']).toContain('GET');
+    expect(preflight.headers['Access-Control-Expose-Headers']).toContain('ETag');
+  });
+
+  test('x-amz-checksum-crc32 must match the body', async () => {
+    const backend = new MemBackend();
+    const body = Buffer.from('checksum');
+    const good = Buffer.from([(crc32(body) >>> 24) & 0xff, (crc32(body) >>> 16) & 0xff, (crc32(body) >>> 8) & 0xff, crc32(body) & 0xff]).toString('base64');
+    const bad = await call(backend, 'PUT', '/logs/a.txt', body, { 'x-amz-checksum-crc32': 'AAAAAA==' });
+    expect(bad.status).toBe(400);
+    expect(bad.body.toString()).toContain('BadDigest');
+    const ok = await call(backend, 'PUT', '/logs/a.txt', body, { 'x-amz-checksum-crc32': good });
+    expect(ok.status).toBe(200);
+    const got = await call(backend, 'GET', '/logs/a.txt', Buffer.alloc(0), { 'x-amz-checksum-mode': 'ENABLED' });
+    expect(got.headers['x-amz-checksum-crc32']).toBe(good);
   });
 
   test('rejects a body over the configured limit', async () => {

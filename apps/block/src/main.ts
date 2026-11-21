@@ -262,6 +262,10 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     sendJson(res, 200, { ok: true });
     return;
   }
+  if (pathname === '/_s3dfs/block/audit' && method === 'POST') {
+    sendJson(res, 200, store.audit());
+    return;
+  }
   if (pathname === '/_s3dfs/block/scan' && method === 'GET') {
     sendJson(res, 200, store.scan());
     return;

@@ -115,6 +115,13 @@ int s3dfs_head_at(s3dfs_store *store, const char *key, uint32_t key_len,
                   const s3dfs_locator *loc, uint64_t *size, uint32_t *crc,
                   uint64_t *mtime_ms);
 int s3dfs_scan(s3dfs_store *store, s3dfs_scan_cb cb, void *user);
+typedef struct s3dfs_audit_report {
+    uint64_t records;
+    uint64_t bad;
+    uint64_t bytes;
+} s3dfs_audit_report;
+/* Reread every stored record and check its frame checksum. */
+int s3dfs_audit(s3dfs_store *store, s3dfs_audit_report *out);
 int s3dfs_flush(s3dfs_store *store);
 int s3dfs_compact(s3dfs_store *store);
 void s3dfs_get_stats(s3dfs_store *store, s3dfs_stats *out);
