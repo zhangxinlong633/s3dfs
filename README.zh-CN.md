@@ -41,6 +41,7 @@ S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js
 | [能力](docs/capabilities.md) | 对接接口和配置的人 | 已提供的 S3 能力与环境变量 |
 | [部署](docs/deploy.md) | 规划机器的人 | 角色、副本、入口 |
 | [上线标准](docs/diff/production.md) | 决定能否承接业务数据的人 | 验收项和目标集群演练 |
+| [规模说明](docs/scale.md) | 评估容量和排机器的人 | 100 EB 业务容量如何换成 block 与索引，以及 50 PB 磁盘的案例 |
 | [故障与恢复](docs/design-recovery.md) | 评估故障影响的人 | 哪些请求还能继续 |
 | [索引与 block](docs/design-replication.md) | 区分两套副本的人 | 放置、健康检查、法定人数 |
 | [基准](docs/benchmarks.md) | 引用数字的人 | 2026-11-17 本机测量的完整表格 |
