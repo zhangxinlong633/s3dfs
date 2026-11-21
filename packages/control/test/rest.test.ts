@@ -271,6 +271,58 @@ describe('remaining designs', () => {
     }
   });
 
+  test('drain moves a replica off the named node and the object still reads', async () => {
+    const box = open();
+    try {
+      await box.cluster.put('logs', 'a.txt', Buffer.from('stay'));
+      await box.registry.upsert({ nodeId: 'c', address: '10.0.0.3:9100', status: 'up', lastSeenMs: 1, zone: 'z3' });
+      const before = await box.cluster.locators('logs/a.txt');
+      expect(before.some((loc) => loc.nodeId === 'a')).toBe(true);
+      await box.cluster.drain('a');
+      const after = await box.cluster.locators('logs/a.txt');
+      expect(after.some((loc) => loc.nodeId === 'a')).toBe(false);
+      expect(after).toHaveLength(before.length);
+      expect((await box.cluster.get('logs', 'a.txt'))?.value.toString('utf8')).toBe('stay');
+    } finally {
+      box.restore();
+    }
+  });
+
+  test('bucket usage follows every index page', async () => {
+    const box = open();
+    try {
+      await box.cluster.put('logs', 'a.txt', Buffer.from('hello'));
+      await box.cluster.put('logs', 'b.txt', Buffer.from('yo'));
+      const orig = box.kv.scan.bind(box.kv);
+      box.kv.scan = async (opts: { prefix?: string; startAfter?: string } = {}) => {
+        const full = await orig(opts);
+        let objects = full.objects;
+        if (opts.startAfter) {
+          objects = objects.filter((obj) => obj.key > opts.startAfter!);
+        }
+        const page = objects.slice(0, 1);
+        return { truncated: objects.length > 1, objects: page };
+      };
+      expect(await box.cluster.bucketUsage('logs')).toEqual({ objects: 2, bytes: 7 });
+    } finally {
+      box.restore();
+    }
+  });
+
+  test('replication progress stays at zero until a batch is sent', async () => {
+    const box = open();
+    try {
+      await box.cluster.put('logs', 'a.txt', Buffer.from('keep'));
+      expect(await box.cluster.replicationProgress()).toEqual({ sent: 0, pending: 0 });
+      await box.cluster.sendChanges({ put: async () => {} });
+      expect(await box.cluster.replicationProgress()).toEqual({ sent: 1, pending: 0 });
+      await box.cluster.put('logs', 'b.txt', Buffer.from('next'));
+      expect(await box.cluster.replicationProgress()).toEqual({ sent: 1, pending: 1 });
+    } finally {
+      box.restore();
+    }
+  });
+
   test('sendChanges deletes on the target only when deletes are requested', async () => {
     const box = open();
     try {

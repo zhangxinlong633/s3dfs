@@ -162,6 +162,8 @@ export class ObjectCluster {
 
   private lostTotal = 0;
   private changeSeq = 0;
+  private replOpened = false;
+  private replSent = 0;
   private readonly limitsCache = new Map<string, { at: number; limits: BucketLimits }>();
   private readonly usageMem = new Map<string, number>();
 
@@ -190,7 +192,12 @@ export class ObjectCluster {
   }
 
   async listChanges(): Promise<{ op: string; bucket: string; key: string; mtimeMs: number }[]> {
-    const out: { op: string; bucket: string; key: string; mtimeMs: number }[] = [];
+    const records = await this.listChangeRecords();
+    return records.map(({ op, bucket, key, mtimeMs }) => ({ op, bucket, key, mtimeMs }));
+  }
+
+  private async listChangeRecords(): Promise<{ id: string; op: string; bucket: string; key: string; mtimeMs: number }[]> {
+    const out: { id: string; op: string; bucket: string; key: string; mtimeMs: number }[] = [];
     let startAfter: string | undefined;
     for (;;) {
       const listed = await this.kv.scan({ prefix: CHANGE_PREFIX, startAfter, maxKeys: 1000 });
@@ -201,7 +208,7 @@ export class ObjectCluster {
         }
         try {
           const parsed = JSON.parse(raw.value.toString('utf8')) as { op: string; bucket: string; key: string; mtimeMs: number };
-          out.push({ op: parsed.op, bucket: parsed.bucket, key: parsed.key, mtimeMs: parsed.mtimeMs });
+          out.push({ id: obj.key, op: parsed.op, bucket: parsed.bucket, key: parsed.key, mtimeMs: parsed.mtimeMs });
         } catch {
           // Skip a torn journal record.
         }
@@ -734,8 +741,23 @@ export class ObjectCluster {
       compressType: this.compressType,
     };
     try {
-      const listed = await this.kv.scan({ prefix: '', maxKeys: 100_000 });
-      acc.objects = listed.objects.filter((o) => isVisibleObjectKey(o.key) && !o.key.endsWith('/')).length;
+      let startAfter: string | undefined;
+      for (;;) {
+        const listed = await this.kv.scan({ prefix: '', startAfter, maxKeys: 1000 });
+        if (listed.objects.length === 0) {
+          break;
+        }
+        for (const obj of listed.objects) {
+          startAfter = obj.key;
+          if (!isVisibleObjectKey(obj.key) || obj.key.endsWith('/')) {
+            continue;
+          }
+          acc.objects++;
+        }
+        if (!listed.truncated) {
+          break;
+        }
+      }
     } catch {
       acc.objects = 0;
     }
@@ -1202,13 +1224,16 @@ export class ObjectCluster {
     target: { put(bucket: string, key: string, value: Buffer): Promise<void>; delete?(bucket: string, key: string): Promise<void> },
     options?: { deletes?: boolean },
   ): Promise<{ sent: number }> {
-    const changes = await this.listChanges();
+    this.replOpened = true;
+    const changes = await this.listChangeRecords();
     let sent = 0;
     for (const change of changes) {
       if (change.op === 'delete') {
         if (options?.deletes && target.delete) {
           await target.delete(change.bucket, change.key);
+          await this.kv.delete(change.id);
           sent++;
+          this.replSent++;
         }
         continue;
       }
@@ -1217,9 +1242,119 @@ export class ObjectCluster {
         continue;
       }
       await target.put(change.bucket, change.key, got.value);
+      await this.kv.delete(change.id);
       sent++;
+      this.replSent++;
     }
     return { sent };
+  }
+
+  /** Sent journal entries, and how many remain. Both stay at 0 until replication runs. */
+  async replicationProgress(): Promise<{ sent: number; pending: number }> {
+    if (!this.replOpened) {
+      return { sent: 0, pending: 0 };
+    }
+    return { sent: this.replSent, pending: (await this.listChanges()).length };
+  }
+
+  /** Sum logical sizes for one bucket, following every index page. */
+  async bucketUsage(bucket: string): Promise<{ objects: number; bytes: number }> {
+    let objects = 0;
+    let bytes = 0;
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: `${bucket}/`, startAfter, maxKeys: 1000 });
+      for (const obj of listed.objects) {
+        if (!isVisibleObjectKey(obj.key) || obj.key.endsWith('/')) {
+          continue;
+        }
+        const raw = await this.kv.get(obj.key);
+        if (!raw) {
+          continue;
+        }
+        try {
+          const loc = JSON.parse(raw.value.toString('utf8')) as { v?: number; size?: number };
+          if (loc.v !== 3) {
+            continue;
+          }
+          objects++;
+          bytes += loc.size ?? 0;
+        } catch {
+          // A torn locator is not a counted object.
+        }
+      }
+      if (!listed.truncated || listed.objects.length === 0) {
+        break;
+      }
+      startAfter = listed.objects[listed.objects.length - 1]!.key;
+    }
+    return { objects, bytes };
+  }
+
+  /**
+   * Copy every replica that lives on `nodeId` onto another live node, then drop it
+   * from the locator. Replica count stays the same. Does nothing until called.
+   */
+  async drain(nodeId: string): Promise<{ moved: number; bytes: number }> {
+    const known = this.registry.list().some((item) => item.nodeId === nodeId);
+    if (!known) {
+      throw new ControlError('BAD_REQUEST', `unknown block node ${nodeId}`);
+    }
+    let moved = 0;
+    let bytes = 0;
+    let startAfter: string | undefined;
+    for (;;) {
+      const listed = await this.kv.scan({ prefix: '', startAfter, maxKeys: 1000 });
+      if (listed.objects.length === 0) {
+        break;
+      }
+      for (const obj of listed.objects) {
+        startAfter = obj.key;
+        if (!isVisibleObjectKey(obj.key)) {
+          continue;
+        }
+        const locs = await this.locators(obj.key);
+        const leaving = locs.filter((loc) => loc.nodeId === nodeId);
+        if (leaving.length === 0) {
+          continue;
+        }
+        for (const loc of leaving) {
+          const source = locs.find((item) => item.nodeId !== nodeId && !this.registry.isDown(item.nodeId));
+          const dest = this.registry.live().find((node) => node.nodeId !== nodeId && !locs.some((item) => item.nodeId === node.nodeId));
+          if (!source || !dest) {
+            continue;
+          }
+          const got = await blockGet(source.address, source.dataKey ?? obj.key, source);
+          if (!got) {
+            continue;
+          }
+          const ev = await blockPut(dest.address, source.dataKey ?? obj.key, got.value, {
+            compressType: source.compressType,
+            origSize: got.value.length,
+            origCrc: source.crc,
+          });
+          const replaced: ObjectLocator = {
+            ...loc,
+            nodeId: dest.nodeId,
+            address: dest.address,
+            recId: ev.recId,
+            storedSize: ev.size,
+            mtimeMs: ev.mtimeMs,
+          };
+          await this.kv.put(locatorKey(obj.key, loc.replica), Buffer.from(JSON.stringify(replaced)));
+          const idx = locs.findIndex((item) => item.replica === loc.replica);
+          if (idx >= 0) {
+            locs[idx] = replaced;
+          }
+          moved++;
+          bytes += got.value.length;
+        }
+      }
+      if (!listed.truncated) {
+        break;
+      }
+    }
+    return { moved, bytes };
   }
 
   async lostKeys(): Promise<string[]> {
