@@ -411,9 +411,6 @@ export class ObjectCluster {
   async get(bucket: string, key: string): Promise<ObjectValue | null> {
     const objectKey = this.objectKey(bucket, key);
     const locs = this.prefer(await this.locators(objectKey));
-    if (locs.some((loc) => (loc.segments?.length ?? 0) > 1)) {
-      return this.readSegments(objectKey, locs);
-    }
     let last: unknown;
     for (const loc of locs) {
       try {
@@ -427,6 +424,12 @@ export class ObjectCluster {
           continue;
         }
         if (loc.crc && crc32(value) !== loc.crc) {
+          if ((loc.segments?.length ?? 0) > 1) {
+            const repaired = await this.repairBadSegments(objectKey, locs, loc, value);
+            if (repaired) {
+              return repaired;
+            }
+          }
           last = new Error(`crc mismatch for ${objectKey}`);
           continue;
         }
@@ -891,36 +894,49 @@ export class ObjectCluster {
     };
   }
 
-  private async readSegments(objectKey: string, locs: ObjectLocator[]): Promise<ObjectValue | null> {
-    const sample = locs.find((loc) => (loc.segments?.length ?? 0) > 1);
-    if (!sample?.segments) {
+  private async repairBadSegments(
+    objectKey: string,
+    locs: ObjectLocator[],
+    loc: ObjectLocator,
+    value: Buffer,
+  ): Promise<ObjectValue | null> {
+    if (!loc.segments) {
       return null;
     }
-    const span = sample.segmentBytes || SEGMENT_BYTES;
+    const span = loc.segmentBytes || SEGMENT_BYTES;
     const parts: Buffer[] = [];
-    for (let i = 0; i < sample.segments.length; i++) {
+    for (let i = 0; i < loc.segments.length; i++) {
       const start = i * span;
-      const end = Math.min(sample.size, start + span) - 1;
-      let piece: Buffer | null = null;
-      for (const loc of locs) {
-        const expect = loc.segments?.[i] ?? sample.segments[i]!;
+      const sliceEnd = Math.min(value.length, start + span);
+      const piece = value.subarray(start, sliceEnd);
+      const expect = loc.segments[i]!;
+      if (crc32(piece) === expect) {
+        parts.push(piece);
+        continue;
+      }
+      let fixed: Buffer | null = null;
+      for (const other of locs) {
+        if (other.address === loc.address && other.recId === loc.recId) {
+          continue;
+        }
+        const otherExpect = other.segments?.[i] ?? expect;
         try {
-          const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc, { start, end });
-          if (got && crc32(got.value) === expect) {
-            piece = got.value;
+          const got = await blockGet(other.address, other.dataKey ?? objectKey, other, { start, end: sliceEnd - 1 });
+          if (got && crc32(got.value) === otherExpect) {
+            fixed = got.value;
             break;
           }
         } catch {
           // Try the next replica for this segment only.
         }
       }
-      if (!piece) {
-        throw new ControlError('BLOCK_UNAVAILABLE', `segment ${i} failed for ${objectKey}`);
+      if (!fixed) {
+        return null;
       }
-      parts.push(piece);
+      parts.push(fixed);
     }
-    const value = Buffer.concat(parts);
-    return { value, size: value.length, crc: sample.crc, mtimeMs: sample.mtimeMs, compressType: sample.compressType };
+    const out = Buffer.concat(parts);
+    return { value: out, size: out.length, crc: loc.crc, mtimeMs: loc.mtimeMs, compressType: loc.compressType };
   }
 
   private refStorageKey(loc: ObjectLocator): string {

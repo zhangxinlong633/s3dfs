@@ -178,3 +178,18 @@ A separate layout check of that older engine, writing 5,000 × 1 KiB objects and
 | get 1 MiB，N=3 | 364 ops/s（364 MiB/s） | 2.7 ms | 3.4 ms |
 
 复现：`S3DFS_COMPACT_INTERVAL_MS=0 S3DFS_BENCH_FOCUS=n3 S3DFS_BENCH_OPS=1000 S3DFS_BENCH_WARMUP=100 bun scripts/bench-split.mjs`。原始结果在 [bench-2026-11-21-n3.json](bench-2026-11-21-n3.json)。
+
+## 2026-11-21 三副本再测
+
+同一台机器、同一条命令，测的是带变更日志、用量记账和段校验的当前代码。时间 12:27（Asia/Shanghai）。1 KiB 预热 100 次、测量 1,000 次。1 MiB 预热 4 次、测量 40 次。仍然是 localhost，不是目标集群的容量。
+
+| 负载 | 吞吐 | p50 | p99 |
+| --- | ---: | ---: | ---: |
+| put 1 KiB，N=3 | 1,219 ops/s | 767 µs | 1,435 µs |
+| get 1 KiB，N=3 | 4,003 ops/s | 236 µs | 517 µs |
+| put 1 MiB，N=3 | 162 ops/s（162 MiB/s） | 6.1 ms | 6.9 ms |
+| get 1 MiB，N=3 | 376 ops/s（376 MiB/s） | 2.6 ms | 3.8 ms |
+
+写比上午慢：每次 Put 还要写 `$chg/` 和桶用量。读和上午接近。整段 CRC 对得上时一次读完；只有整段对不上时，才按 64 KiB 重取坏掉的那一段。
+
+原始结果在 [bench-2026-11-21-n3-2.json](bench-2026-11-21-n3-2.json)。

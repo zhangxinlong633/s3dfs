@@ -196,8 +196,9 @@ describe('remaining designs', () => {
       const got = await box.cluster.get('logs', 'seg');
       expect(got?.value.toString('utf8')).toBe('abcdefgh');
       const ranged = box.calls.filter((url) => url.includes('start='));
-      expect(ranged.filter((url) => url.includes('start=0'))).toHaveLength(2);
-      expect(ranged.filter((url) => url.includes('start=4'))).toHaveLength(1);
+      expect(box.calls.some((url) => url.includes('/get') && !url.includes('start='))).toBe(true);
+      expect(ranged.filter((url) => url.includes('start=0'))).toHaveLength(1);
+      expect(ranged.filter((url) => url.includes('start=4'))).toHaveLength(0);
     } finally {
       box.restore();
     }
