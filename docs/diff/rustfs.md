@@ -15,7 +15,7 @@
 | --- | --- |
 | 海量小对象，担心本地文件系统 inode 和每对象一个文件 | s3dfs。对象打进大 `.blk`，文件数跟块走，不跟对象数走 |
 | 日志、文本，希望写入前就压缩，压不小则原样落盘 | s3dfs。默认 zstd，类型记在 locator 上 |
-| 要接到现成 AWS CLI / SDK，并且依赖 IAM、KMS、站点复制、Object Lock、配额 | RustFS。这些在它的数据面上已经标成可用。s3dfs 的 Nest API 能做单对 access/secret 的 SigV4、预签名、分片、Copy、虚拟主机 URL、一份桶策略、单密钥 AES256、版本和删除标记、按前缀过期、一个 webhook |
+| 要接到现成 AWS CLI / SDK，并且依赖 IAM、KMS、站点复制、Object Lock、配额 | RustFS。这些在它的数据面上已经标成可用。s3dfs 的 Nest API 能做 SigV4、预签名、分片、Copy、虚拟主机 URL、桶策略、用户和组、默认 AES256 与 SSE-C、版本、对象锁、桶配额、按前缀过期、webhook 和一个队列。没有 KMS，也不补送已有对象 |
 | 大对象、数据湖、AI 吞吐，希望用纠删码换容量，而不是 3 副本 | RustFS。默认按纠删集做 Reed-Solomon |
 | 索引很小、正文机器很多，两边独立加机器 | s3dfs。索引建议 3–5 台 dleveldb，block 可以很多 |
 | 单进程就把 S3 和控制台一起跑起来，用 Docker / Helm 当 MinIO 替代 | RustFS。一个 `rustfs` 进程同时听 :9000 和 :9001。s3dfs 单机默认要分别起索引、block、API、控制台 |
@@ -94,15 +94,15 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 
 - Put / Get / Head / Delete / List（含 delimiter）、单个 Range、建桶、删空桶、CopyObject、虚拟主机风格 URL
 - 两个环境变量都设置时的 SigV4，以及预签名 URL。不设置则不鉴权。ETag 是整段正文的 CRC32，另有 `x-s3dfs-etag-algorithm: crc32`；`Content-MD5` 按 MD5 核对
-- `aws-chunked`（含 chunk signature）先解开再落盘。分片有创建、上传、ListParts、完成、中止；清单在索引里，分片正文在 block，重启还在，完成时拼成一个对象再写入正式 key
-- 一份桶策略（Allow / Deny）、单密钥 AES-256-GCM、版本和删除标记、按前缀的天数过期、一个 webhook URL
+- `aws-chunked`（含 chunk signature）先解开再落盘。分片有创建、上传、ListParts、完成、中止；清单在索引里，分片正文在 block，重启还在。未加密的完成按段转发，带服务端加密时仍拼成一段再封口
+- 桶策略（Allow / Deny）、用户和组、默认 AES256 与 SSE-C、版本和删除标记、对象锁、桶配额、按前缀的天数过期、webhook 和一个队列
 - 按对象压缩、3 副本、宕机节点避让、活副本不足时补齐并退役 down 的 locator、没有活副本时记为 `lost`、墓碑、扫描重建 locator、空闲或手动 compact
 
 控制台仍是看统计、桶和 block 状态，并触发 flush。C S3 网关能解开 `aws-chunked`、做内存中的分片和删空桶；配了同一对密钥时校验请求头签名和预签名，不校验分块签名。未压缩对象的 Range 按偏移向 block 要那一段；压缩对象仍先整段解开。超过 1 MiB 的原始 Put 按块进入 block。多数副本写成功就提交索引，种子上的 `@zone` 用来避开同一故障域。每个响应带 `x-amz-request-id`。
 
-这些和 RustFS 同名的能力，深度不一样。RustFS 的签名背后是 IAM，加密可以接到 Vault / AWS KMS，版本和生命周期是产品功能，通知、复制、配额、审计都在数据面上。s3dfs 这边是一条主路径加一组最小实现：一把密钥、一条策略、一个 webhook。Nest API 已有条件请求、用户元数据和批量删除。
+这些和 RustFS 同名的能力，深度不一样。RustFS 的签名背后还能接 LDAP 和外部 KMS，复制会补送已有对象。s3dfs 的身份、加密、对象锁、配额和桶复制是第一版：没有 LDAP 和 KMS，复制默认关闭，也不补送盘上的旧对象。Nest API 已有条件请求、用户元数据和批量删除。
 
-还没做的部分见 [todo.md](../todo.md)，以及下一节按源码逐项列出的缺口。s3dfs 自己的写入路径上仍开着：分片完成时在 API 里拼成一段、`aws-chunked` 仍整段缓冲、C 网关不校验分块签名。
+还没做的部分见 [todo.md](../todo.md)，以及下一节按源码逐项列出的缺口。s3dfs 自己的写入路径上仍开着：带服务端加密的分片完成仍拼成一段、`aws-chunked` 仍整段缓冲、C 网关不校验分块签名。
 
 ## 源码里有、s3dfs 还没有
 
@@ -113,9 +113,9 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | tagging | `rustfs/src/app/object_meta/tagging.rs`，桶和对象标签 | `?tagging` 读写桶标签和对象标签。对象标签存在索引 `$tags/`，不进 `.blk` |
 | cors | `rustfs/src/server/cors.rs`，`rustfs/src/app/bucket_usecase.rs` 的 cors 模块 | `?cors` 保存规则。`OPTIONS` 按来源和方法回预检头 |
 | website | `rustfs/src/app/website.rs` | `?website` 保存索引、错误页和按前缀重定向。目录请求返回索引。对象不存在时返回错误页，状态仍是 404。命中前缀时返回配置的跳转状态和 `Location` |
-| replication | `crates/replication`，桶复制配置 | 没有。`sendChanges` 只把变更送到另一套集群，默认不调用，也没有 S3 复制配置 |
-| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | `?object-lock` 打开后才能设保留期和法律保全，打开后不能关掉。GOVERNANCE 可用绕过头，法律保全不能 |
-| encryption | `crates/kms`：SSE-S3、SSE-KMS、SSE-C，后端可以是本地、Vault KV2、Vault Transit | 桶上的一把 AES-256-GCM。没有 KMS，也没有按对象换密钥 |
+| replication | `crates/replication`，桶复制配置 | `?replication` 打开后，之后的 Put 和 Delete 才送到 `S3DFS_REPLICA_URL`。默认关闭。不补送已有对象。`replicationProgress` 只给已送和未送两个数 |
+| object-lock、retention、legal-hold | `rustfs/src/app/bucket_usecase.rs` 的 object_lock，`crates/lifecycle/src/object_lock.rs` | `?object-lock` 打开后才能设保留期和法律保全，打开后不能关掉。可以给新对象一个默认天数。GOVERNANCE 可用绕过头，法律保全不能 |
+| encryption | `crates/kms`：SSE-S3、SSE-KMS、SSE-C，后端可以是本地、Vault KV2、Vault Transit | 默认 AES256 和请求上的 AES256 共用 `S3DFS_SSE_KEY`。超过 1 MiB 按块封存。上一把密钥留着时旧对象仍能打开。SSE-C 用调用方的密钥。没有 KMS |
 | inventory | `rustfs/src/connect/inventory` | `?inventory` 保存一份 CSV 配置。`POST` 立刻把当前对象写成 `前缀/id.csv`。没有按天调度 |
 | requestPayment、accelerate、intelligent-tiering、analytics、metrics | 路由接了这些查询名 | 没有 |
 | publicAccessBlock | 路由接了这个查询名 | `?publicAccessBlock` 打开后，拒绝资源为 `*` 或 `/*` 的 Allow 策略 |
@@ -126,16 +126,16 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 
 | 能力 | RustFS 源码 | s3dfs |
 | --- | --- | --- |
-| IAM | `crates/iam`：用户、组、服务账号、策略、LDAP、多因素 | 一对 `S3DFS_ACCESS_KEY` / `S3DFS_SECRET_KEY`。一份桶策略 |
+| IAM | `crates/iam`：用户、组、服务账号、策略、LDAP、多因素 | 索引里有用户、组、策略、服务账号和 `assumeRole`。根密钥和 `S3DFS_ACCOUNTS` 仍可用。没有 LDAP 和多因素 |
 | OIDC | README 标可用，认证走 IAM 旁边的登录 | 没有 |
 | Keystone | `crates/keystone` | 没有 |
 | 桶配额 | README 标可用；用量在 `crates/data-usage`、`crates/object-capacity` | 管理接口可以设 `quotaBytes`。没有 S3 的桶配额查询 |
 | 生命周期分层 | `crates/lifecycle` 含转移到远端 S3 的准入；scanner 负责到期和转移 | 按前缀和标签过期删除，按 `NoncurrentDays` 删掉非当前版本，并在删除标记成为唯一版本后清掉它。不把对象转到远端。`GET ?usage` 返回对象个数和字节 |
-| 站点复制 | `crates/replication` 与 `.docker/test/site-replication` | 没有 |
+| 站点复制 | `crates/replication` 与 `.docker/test/site-replication` | 桶复制开关只送之后的 Put 和 Delete。不补送已有对象，也不做整集群对写 |
 | S3 Select | `crates/s3select-api`、`crates/s3select-query`。README 写明只收未压缩输入 | 没有 |
 | 审计 | `crates/audit` | 没有。访问日志是每个响应一行 JSON |
 | 可观测性 | `crates/obs`、`crates/io-metrics` | `GET /_s3dfs/metrics` 只计本进程状态码 |
-| 事件通知 | `crates/notify` | `targets` 里可以有多个 webhook，每个地址用自己的 `events`。只写 `url` 时仍是一个地址 |
+| 事件通知 | `crates/notify` | `targets` 里可以有多个 webhook，每个地址用自己的 `events`。也可以交给一个队列。事件里是 bucket 和 key |
 | 多租户 | README 标可用 | 没有 |
 | Swift | `crates/protocols` 的 swift，编译 feature，默认不进 | 没有 |
 | FTPS、WebDAV | 默认 feature：`ftps`、`webdav` | 没有。挂载是自带的 `s3dfs-fuse` |
@@ -149,8 +149,8 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | 能力 | RustFS 源码 | s3dfs |
 | --- | --- | --- |
 | 冗余 | `crates/ecstore`、`crates/ecstore/src/erasure`，Reed-Solomon | 默认 3 份整对象副本。纠删不替换 `.blk` |
-| 没人读过的数据 | `crates/scanner` 后台扫用量、生命周期、复制和 bitrot，并排队 `crates/heal` | `Store.audit` 与 `POST /_s3dfs/block/audit` 把盘上每条记录再读一遍，帧校验和不对的计入 `bad`。不改写坏记录，计数也不写入索引。Get 时仍会换一份好副本 |
-| 扩容 | 存储池在后面追加，已有纠删集宽度不能改 | 加 block 机器。旧对象不自动搬到新机器 |
+| 没人读过的数据 | `crates/scanner` 后台扫用量、生命周期、复制和 bitrot，并排队 `crates/heal` | `scrub` 按 locator 重写坏副本并把检查数留在索引里。不扫没有索引的字节。Get 时仍会换一份好副本 |
+| 扩容 | 存储池在后面追加，已有纠删集宽度不能改 | 加 block 机器。旧对象不自动搬到新机器。`drain(nodeId)` 要人调用，才把这一台上面的份写到别的活节点 |
 
 ## 可靠性对照
 
@@ -167,7 +167,7 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 
 | 系统 | 自我修复 | 静默损坏巡检 | 自运维 | 告警与升级 | 停在哪 |
 | --- | --- | --- | --- | --- | --- |
-| s3dfs | 规则自动 | 规则自动 | 规则自动 | 手工 | 副本不够会再写一份，Get 时 CRC 不对就换一份。没有把所有 `.blk` 再读一遍并修好的闭环，告警也没有接上外部值班 |
+| s3dfs | 规则自动 | 规则自动 | 规则自动 | 手工 | 副本不够会再写一份，Get 时 CRC 不对就换一份。scrub 按 locator 留下计数，但没有把没有索引的 `.blk` 再读一遍。告警要配置地址才送出 |
 | ZFS | 闭环 | 闭环 | 规则自动 | 规则自动 | 读到坏块当场修，scrub 把没人读的块也走一遍，结果留在池的错误计数里。池在一台机器上 |
 | Btrfs | 规则自动 | 规则自动 | 手工 | 手工 | RAID 1/10 的 scrub 可以用另一份修。scrub 和 balance 要人安排。RAID 5/6 不能当唯一副本 |
 | HAMMER2 | 规则自动 | 规则自动 | 手工 | 手工 | 读时用 CRC，从卷可以恢复这一卷。没有默认定时把整卷读完并修好 |
@@ -175,14 +175,14 @@ s3dfs 的 Nest API（默认 :9000）现在能做：
 | NTFS | 规则自动 | 没有 | 手工 | 手工 | 在线修复和日志重放管元数据。用户数据没有端到端校验，也没有第二份副本 |
 | FFS | 手工 | 没有 | 手工 | 手工 | fsck 由人发起。数据块没有端到端校验。GEOM 镜像不自动跨机器补一份 |
 
-s3dfs 和 ZFS 的差距在闭环：ZFS 修完会留下计数，scrub 覆盖没人读过的块。s3dfs 与 Btrfs、HAMMER2 同在规则自动，还没有到 ZFS 那一档。APFS 的用户数据没有可以换上的第二份。NTFS 和 FFS 的用户数据没有端到端校验。这些文件系统都不提供跨 zone 的 S3。
+s3dfs 和 ZFS 的差距在闭环：ZFS 的 scrub 覆盖没人读过的块。s3dfs 的 `scrub` 按 locator 修并留下计数，不扫没有索引的字节。s3dfs 与 Btrfs、HAMMER2 同在规则自动，还没有到 ZFS 那一档。APFS 的用户数据没有可以换上的第二份。NTFS 和 FFS 的用户数据没有端到端校验。这些文件系统都不提供跨 zone 的 S3。
 
-s3dfs 现在停在规则自动。下面两档还没有。纠删、IAM、KMS、Object Lock 和站点复制不在这张差距表里。
+s3dfs 现在停在规则自动。下面两档还没有。纠删、KMS 和整集群的站点同步不在这张差距表里。身份账本、对象锁和桶复制开关已经有第一版。
 
 | 还差的档 | 还缺什么 |
 | --- | --- |
-| 闭环 | 把所有 `.blk` 再读一遍，能修的当时修，修完留下计数。停一台 block 或一台索引之后，健康检查回到 200 要多久，还没有测过 |
-| 产品 | 准备接流量的集群上还没有容量数字，也没有五步演练的部署笔记。告警没有接上外部值班，升级没有交给值班的步骤。本机 localhost 的通过不能当作唯一副本 |
+| 闭环 | 把没有索引的 `.blk` 再读一遍。按 locator 的巡检已经会修并留下计数。停一台 block 或一台索引之后，健康检查回到 200 要多久，还没有在目标集群测过 |
+| 产品 | 准备接流量的集群上还没有容量数字，也没有五步演练的部署笔记。告警只在配置了地址时送出，升级顺序已经写给值班，目标集群还没按这个顺序走过。本机 localhost 的通过不能当作唯一副本 |
 
 ## 不照搬的部分
 
