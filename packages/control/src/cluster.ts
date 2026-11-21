@@ -1077,7 +1077,18 @@ export class ObjectCluster {
         break;
       }
     }
+    await this.kv.put('$scrub/report', Buffer.from(JSON.stringify(report)));
     return report;
+  }
+
+  /** Counts from the last scrub. A new process reads the same numbers without running scrub. */
+  async scrubReport(): Promise<{ checked: number; repaired: number; lost: number } | null> {
+    const got = await this.kv.get('$scrub/report');
+    if (!got) {
+      return null;
+    }
+    const parsed = JSON.parse(got.value.toString('utf8')) as { checked: number; repaired: number; lost: number };
+    return { checked: parsed.checked, repaired: parsed.repaired, lost: parsed.lost };
   }
 
   private async scrubObject(objectKey: string): Promise<'ok' | 'repaired' | 'lost' | 'skipped'> {

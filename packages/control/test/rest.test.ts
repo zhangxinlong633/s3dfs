@@ -124,6 +124,8 @@ describe('remaining designs', () => {
       const again = await box.cluster.scrub();
       expect(again.lost).toBe(1);
       expect(await box.cluster.lostKeys()).toContain('logs/a.txt');
+      const next = new ObjectCluster(box.kv, new NodeRegistry(nodes()), 3);
+      expect(await next.scrubReport()).toEqual(again);
     } finally {
       box.restore();
     }
