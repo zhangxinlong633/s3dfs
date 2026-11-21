@@ -3,13 +3,19 @@ import { crc32, parseByteRange, type ObjectValue } from '@s3dfs/control';
 import { AwsChunkError, objectBytes } from './aws-chunked';
 import { MultipartUploads, S3HttpError, parseCompleteParts } from './multipart';
 import {
+  accountAllowsBucket,
+  accountExpired,
   actionFor,
   checkPolicy,
+  isCustomerSealed,
   isSealed,
+  openCustomer,
   openObject,
   matchCors,
   parseCors,
+  parseDefaultEncryption,
   parseObjectLock,
+  parseReplication,
   parsePublicAccessBlock,
   policyIsPublic,
   parseInventory,
@@ -25,8 +31,10 @@ import {
   retentionXml,
   tagsXml,
   postEvent,
+  sealCustomer,
   sealObject,
   sseKeyFromSecret,
+  type AccessAccount,
   type ConfigStore,
   type ObjectUserMeta,
   type VersionStore,
@@ -90,6 +98,9 @@ export interface S3Request {
 
 export interface S3Options {
   credentials?: SigV4Identity;
+  accounts?: AccessAccount[];
+  replica?: { put(bucket: string, key: string, body: Buffer): Promise<void>; delete(bucket: string, key: string): Promise<void> };
+  queue?: { push(event: Record<string, unknown>): void };
   /** Virtual-hosted buckets are `{bucket}.{domain}`. */
   domain?: string;
   sseSecret?: string;
@@ -207,6 +218,53 @@ function resolveTarget(req: S3Request, domain: string | undefined): { bucket?: s
   return parsePath(req.path);
 }
 
+function accessKeyIdOf(req: S3Request): string | undefined {
+  const auth = header(req.headers, 'authorization') ?? '';
+  const cred = /Credential=([^,\s]+)/.exec(auth)?.[1] ?? req.query.get('X-Amz-Credential') ?? '';
+  const accessKeyId = cred.split('/')[0];
+  return accessKeyId || undefined;
+}
+
+function verifyStreaming(req: S3Request, secret: string, signed: { scope: string; amzDate: string; signature: string }): void {
+  const sha = header(req.headers, 'x-amz-content-sha256') ?? '';
+  if (sha.startsWith('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) {
+    verifyChunkSignatures(req.body, secret, signed.scope, signed.amzDate, signed.signature);
+  }
+}
+
+function authenticate(req: S3Request, options: S3Options): AccessAccount | undefined {
+  if (options.accounts && options.accounts.length > 0) {
+    const account = options.accounts.find((item) => item.accessKeyId === accessKeyIdOf(req));
+    if (!account) {
+      throw new S3HttpError(403, 'InvalidAccessKeyId', 'The access key id does not match');
+    }
+    if (accountExpired(account, req.now ?? Date.now())) {
+      throw new S3HttpError(403, 'AccessDenied', 'The security token has expired');
+    }
+    verifyStreaming(req, account.secretAccessKey, verifySigV4({ ...req, now: req.now }, account));
+    return account;
+  }
+  if (options.credentials) {
+    verifyStreaming(req, options.credentials.secretAccessKey, verifySigV4({ ...req, now: req.now }, options.credentials));
+  }
+  return undefined;
+}
+
+function customerKey(req: S3Request): Buffer | undefined {
+  const algorithm = header(req.headers, 'x-amz-server-side-encryption-customer-algorithm');
+  if (!algorithm) {
+    return undefined;
+  }
+  if (algorithm.toUpperCase() !== 'AES256') {
+    throw new S3HttpError(400, 'InvalidArgument', 'SSE-C algorithm must be AES256');
+  }
+  const key = Buffer.from(header(req.headers, 'x-amz-server-side-encryption-customer-key') ?? '', 'base64');
+  if (key.length !== 32) {
+    throw new S3HttpError(400, 'InvalidArgument', 'SSE-C key must be 32 bytes');
+  }
+  return key;
+}
+
 function isBucketAdmin(req: S3Request): boolean {
   return (
     req.query.has('policy') ||
@@ -220,7 +278,9 @@ function isBucketAdmin(req: S3Request): boolean {
     req.query.has('inventory') ||
     req.query.has('publicAccessBlock') ||
     req.query.has('location') ||
-    req.query.has('object-lock')
+    req.query.has('object-lock') ||
+    req.query.has('encryption') ||
+    req.query.has('replication')
   );
 }
 
@@ -350,14 +410,11 @@ export async function handleS3(
   options: S3Options = {},
 ): Promise<S3Response> {
   try {
-    if (options.credentials) {
-      const signed = verifySigV4({ ...req, now: req.now }, options.credentials);
-      const sha = header(req.headers, 'x-amz-content-sha256') ?? '';
-      if (sha.startsWith('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) {
-        verifyChunkSignatures(req.body, options.credentials.secretAccessKey, signed.scope, signed.amzDate, signed.signature);
-      }
-    }
+    const account = authenticate(req, options);
     const { bucket, key } = resolveTarget(req, options.domain);
+    if (account && bucket && !accountAllowsBucket(account, bucket)) {
+      throw new S3HttpError(403, 'AccessDenied', 'The access key is not allowed to use this bucket');
+    }
     const method = req.method.toUpperCase();
     if (bucket && !isBucketAdmin(req)) {
       const config = options.config ? await options.config.get(bucket) : {};
@@ -600,9 +657,21 @@ async function handleBucket(
       return xml(405, errorXml('MethodNotAllowed', 'Object lock cannot be removed', bucket));
     }
   }
+  if (req.query.has('encryption') && configStore && method === 'PUT') {
+    const config = await configStore.get(bucket);
+    config.encryption = parseDefaultEncryption(req.body.toString('utf8'));
+    await configStore.put(bucket, config);
+    return empty(200);
+  }
+  if (req.query.has('replication') && configStore && method === 'PUT') {
+    const config = await configStore.get(bucket);
+    config.replication = parseReplication(req.body.toString('utf8'));
+    await configStore.put(bucket, config);
+    return empty(200);
+  }
   if (req.query.has('notification') && configStore) {
     if (method === 'PUT') {
-      const parsed = JSON.parse(req.body.toString('utf8')) as { url?: string; events?: string[]; targets?: { url?: string; events?: string[] }[] };
+      const parsed = JSON.parse(req.body.toString('utf8')) as { url?: string; events?: string[]; targets?: { url?: string; events?: string[] }[]; queue?: { events?: string[] } };
       const config = await configStore.get(bucket);
       if (Array.isArray(parsed.targets)) {
         config.notify = parsed.targets
@@ -614,6 +683,9 @@ async function handleBucket(
         config.notifyUrl = parsed.url;
         config.notifyEvents = parsed.events;
         config.notify = parsed.url ? [{ url: parsed.url, events: parsed.events }] : [];
+      }
+      if (parsed.queue) {
+        config.queue = { events: parsed.queue.events };
       }
       await configStore.put(bucket, config);
       return empty(200);
@@ -791,12 +863,17 @@ async function missingObject(backend: S3Backend, bucket: string, key: string, co
   return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
 }
 
-async function maybeSeal(req: S3Request, body: Buffer, options: S3Options): Promise<Buffer> {
+async function maybeSeal(req: S3Request, body: Buffer, options: S3Options, encryption?: { algorithm: 'AES256' }): Promise<Buffer> {
+  const customer = customerKey(req);
+  if (customer) {
+    return sealCustomer(customer, body);
+  }
   const want = (header(req.headers, 'x-amz-server-side-encryption') ?? '').toUpperCase();
-  if (!want) {
+  const defaults = !want && encryption?.algorithm === 'AES256';
+  if (!want && !defaults) {
     return body;
   }
-  if (want !== 'AES256') {
+  if (want && want !== 'AES256') {
     throw new S3HttpError(400, 'InvalidArgument', 'Only AES256 server-side encryption is supported');
   }
   if (!options.sseSecret) {
@@ -805,11 +882,41 @@ async function maybeSeal(req: S3Request, body: Buffer, options: S3Options): Prom
   return sealObject(sseKeyFromSecret(options.sseSecret), body);
 }
 
-async function presentObject(stored: Buffer, options: S3Options): Promise<Buffer> {
+async function presentObject(stored: Buffer, options: S3Options, req: S3Request): Promise<Buffer> {
+  if (isCustomerSealed(stored)) {
+    const key = customerKey(req);
+    if (!key) {
+      throw new S3HttpError(403, 'InvalidRequest', 'SSE-C key is required');
+    }
+    try {
+      return openCustomer(key, stored);
+    } catch {
+      throw new S3HttpError(403, 'InvalidRequest', 'SSE-C key does not match');
+    }
+  }
   if (options.sseSecret && isSealed(stored)) {
     return openObject(sseKeyFromSecret(options.sseSecret), stored);
   }
   return stored;
+}
+
+async function applyDefaultRetention(config: { objectLock?: { mode?: 'GOVERNANCE' | 'COMPLIANCE'; days?: number } }, options: S3Options, bucket: string, key: string, now: number): Promise<void> {
+  const lock = config.objectLock;
+  if (!options.meta || !lock?.mode || !lock.days) {
+    return;
+  }
+  await options.meta.saveRetention(bucket, key, { mode: lock.mode, untilMs: now + lock.days * 86_400_000 });
+}
+
+async function replicate(config: { replication?: { enabled: true } }, options: S3Options, bucket: string, key: string, body?: Buffer): Promise<void> {
+  if (!config.replication?.enabled || !options.replica) {
+    return;
+  }
+  if (body) {
+    await options.replica.put(bucket, key, body);
+    return;
+  }
+  await options.replica.delete(bucket, key);
 }
 
 async function handleObject(
@@ -922,7 +1029,7 @@ async function handleObject(
       await backend.putStream(bucket, key, uploads.eachPart(bucket, key, uploadId, declared));
     } else {
       const body = await uploads.complete(bucket, key, uploadId, declared);
-      await backend.put(bucket, key, await maybeSeal(req, body, options));
+      await backend.put(bucket, key, await maybeSeal(req, body, options, config.encryption));
     }
     await uploads.finish(uploadId);
     const meta = await backend.head(bucket, key);
@@ -999,7 +1106,7 @@ async function handleObject(
       }
       const meta = await backend.head(bucket, key);
       const etag = meta ? etagFromCrc(meta.crc) : '"00000000"';
-      await postEvent(config, { event: 's3:ObjectCreated:Copy', bucket, key }, options.fetchImpl);
+      await postEvent(config, { event: 's3:ObjectCreated:Copy', bucket, key }, options.fetchImpl, options.queue);
       return xml(200, copyObjectXml(etag, new Date(meta?.mtimeMs ?? Date.now()).toISOString()), etagHeaders(meta?.crc ?? 0));
     }
     await backend.createBucket(bucket);
@@ -1026,7 +1133,9 @@ async function handleObject(
       if (options.meta) {
         await options.meta.save(bucket, key, userMeta(req.headers));
       }
-      await postEvent(config, { event: 's3:ObjectCreated:Put', bucket, key, size: stored.size }, options.fetchImpl);
+      await applyDefaultRetention(config, options, bucket, key, req.now ?? Date.now());
+      await replicate(config, options, bucket, key, Buffer.alloc(0));
+      await postEvent(config, { event: 's3:ObjectCreated:Put', bucket, key, size: stored.size }, options.fetchImpl, options.queue);
       return empty(200, headers);
     }
     const plain = payload(req);
@@ -1035,7 +1144,7 @@ async function handleObject(
     if (failed) {
       return failed;
     }
-    const stored = await maybeSeal(req, plain, options);
+    const stored = await maybeSeal(req, plain, options, config.encryption);
     await backend.put(bucket, key, stored);
     let versionId: string | undefined;
     if (versioning) {
@@ -1053,7 +1162,9 @@ async function handleObject(
     if (options.meta) {
       await options.meta.save(bucket, key, userMeta(req.headers));
     }
-    await postEvent(config, { event: 's3:ObjectCreated:Put', bucket, key, size: plain.length }, options.fetchImpl);
+    await applyDefaultRetention(config, options, bucket, key, req.now ?? Date.now());
+    await replicate(config, options, bucket, key, stored);
+    await postEvent(config, { event: 's3:ObjectCreated:Put', bucket, key, size: plain.length }, options.fetchImpl, options.queue);
     return empty(200, headers);
   }
   if (method === 'GET' || method === 'HEAD') {
@@ -1080,7 +1191,7 @@ async function handleObject(
       if (!version || version.deleteMarker || !version.body) {
         return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
       }
-      const body = method === 'HEAD' ? Buffer.alloc(0) : await presentObject(version.body, options);
+      const body = method === 'HEAD' ? Buffer.alloc(0) : await presentObject(version.body, options, req);
       return {
         status: 200,
         headers: {
@@ -1129,7 +1240,7 @@ async function handleObject(
     if (!obj) {
       return xml(404, errorXml('NoSuchKey', 'The specified key does not exist', `/${bucket}/${key}`));
     }
-    const body = partial ? obj.value : await presentObject(obj.value, options);
+    const body = partial ? obj.value : await presentObject(obj.value, options, req);
     if (!partial && body.length !== obj.value.length) {
       headers['Content-Length'] = String(body.length);
     }
@@ -1155,12 +1266,13 @@ async function handleObject(
       await versioning.put(bucket, key, { id: versionId, body: null, deleteMarker: true, mtimeMs: Date.now() });
       await backend.delete(bucket, key);
       await options.meta?.remove(bucket, key);
-      await postEvent(config, { event: 's3:ObjectRemoved:DeleteMarkerCreated', bucket, key }, options.fetchImpl);
+      await postEvent(config, { event: 's3:ObjectRemoved:DeleteMarkerCreated', bucket, key }, options.fetchImpl, options.queue);
       return empty(204, { 'x-amz-version-id': versionId, 'x-amz-delete-marker': 'true' });
     }
     await backend.delete(bucket, key);
     await options.meta?.remove(bucket, key);
-    await postEvent(config, { event: 's3:ObjectRemoved:Delete', bucket, key }, options.fetchImpl);
+    await replicate(config, options, bucket, key);
+    await postEvent(config, { event: 's3:ObjectRemoved:Delete', bucket, key }, options.fetchImpl, options.queue);
     return empty(204);
   }
   return xml(405, errorXml('MethodNotAllowed', 'Method not allowed', `/${bucket}/${key}`));

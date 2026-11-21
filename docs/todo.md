@@ -97,7 +97,7 @@ s3dfs 的写条件已经和 Garage 的多数同类，读条件和 SeaweedFS 热�
 | 探活与指标 | 健康是集群状态；Prometheus 一类的拉取接口 | `lost` 来自 `$lost/`，健康 JSON 带 `lostKeys`。`/_s3dfs/metrics` 是进程启动以来的状态码计数 | 指标格式不挡八项。不改成 Prometheus |
 | ETag | MD5，或分片的 MD5 再加段数 | 整段 CRC32，响应带 `x-s3dfs-etag-algorithm: crc32`。核对正文用 `Content-MD5` | 对接时讲明。不改成 MD5 也能上线 |
 | 压缩 | 多数不在服务端默默压缩 | 默认 zstd，压不小则存原文 | 保持 |
-| 对象锁、站点复制、配额、审计、KMS、远程分层 | MinIO、Ceph、Garage、RustFS、Ozone 的程度不一，都已放在数据面或相邻组件上 | 没有 | 不作为上线前提 |
+| 对象锁、站点复制、配额、审计、KMS、远程分层 | MinIO、Ceph、Garage、RustFS、Ozone 的程度不一，都已放在数据面或相邻组件上 | 对象锁开关、保留期和法律保全已有。配额是管理接口上的 `quotaBytes`。站点复制、KMS 和远程分层还没有 | 值得做，不挡八项。见文末「对照 MinIO 值得做」 |
 | 小对象的进程上限 | SeaweedFS 内存里约 16 字节一条 | 单进程活记录停在 2^30 − 1。按 1 KiB 算大约 1 TiB 逻辑数据就要拆进程；按 1 MiB 算，一块 1 PB 盘仍在上限以内 | 见 [规模说明](scale.md)。不挡当前八项 |
 
 ### 由此不改的判断
@@ -160,6 +160,18 @@ GFS、淘宝 TFS、FastDFS 管的是文件，不是带桶和 SigV4 的对象。Z
 | 告警送到值班 | [ZFS](diff/zfs.md) 把盘故障和校验错误发到本机事件 | 配置了接收地址时，`lost`、布局不 ok、副本不足各送一条。没配置就不发 | 不自动升级。模型仍不决定修不修 | 配上地址后制造一条 `$lost/`，地址收到含这个 key 的消息。不配时与现在相同 |
 | 升级顺序写给值班 | [CephFS](diff/cephfs.md) 的升级是写下来的步骤，不是自动跳版本 | 写出索引、block、API 的停止、替换、拉起顺序和回退 | 不自动跳版本 | 按文档在本机走完一遍，健康检查回到 200 |
 
+## 对照 MinIO 值得做
+
+来自 [minio.md](diff/minio.md)。日常的 Put、Get、分片、拷贝、版本、生命周期、标签、CORS、网站、校验和已经有了。对象锁的开关、保留期和法律保全也有。下面这些值得做。写成功仍是 3 份里的 2 份，默认冗余仍是整对象 3 副本，不改成纠删，也不改成每对象一份 `xl.meta`。都不挡上面的八项。没人读过的坏记录已经列在「把 `.blk` 再读一遍并留下计数」，这里不重复。
+
+| 还缺的 | MinIO 里是什么 | 在 s3dfs 里做成什么 | 不一起搬 | 关闭条件 |
+| --- | --- | --- | --- | --- |
+| 多用户身份 | 用户、组、服务账号、STS，以及多条策略。另有 LDAP | 代码已补：`accounts` 里每把密钥限定桶，`expiresAtMs` 过期后拒绝。环境变量 `S3DFS_ACCOUNTS` 可传入同一份 JSON | 第一版不接 LDAP、OIDC。不把策略引擎做成 IAM 的全部动作 | `apps/api/test/s3-rest.test.ts`：两把密钥各写各的桶，过期凭证 403 |
+| 加密接到密钥 | 桶默认加密，以及 SSE-S3、SSE-KMS、SSE-C。密钥可以接到 KMS | 代码已补：`?encryption` 的 AES256 用 `S3DFS_SSE_KEY` 封存。SSE-C 用调用方的密钥，对不上则 Get 失败 | 不替换未标明加密的对象。不把 Vault 当成上线依赖。外部 KMS 仍是这把测试密钥 | `apps/api/test/s3-rest.test.ts`：默认加密的 Put 不带加密头也能读出原文。错的 SSE-C 密钥 Get 为 403 |
+| 桶复制和站点复制 | 桶上的复制配置，以及另一套集群的站点复制。删除和覆盖会送到对端 | 代码已补：`?replication` 打开后，Delete 调 `replica.delete`。`sendChanges(..., { deletes: true })` 才把删除送到目标 | 不把本集群的 3 副本叫作第二站点。不改成纠删后再复制。默认不调用 | `apps/api/test/s3-rest.test.ts`：没配规则时目标收不到删除。配上之后收得到。`packages/control/test/rest.test.ts` 覆盖 `deletes: true` |
+| 通知的目的地 | Webhook 之外还有 Kafka、AMQP、Redis、NATS | 代码已补：通知配置里的 `queue` 把事件交给一个队列。webhook 仍可用 | 只做一种队列接口，不接四种中间件。事件里没有对象正文 | `apps/api/test/s3-rest.test.ts`：队列收到 bucket 和 key |
+| 对象锁的默认保留期 | 桶配置里写默认模式和天数，新建对象不用再逐个 Put retention | 代码已补：`?object-lock` 接受 `DefaultRetention` 的模式和天数。新 Put 写入保留期 | 不锁未打开对象锁的桶。法律保全仍按对象打开 | `apps/api/test/s3-rest.test.ts`：默认 1 天的对象 Delete 为 403。另一个桶 Put 后仍可删 |
+
 ## 不作为上线前提
 
-纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift、SFTP、多用户 IAM、KMS、把 ETag 改成 MD5、Prometheus 拉取格式、加节点后自动搬走旧对象。单机文件系统上的快照、RAID-Z、USN 变更日志和同池克隆也不在这八项里。POSIX 共享、块设备、NFS 和 SMB 导出同样不在这八项里。上一节收进来的巡检、按块补副本、持久的 `lost`、变更日志、段校验、共享 Copy、桶配额、按盘记账、显式搬迁、送到另一套集群、坏 locator 换份，以及再后面的全量巡检计数、恢复时间、外部告警和升级顺序，也不挡这八项。
+纠删码、远程分层、审计日志、Helm、Swift、SFTP、把 ETag 改成 MD5、Prometheus 拉取格式、加节点后自动搬走旧对象。LDAP 和 OIDC 不在身份那一条的第一版里。单机文件系统上的快照、RAID-Z、USN 变更日志和同池克隆也不在这八项里。POSIX 共享、块设备、NFS 和 SMB 导出同样不在这八项里。上一节收进来的巡检、按块补副本、持久的 `lost`、变更日志、段校验、共享 Copy、桶配额、按盘记账、显式搬迁、送到另一套集群、坏 locator 换份，以及再后面的全量巡检计数、恢复时间、外部告警和升级顺序，也不挡这八项。上面「对照 MinIO 值得做」里的身份、加密、复制、通知目的地和默认保留期同样不挡这八项。

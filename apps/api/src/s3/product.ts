@@ -38,7 +38,10 @@ export interface BucketConfig {
   notifyUrl?: string;
   notifyEvents?: string[];
   notify?: { url: string; events?: string[] }[];
-  objectLock?: { enabled: true };
+  queue?: { events?: string[] };
+  objectLock?: { enabled: true; mode?: 'GOVERNANCE' | 'COMPLIANCE'; days?: number };
+  encryption?: { algorithm: 'AES256' };
+  replication?: { enabled: true };
   blockPublicPolicy?: boolean;
   tags?: Record<string, string>;
   cors?: CorsRule[];
@@ -307,19 +310,85 @@ export function notifyTargets(config: { notifyUrl?: string; notifyEvents?: strin
   return config.notifyUrl ? [{ url: config.notifyUrl, events: config.notifyEvents }] : [];
 }
 
-export function parseObjectLock(body: string): { enabled: true } {
+export interface ObjectLockConfig {
+  enabled: true;
+  mode?: 'GOVERNANCE' | 'COMPLIANCE';
+  days?: number;
+}
+
+export function parseObjectLock(body: string): ObjectLockConfig {
   if (!/<ObjectLockEnabled>\s*Enabled\s*<\/ObjectLockEnabled>/i.test(body)) {
     throw new S3HttpError(400, 'MalformedXML', 'Object lock must be Enabled');
+  }
+  const mode = /<Mode>\s*(GOVERNANCE|COMPLIANCE)\s*<\/Mode>/i.exec(body)?.[1]?.toUpperCase();
+  const days = Number(/<Days>\s*(\d+)\s*<\/Days>/i.exec(body)?.[1] ?? '');
+  const lock: ObjectLockConfig = { enabled: true };
+  if (mode === 'GOVERNANCE' || mode === 'COMPLIANCE') {
+    lock.mode = mode;
+  }
+  if (Number.isInteger(days) && days > 0) {
+    lock.days = days;
+  }
+  return lock;
+}
+
+export function parseDefaultEncryption(body: string): { algorithm: 'AES256' } {
+  if (!/<SSEAlgorithm>\s*AES256\s*<\/SSEAlgorithm>/i.test(body)) {
+    throw new S3HttpError(400, 'MalformedXML', 'Default encryption must be AES256');
+  }
+  return { algorithm: 'AES256' };
+}
+
+export function parseReplication(body: string): { enabled: true } {
+  if (!/<Status>\s*Enabled\s*<\/Status>/i.test(body)) {
+    throw new S3HttpError(400, 'MalformedXML', 'Replication rule must be Enabled');
   }
   return { enabled: true };
 }
 
+export interface AccessAccount {
+  accessKeyId: string;
+  secretAccessKey: string;
+  buckets: '*' | string[];
+  expiresAtMs?: number;
+}
+
+export function accountExpired(account: AccessAccount, now: number): boolean {
+  return account.expiresAtMs != null && now >= account.expiresAtMs;
+}
+
+export function accountAllowsBucket(account: AccessAccount, bucket: string): boolean {
+  return account.buckets === '*' || account.buckets.includes(bucket);
+}
+
+const SSE_C_MAGIC = Buffer.from('S3EC');
+
+export function sealCustomer(key: Buffer, plain: Buffer): Buffer {
+  const sealed = sealObject(key, plain);
+  SSE_C_MAGIC.copy(sealed, 0);
+  return sealed;
+}
+
+export function isCustomerSealed(stored: Buffer): boolean {
+  return stored.length >= 4 && stored.subarray(0, 4).equals(SSE_C_MAGIC);
+}
+
+export function openCustomer(key: Buffer, stored: Buffer): Buffer {
+  const copy = Buffer.from(stored);
+  SSE_MAGIC.copy(copy, 0);
+  return openObject(key, copy);
+}
+
 export async function postEvent(
-  config: { notifyUrl?: string; notifyEvents?: string[]; notify?: { url: string; events?: string[] }[] },
+  config: { notifyUrl?: string; notifyEvents?: string[]; notify?: { url: string; events?: string[] }[]; queue?: { events?: string[] } },
   event: Record<string, unknown>,
   fetchImpl: typeof fetch = fetch,
+  queue?: { push(event: Record<string, unknown>): void },
 ): Promise<void> {
   const name = String(event.event ?? '');
+  if (queue && config.queue && eventSelected(config.queue.events, name)) {
+    queue.push(event);
+  }
   await Promise.all(
     notifyTargets(config)
       .filter((target) => eventSelected(target.events, name))

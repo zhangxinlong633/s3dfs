@@ -1187,11 +1187,18 @@ export class ObjectCluster {
     return { moved, bytes };
   }
 
-  async sendChanges(target: { put(bucket: string, key: string, value: Buffer): Promise<void> }): Promise<{ sent: number }> {
+  async sendChanges(
+    target: { put(bucket: string, key: string, value: Buffer): Promise<void>; delete?(bucket: string, key: string): Promise<void> },
+    options?: { deletes?: boolean },
+  ): Promise<{ sent: number }> {
     const changes = await this.listChanges();
     let sent = 0;
     for (const change of changes) {
       if (change.op === 'delete') {
+        if (options?.deletes && target.delete) {
+          await target.delete(change.bucket, change.key);
+          sent++;
+        }
         continue;
       }
       const got = await this.get(change.bucket, change.key);

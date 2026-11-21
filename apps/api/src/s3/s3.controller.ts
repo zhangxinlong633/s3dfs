@@ -4,6 +4,7 @@ import type { Request, Response } from 'express';
 import { ControlError, serviceHealthy } from '@s3dfs/control';
 import { EngineService } from '../engine/engine.service';
 import { handleS3, type S3Options } from './handle';
+import type { AccessAccount } from './product';
 import { IndexConfigStore, IndexObjectMeta, IndexUploadStore, IndexVersionStore } from './index-store';
 import { RequestMetrics } from './metrics';
 import { MultipartUploads } from './multipart';
@@ -11,6 +12,31 @@ import { patrolAuthorized } from './patrol';
 import { errorXml } from './s3.xml';
 
 type RawReq = Request & { rawBody?: Buffer; bodyStream?: AsyncIterable<Buffer> };
+
+function accountsFromEnv(): AccessAccount[] | undefined {
+  const raw = process.env.S3DFS_ACCOUNTS;
+  if (!raw) {
+    return undefined;
+  }
+  const parsed = JSON.parse(raw) as AccessAccount[];
+  return Array.isArray(parsed) ? parsed : undefined;
+}
+
+function replicaFromEnv(): S3Options['replica'] {
+  const base = process.env.S3DFS_REPLICA_URL;
+  if (!base) {
+    return undefined;
+  }
+  const root = base.replace(/\/$/, '');
+  return {
+    async put(bucket, key, body) {
+      await fetch(`${root}/${bucket}/${encodeURI(key)}`, { method: 'PUT', body });
+    },
+    async delete(bucket, key) {
+      await fetch(`${root}/${bucket}/${encodeURI(key)}`, { method: 'DELETE' });
+    },
+  };
+}
 
 function sendServiceError(res: Response, err: unknown): boolean {
   if (
@@ -43,6 +69,8 @@ export class S3Controller {
     const secretAccessKey = process.env.S3DFS_SECRET_KEY;
     return {
       credentials: accessKeyId && secretAccessKey ? { accessKeyId, secretAccessKey } : undefined,
+      accounts: accountsFromEnv(),
+      replica: replicaFromEnv(),
       domain: process.env.S3DFS_DOMAIN,
       sseSecret: process.env.S3DFS_SSE_KEY,
       config: new IndexConfigStore(this.engine.index()),

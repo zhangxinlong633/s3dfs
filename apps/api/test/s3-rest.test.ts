@@ -654,4 +654,129 @@ describe('s3 surface that was still open', () => {
       { url: 'http://hook.local/del', event: 's3:ObjectRemoved:Delete' },
     ]);
   });
+
+  test('two keys write only their own buckets, and an expired token is rejected', async () => {
+    const backend = new MemBackend();
+    const now = Date.UTC(2026, 10, 21, 8, 0, 0);
+    const accounts = [
+      { accessKeyId: 'ALICE', secretAccessKey: 'alice-secret', buckets: ['logs'] },
+      { accessKeyId: 'BOB', secretAccessKey: 'bob-secret', buckets: ['other'] },
+      { accessKeyId: 'TEMP', secretAccessKey: 'temp-secret', buckets: '*' as const, expiresAtMs: now - 1000 },
+    ];
+    const alice = await call(backend, signedPut('/logs/a.txt', Buffer.from('a'), accounts[0]!, now), { accounts, now });
+    expect(alice.status).toBe(200);
+    const bob = await call(backend, signedPut('/logs/b.txt', Buffer.from('b'), accounts[1]!, now), { accounts, now });
+    expect(bob.status).toBe(403);
+    const expired = await call(backend, signedPut('/logs/c.txt', Buffer.from('c'), accounts[2]!, now), { accounts, now });
+    expect(expired.status).toBe(403);
+    expect(backend.objects.has('logs/b.txt')).toBe(false);
+  });
+
+  test('bucket default encryption stores ciphertext and a wrong SSE-C key cannot read', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const xml = '<ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?encryption', body: Buffer.from(xml) }, { config, sseSecret: 'bucket-key' });
+    const put = await call(backend, { method: 'PUT', path: '/logs/plain.txt', body: Buffer.from('hello') }, { config, sseSecret: 'bucket-key' });
+    expect(put.status).toBe(200);
+    expect(backend.objects.get('logs/plain.txt')?.body.includes(Buffer.from('hello'))).toBe(false);
+    const got = await call(backend, { method: 'GET', path: '/logs/plain.txt' }, { config, sseSecret: 'bucket-key' });
+    expect(got.status).toBe(200);
+    expect(got.body.toString()).toBe('hello');
+
+    const customer = Buffer.alloc(32, 7).toString('base64');
+    const wrong = Buffer.alloc(32, 9).toString('base64');
+    await call(
+      backend,
+      {
+        method: 'PUT',
+        path: '/logs/c.txt',
+        body: Buffer.from('secret'),
+        headers: {
+          'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+          'x-amz-server-side-encryption-customer-key': customer,
+        },
+      },
+      { config },
+    );
+    const denied = await call(
+      backend,
+      {
+        method: 'GET',
+        path: '/logs/c.txt',
+        headers: {
+          'x-amz-server-side-encryption-customer-algorithm': 'AES256',
+          'x-amz-server-side-encryption-customer-key': wrong,
+        },
+      },
+      { config },
+    );
+    expect(denied.status).toBe(403);
+  });
+
+  test('replication deletes the target only when the bucket rule is enabled', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const removed: string[] = [];
+    const replica = {
+      async put() {},
+      async delete(bucket: string, key: string) {
+        removed.push(`${bucket}/${key}`);
+      },
+    };
+    await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('a') }, { config, replica });
+    await call(backend, { method: 'DELETE', path: '/logs/a.txt' }, { config, replica });
+    expect(removed).toEqual([]);
+    await call(
+      backend,
+      { method: 'PUT', path: '/logs?replication', body: Buffer.from('<ReplicationConfiguration><Rule><Status>Enabled</Status></Rule></ReplicationConfiguration>') },
+      { config, replica },
+    );
+    await call(backend, { method: 'PUT', path: '/logs/b.txt', body: Buffer.from('b') }, { config, replica });
+    await call(backend, { method: 'DELETE', path: '/logs/b.txt' }, { config, replica });
+    expect(removed).toEqual(['logs/b.txt']);
+  });
+
+  test('a configured queue receives the object event and a webhook-only bucket does not need one', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const queued: { bucket?: string; key?: string }[] = [];
+    const queue = { push(event: Record<string, unknown>) { queued.push({ bucket: event.bucket as string, key: event.key as string }); } };
+    await call(
+      backend,
+      { method: 'PUT', path: '/logs?notification', body: Buffer.from(JSON.stringify({ queue: { events: ['s3:ObjectCreated:*'] } })) },
+      { config, queue },
+    );
+    await call(backend, { method: 'PUT', path: '/logs/a.txt', body: Buffer.from('a') }, { config, queue });
+    expect(queued).toEqual([{ bucket: 'logs', key: 'a.txt' }]);
+  });
+
+  test('default retention blocks delete, and a bucket without it still deletes', async () => {
+    const backend = new MemBackend();
+    const config = new MemoryConfigStore();
+    const meta = new MemoryObjectMeta();
+    const lock = '<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>';
+    await call(backend, { method: 'PUT', path: '/logs?object-lock', body: Buffer.from(lock) }, { config, meta });
+    await call(backend, { method: 'PUT', path: '/logs/held.txt', body: Buffer.from('held') }, { config, meta });
+    const blocked = await call(backend, { method: 'DELETE', path: '/logs/held.txt' }, { config, meta });
+    expect(blocked.status).toBe(403);
+    await call(backend, { method: 'PUT', path: '/other/free.txt', body: Buffer.from('free') }, { config, meta });
+    const removed = await call(backend, { method: 'DELETE', path: '/other/free.txt' }, { config, meta });
+    expect(removed.status).toBe(204);
+  });
 });
+
+function signedPut(path: string, body: Buffer, account: { accessKeyId: string; secretAccessKey: string }, now: number): S3Request {
+  const url = new URL(path, 'http://127.0.0.1:9000');
+  const amzDate = new Date(now).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const scope = `${amzDate.slice(0, 8)}/us-east-1/s3/aws4_request`;
+  const headers: Record<string, string> = {
+    host: '127.0.0.1:9000',
+    'x-amz-date': amzDate,
+    'x-amz-content-sha256': createHash('sha256').update(body).digest('hex'),
+    authorization: `AWS4-HMAC-SHA256 Credential=${account.accessKeyId}/${scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=00`,
+  };
+  const signature = signRequest(account.secretAccessKey, { method: 'PUT', path: url.pathname, query: url.searchParams, headers, body, now }, amzDate, scope);
+  headers.authorization = headers.authorization.replace('Signature=00', `Signature=${signature}`);
+  return { method: 'PUT', path: url.pathname, query: url.searchParams, headers, body, host: '127.0.0.1:9000', now };
+}

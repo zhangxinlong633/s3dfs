@@ -268,4 +268,25 @@ describe('remaining designs', () => {
       box.restore();
     }
   });
+
+  test('sendChanges deletes on the target only when deletes are requested', async () => {
+    const box = open();
+    try {
+      await box.cluster.put('logs', 'a.txt', Buffer.from('keep'));
+      await box.cluster.delete('logs', 'a.txt');
+      const removed: string[] = [];
+      await box.cluster.sendChanges(
+        {
+          put: async () => {},
+          delete: async (bucket, key) => {
+            removed.push(`${bucket}/${key}`);
+          },
+        },
+        { deletes: true },
+      );
+      expect(removed).toContain('logs/a.txt');
+    } finally {
+      box.restore();
+    }
+  });
 });
