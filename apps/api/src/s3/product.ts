@@ -80,7 +80,7 @@ export interface VersionStore {
   put(bucket: string, key: string, version: ObjectVersion): Promise<void>;
   get(bucket: string, key: string, versionId: string): Promise<ObjectVersion | null>;
   list(bucket: string, key: string): Promise<ObjectVersion[]>;
-  listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]>;
+  listBucket(bucket: string): Promise<{ bucket: string; key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]>;
   remove(bucket: string, key: string, versionId: string): Promise<void>;
 }
 
@@ -102,9 +102,9 @@ export class MemoryVersionStore implements VersionStore {
     return this.versions.get(`${bucket}/${key}`) ?? [];
   }
 
-  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]> {
+  async listBucket(bucket: string): Promise<{ bucket: string; key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]> {
     const prefix = `${bucket}/`;
-    const out: { key: string; id: string; mtimeMs: number; deleteMarker: boolean }[] = [];
+    const out: { bucket: string; key: string; id: string; mtimeMs: number; deleteMarker: boolean }[] = [];
     for (const [id, versions] of this.versions) {
       if (!id.startsWith(prefix)) {
         continue;
@@ -181,7 +181,7 @@ export function openSealed(stored: Buffer, secrets: string[]): Buffer {
 
 export async function* sealFrames(chunks: AsyncIterable<Buffer>, secret: string): AsyncIterable<Buffer> {
   yield SSE_FRAMES;
-  let pending = Buffer.alloc(0);
+  let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   const emit = function* (block: Buffer): Generator<Buffer> {
     const sealed = sealObjectKeyed(secret, block);
     const len = Buffer.alloc(4);

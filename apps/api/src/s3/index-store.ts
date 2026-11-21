@@ -181,10 +181,10 @@ export class IndexVersionStore implements VersionStore {
     return out;
   }
 
-  async listBucket(bucket: string): Promise<{ key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]> {
+  async listBucket(bucket: string): Promise<{ bucket: string; key: string; id: string; mtimeMs: number; deleteMarker: boolean }[]> {
     const prefix = `$ver/${bucket}/`;
     const scanned = await this.kv.scan({ prefix, maxKeys: 10_000 });
-    const out: { key: string; id: string; mtimeMs: number; deleteMarker: boolean }[] = [];
+    const out: { bucket: string; key: string; id: string; mtimeMs: number; deleteMarker: boolean }[] = [];
     for (const obj of scanned.objects) {
       if (obj.key.endsWith('/list')) {
         continue;
