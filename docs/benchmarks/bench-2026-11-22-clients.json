@@ -1,0 +1,44 @@
+{
+  "at": "2026-11-22T04:56:42Z",
+  "until": "2026-11-22T05:02:38Z",
+  "payload": "random",
+  "note": "Three clients, one after another. Two call the API on their own machine. The machine without an API calls the API on the 16-core machine over the cluster network.",
+  "runs": [
+    {
+      "client": "16-core, API on the same machine",
+      "finishedAt": "2026-11-22T04:58:40.796Z",
+      "results": [
+        {"name": "put 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 40.158406610680565, "p50Us": 23732.377, "p99Us": 49931.192, "elapsedSec": 49.802772789},
+        {"name": "get 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 48.62125076215297, "p50Us": 19506.721, "p99Us": 34702.226, "elapsedSec": 41.134277063},
+        {"name": "put 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 13.137092764090685, "p50Us": 52381.693, "p99Us": 534215.791, "elapsedSec": 3.044813698},
+        {"name": "get 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 29.40039859825603, "p50Us": 32709.578, "p99Us": 57956.708, "elapsedSec": 1.360525772},
+        {"name": "put 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 260.34070274115527, "elapsedSec": 7.682240921},
+        {"name": "get 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 449.38957213531427, "elapsedSec": 4.450481551}
+      ]
+    },
+    {
+      "client": "8-core, API on the same machine",
+      "finishedAt": "2026-11-22T05:00:38.793Z",
+      "results": [
+        {"name": "put 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 41.61746862035567, "p50Us": 22654.938, "p99Us": 50221.938, "elapsedSec": 48.056743149},
+        {"name": "get 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 53.99804090112792, "p50Us": 17867.864, "p99Us": 29540.337, "elapsedSec": 37.038380775},
+        {"name": "put 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 15.27033870661469, "p50Us": 57003.77, "p99Us": 127152.455, "elapsedSec": 2.619457287},
+        {"name": "get 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 32.47185135554786, "p50Us": 28963.047, "p99Us": 67367.66, "elapsedSec": 1.231836139},
+        {"name": "put 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 275.8023835417585, "elapsedSec": 7.251568947},
+        {"name": "get 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 454.5906920016924, "elapsedSec": 4.399562145}
+      ]
+    },
+    {
+      "client": "8-core, no local API, cluster network to the 16-core API",
+      "finishedAt": "2026-11-22T05:02:38.747Z",
+      "results": [
+        {"name": "put 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 37.95614903135142, "p50Us": 24925.704, "p99Us": 62285.373, "elapsedSec": 52.692384529},
+        {"name": "get 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 48.59823666891418, "p50Us": 19805.541, "p99Us": 33213.06, "elapsedSec": 41.153756537},
+        {"name": "put 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 13.02374938558468, "p50Us": 57067.465, "p99Us": 359628.732, "elapsedSec": 3.071312171},
+        {"name": "get 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 29.915307856357778, "p50Us": 32146.586, "p99Us": 67699.939, "elapsedSec": 1.337108085},
+        {"name": "put 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 282.60428758128086, "elapsedSec": 7.077033463},
+        {"name": "get 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 454.90206147287114, "elapsedSec": 4.396550751}
+      ]
+    }
+  ]
+}

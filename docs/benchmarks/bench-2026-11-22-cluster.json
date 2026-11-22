@@ -1,0 +1,13 @@
+{
+  "at": "2026-11-22T04:37:08.164Z",
+  "client": "same machine as the measured API, loopback",
+  "payload": "random",
+  "results": [
+    {"name": "put 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 41.079866605453056, "p50Us": 22967.662, "p99Us": 41228.3, "elapsedSec": 48.685649815},
+    {"name": "get 1KiB", "ops": 2000, "warmup": 200, "opsPerSec": 58.57651105692781, "p50Us": 16458.87, "p99Us": 26832.303, "elapsedSec": 34.143378701},
+    {"name": "put 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 14.636560658208504, "p50Us": 53957.97, "p99Us": 319000.977, "elapsedSec": 2.732882467},
+    {"name": "get 1MiB", "ops": 40, "warmup": 4, "opsPerSec": 35.71855950371347, "p50Us": 27957.975, "p99Us": 35240.028, "elapsedSec": 1.11986599},
+    {"name": "put 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 247.8566216018322, "elapsedSec": 8.069181235},
+    {"name": "get 1KiB x32", "ops": 2000, "warmup": 64, "inflight": 32, "opsPerSec": 473.7979755546834, "elapsedSec": 4.221208412}
+  ]
+}

@@ -3,7 +3,7 @@ import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockScan, blo
 import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
 import { BACK_PREFIX, CHANGE_PREFIX, GC_PREFIX, LOST_PREFIX, MAINT_PREFIX, MAINTENANCE_MS, isVisibleObjectKey, locatorKey, lostKey, maintKey, usageKey } from './keys.js';
-import type { IndexClient } from './kv-client.js';
+import type { KvIndex } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
 import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
 import { ControlError } from './types.js';
@@ -163,13 +163,19 @@ function parseLocator(value: Buffer): ObjectLocator | null {
 
 export class ObjectCluster {
   constructor(
-    private readonly kv: IndexClient,
+    private readonly kv: KvIndex,
     private readonly registry: NodeRegistry,
     private readonly dataReplicas: number,
     private readonly compressType: CompressType = parseCompressType(process.env.S3DFS_COMPRESS),
   ) {}
 
   private lostTotal = 0;
+  /** Copies started after the local write has already been published. */
+  private copies: Promise<void> = Promise.resolve();
+  /** The full object walk in admitReturns must not overlap itself. */
+  private admitting = false;
+  /** Next automatic repair continues after this key. One call covers one segment. */
+  private repairCursor: string | undefined;
   private changeSeq = 0;
   private replOpened = false;
   private replSent = 0;
@@ -277,14 +283,26 @@ export class ObjectCluster {
     const digest = crc32(value);
     const targets = this.registry.pick(objectKey, this.dataReplicas);
     const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
-    const writes = await Promise.allSettled(targets.map((n) => blockPut(n.address, blockKey, packed.stored, meta)));
-    const accepted: { nodeId: string; address: string; recId: number; chained: boolean; generation: number; extentCount: number; storedSize: number; mtimeMs: number }[] = [];
-    for (let i = 0; i < writes.length; i++) {
-      const result = writes[i]!;
-      const node = targets[i]!;
-      if (result.status === 'fulfilled') {
-        const ev = result.value;
-        accepted.push({
+    const need = writeQuorum(targets.length);
+    const placed: {
+      nodeId: string;
+      address: string;
+      recId: number;
+      chained: boolean;
+      generation: number;
+      extentCount: number;
+      storedSize: number;
+      mtimeMs: number;
+    }[] = [];
+    const later: typeof targets = [];
+    for (const node of targets) {
+      if (placed.length > 0) {
+        later.push(node);
+        continue;
+      }
+      try {
+        const ev = await blockPut(node.address, blockKey, packed.stored, meta);
+        placed.push({
           nodeId: node.nodeId,
           address: node.address,
           recId: ev.recId,
@@ -294,60 +312,113 @@ export class ObjectCluster {
           storedSize: ev.size,
           mtimeMs: ev.mtimeMs,
         });
+      } catch {
+        continue;
       }
     }
-    if (accepted.length < writeQuorum(targets.length)) {
-      throw new ControlError(
-        'BLOCK_UNAVAILABLE',
-        `wrote ${accepted.length} of ${targets.length} replicas for ${objectKey}`,
-      );
+    const home = placed[0];
+    if (!home) {
+      throw new ControlError('BLOCK_UNAVAILABLE', `wrote 0 of ${targets.length} replicas for ${objectKey}`);
     }
-    const segments = segmentCrcs(value);
-    const changeP = this.noteChange('put', bucket, key);
-    const locatorKeys = accepted.map((_, i) => locatorKey(objectKey, i));
-    const indexed = await Promise.allSettled(
-      accepted.map(async (ev, i) => {
-        const loc: ObjectLocator = {
-          v: 3,
-          replica: i,
-          replicaCount: accepted.length,
-          nodeId: ev.nodeId,
-          address: ev.address,
+    const needMore = need - 1;
+    const pending = [...later];
+    while (placed.length < 1 + needMore && pending.length > 0) {
+      const node = pending.shift()!;
+      try {
+        const ev = await blockPut(node.address, blockKey, packed.stored, meta);
+        placed.push({
+          nodeId: node.nodeId,
+          address: node.address,
           recId: ev.recId,
           chained: ev.chained,
           generation: ev.generation,
           extentCount: ev.extentCount,
-          size: value.length,
-          storedSize: ev.storedSize,
-          compressType: packed.compressType,
-          crc: digest,
+          storedSize: ev.size,
           mtimeMs: ev.mtimeMs,
-          segments,
-          segmentBytes: SEGMENT_BYTES,
-          ...(blockKey === objectKey ? {} : { dataKey: blockKey }),
-        };
-        await this.kv.put(locatorKeys[i]!, Buffer.from(JSON.stringify(loc)));
-      }),
-    );
-    const failed = indexed.find((item) => item.status === 'rejected');
-    if (failed && failed.status === 'rejected') {
-      const changeKey = await changeP.catch(() => undefined);
-      await Promise.all([
-        ...locatorKeys.map((indexKey) => this.kv.delete(indexKey).catch(() => false)),
-        changeKey ? this.kv.delete(changeKey).catch(() => false) : Promise.resolve(false),
-      ]);
-      throw failed.reason;
+        });
+      } catch {
+        // 这一份失败就试下一个节点。
+      }
     }
+    if (placed.length < need) {
+      throw new ControlError(
+        'BLOCK_UNAVAILABLE',
+        `wrote ${placed.length} of ${targets.length} replicas for ${objectKey}`,
+      );
+    }
+    const segments = segmentCrcs(value);
+    const body = {
+      v: 3 as const,
+      size: value.length,
+      compressType: packed.compressType,
+      crc: digest,
+      segments,
+      segmentBytes: SEGMENT_BYTES,
+      ...(blockKey === objectKey ? {} : { dataKey: blockKey }),
+    };
+    const locatorKeys = placed.map((_, i) => locatorKey(objectKey, i));
     try {
-      await changeP;
+      for (let i = 0; i < placed.length; i++) {
+        const ev = placed[i]!;
+        await this.kv.put(
+          locatorKeys[i]!,
+          Buffer.from(JSON.stringify({ ...body, ...ev, replica: i, replicaCount: placed.length })),
+        );
+      }
+      await this.noteChange('put', bucket, key);
     } catch (err) {
       await Promise.all(locatorKeys.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
       throw err;
     }
     if (previous && blockKey !== objectKey) {
-      await Promise.all(previous.map((loc) => this.releaseLocator(loc, objectKey)));
+      await Promise.all(previous.map((item) => this.releaseLocator(item, objectKey)));
     }
     await this.addUsage(bucket, value.length - (previous?.[0]?.size ?? 0), limits);
+    const known = new Set(placed.map((ev) => ev.address));
+    const follow = (async () => {
+      let count = placed.length;
+      for (const node of pending) {
+        try {
+          const ev = await blockPut(node.address, blockKey, packed.stored, meta);
+          if (known.has(node.address)) {
+            continue;
+          }
+          known.add(node.address);
+          await this.kv.put(
+            locatorKey(objectKey, count),
+            Buffer.from(
+              JSON.stringify({
+                ...body,
+                nodeId: node.nodeId,
+                address: node.address,
+                recId: ev.recId,
+                chained: ev.chained,
+                generation: ev.generation,
+                extentCount: ev.extentCount,
+                storedSize: ev.size,
+                mtimeMs: ev.mtimeMs,
+                replica: count,
+                replicaCount: count + 1,
+              }),
+            ),
+          );
+          count += 1;
+          const primary = placed[0]!;
+          await this.kv.put(
+            locatorKey(objectKey, 0),
+            Buffer.from(JSON.stringify({ ...body, ...primary, replica: 0, replicaCount: count })),
+          );
+        } catch {
+          // 本机这份已经返回。这一份失败留给后面的修补。
+        }
+      }
+    })().catch(() => undefined);
+    this.copies = this.copies.then(() => follow);
+  }
+
+  /** Resolves when copies started by earlier puts have finished or failed. */
+  copiesSettled(): Promise<void> {
+    return this.copies;
   }
 
   /**
@@ -804,14 +875,14 @@ export class ObjectCluster {
    * Drop locators that point at a down node when a live copy remains, and add
    * copies back up to the configured replica count once a node is live again.
    */
-  async repair(opts: { maxObjects?: number } = {}): Promise<RepairReport> {
+  async repair(opts: { maxObjects?: number; startAfter?: string } = {}): Promise<RepairReport> {
     await this.registry.checkAll();
     const returned = await this.admitReturns();
     const paused = await this.maintenanceHolds(Date.now());
     await this.sweepGarbage();
     const report: RepairReport = { scanned: 0, alreadyOk: 0, repaired: 0, skipped: 0, failed: 0, lost: 0, returned };
-    const maxObjects = Math.max(1, opts.maxObjects ?? Number.MAX_SAFE_INTEGER);
-    let startAfter: string | undefined;
+    const maxObjects = Math.max(1, opts.maxObjects ?? 200);
+    let startAfter = opts.startAfter ?? this.repairCursor;
     while (report.scanned < maxObjects) {
       const listed = await this.kv.scan({
         prefix: '',
@@ -819,6 +890,7 @@ export class ObjectCluster {
         maxKeys: Math.min(1000, maxObjects - report.scanned),
       });
       if (listed.objects.length === 0) {
+        this.repairCursor = undefined;
         break;
       }
       for (const obj of listed.objects) {
@@ -834,6 +906,7 @@ export class ObjectCluster {
         }
       }
       if (!listed.truncated || report.scanned >= maxObjects) {
+        this.repairCursor = listed.truncated ? startAfter : undefined;
         break;
       }
     }
@@ -1094,6 +1167,18 @@ export class ObjectCluster {
    * Records whose recId is still in the index are kept. The rest are tombstoned.
    */
   async admitReturns(): Promise<{ nodeId: string; kept: number; removed: number }[]> {
+    if (this.admitting) {
+      return [];
+    }
+    this.admitting = true;
+    try {
+      return await this.admitReturnsOnce();
+    } finally {
+      this.admitting = false;
+    }
+  }
+
+  private async admitReturnsOnce(): Promise<{ nodeId: string; kept: number; removed: number }[]> {
     const notices: { key: string; nodeId: string; address: string }[] = [];
     let startAfter: string | undefined;
     for (;;) {

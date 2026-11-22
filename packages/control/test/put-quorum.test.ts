@@ -85,6 +85,57 @@ describe('replica write', () => {
       globalThis.fetch = previous;
     }
   });
+
+  test('quorum 1 returns after the first copy and fills the rest afterwards', async () => {
+    const previousQuorum = process.env.S3DFS_WRITE_QUORUM;
+    process.env.S3DFS_WRITE_QUORUM = '1';
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let opened = false;
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      if (!opened) {
+        opened = true;
+        return new Response(
+          JSON.stringify({ chained: false, crc: 1, mtimeMs: 1, size: 3, generation: 1, extentCount: 1, recId: 7 }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      await gate;
+      return new Response(
+        JSON.stringify({ chained: false, crc: 1, mtimeMs: 1, size: 3, generation: 1, extentCount: 1, recId: 8 }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      const kv = new MemIndex();
+      const registry = new NodeRegistry(kv as unknown as IndexClient, [
+        { nodeId: 'a', address: '10.0.0.1:9100', zone: 'z1' },
+        { nodeId: 'b', address: '10.0.0.2:9100', zone: 'z2' },
+        { nodeId: 'c', address: '10.0.0.3:9100', zone: 'z3' },
+      ]);
+      const cluster = new ObjectCluster(kv as unknown as IndexClient, registry, 3, 'none');
+      await cluster.put('logs', 'a.txt', Buffer.from('abc'));
+      const primary = JSON.parse(kv.map.get('logs/a.txt')!.toString('utf8')) as { replicaCount: number };
+      expect(primary.replicaCount).toBe(1);
+      expect(kv.map.has('logs/a.txt:1')).toBe(false);
+      release();
+      await cluster.copiesSettled();
+      const filled = JSON.parse(kv.map.get('logs/a.txt')!.toString('utf8')) as { replicaCount: number };
+      expect(filled.replicaCount).toBe(3);
+      expect(kv.map.has('logs/a.txt:1')).toBe(true);
+      expect(kv.map.has('logs/a.txt:2')).toBe(true);
+    } finally {
+      globalThis.fetch = previous;
+      if (previousQuorum === undefined) {
+        delete process.env.S3DFS_WRITE_QUORUM;
+      } else {
+        process.env.S3DFS_WRITE_QUORUM = previousQuorum;
+      }
+    }
+  });
 });
 
 describe('placement', () => {

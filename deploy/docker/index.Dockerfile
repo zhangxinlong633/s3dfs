@@ -6,4 +6,4 @@ COPY . .
 RUN bun install
 VOLUME /var/lib/s3dfs
 EXPOSE 9800
-CMD ["bun", "packages/dleveldb/src/cli.ts"]
+CMD ["bun", "packages/dleveldb/src/dleveldb.ts"]

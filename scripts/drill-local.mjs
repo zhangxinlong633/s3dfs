@@ -8,8 +8,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { signRequest } from '../apps/api/src/s3/sigv4.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dleveldbCli = path.resolve(root, '../dleveldb/packages/dleveldb/src/cli.ts');
-const blockMain = path.join(root, 'apps/block/src/main.ts');
+const dleveldbCli = path.resolve(root, '../dleveldb/packages/dleveldb/src/dleveldb.ts');
+const blockMain = path.join(root, 'apps/block/src/block.ts');
 const apiMain = path.join(root, 'apps/api/src/main.ts');
 const bun = process.env.BUN_BIN ?? 'bun';
 const accessKey = 'drill';

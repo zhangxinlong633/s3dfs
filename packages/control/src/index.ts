@@ -1,4 +1,5 @@
-export { IndexClient, type KvEntry, type KvValue, type ScanResult } from './kv-client.js';
+export { IndexClient, type KvIndex, type KvEntry, type KvValue, type ScanResult } from './kv-client.js';
+export { DirectIndex } from './direct-index.js';
 export {
   blockCompact,
   blockFlush,

@@ -16,11 +16,21 @@ export interface ScanResult {
   truncated: boolean;
 }
 
+export interface KvIndex {
+  readonly endpoints: string[];
+  put(key: string, value: Buffer): Promise<void>;
+  get(key: string): Promise<KvValue | null>;
+  head(key: string): Promise<Omit<KvEntry, 'key'> | null>;
+  delete(key: string): Promise<boolean>;
+  scan(opts?: { prefix?: string; startAfter?: string; maxKeys?: number }): Promise<ScanResult>;
+  ping(): Promise<boolean>;
+}
+
 /**
  * HTTP client for a standalone dleveldb cluster (typically 3–5 nodes).
  * This process is not a ring member; it talks to `/_dleveldb/kv/*`.
  */
-export class IndexClient {
+export class IndexClient implements KvIndex {
   private cursor = 0;
 
   constructor(

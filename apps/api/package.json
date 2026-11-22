@@ -14,6 +14,7 @@
     "@nestjs/core": "12.5.0",
     "@nestjs/platform-express": "12.5.0",
     "@s3dfs/control": "workspace:*",
+    "dleveldb": "file:../../../dleveldb/packages/dleveldb",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   },

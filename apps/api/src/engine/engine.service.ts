@@ -2,6 +2,7 @@ import { hostname } from 'node:os';
 import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import {
   ControlError,
+  DirectIndex,
   IndexClient,
   NodeRegistry,
   ObjectCluster,
@@ -10,6 +11,7 @@ import {
   parseIndexUrls,
   strictLayoutEnabled,
   type ClusterStats,
+  type KvIndex,
   type MaintenanceLeave,
   type RepairReport,
 } from '@s3dfs/control';
@@ -41,7 +43,9 @@ function publicApiBase(): string {
 
 @Injectable()
 export class EngineService implements OnModuleInit, OnModuleDestroy {
-  private kv!: IndexClient;
+  private kv!: KvIndex;
+  private indexHttp: { close(callback: () => void): void } | undefined;
+  private indexDb: { close(): Promise<void> } | undefined;
   private registry!: NodeRegistry;
   private cluster!: ObjectCluster;
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -71,13 +75,24 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   };
 
   async onModuleInit(): Promise<void> {
-    const urls = parseIndexUrls(process.env.S3DFS_INDEX_URLS ?? 'http://127.0.0.1:9800');
-    if (urls.length === 0) {
-      throw new ControlError('INDEX_UNAVAILABLE', 'S3DFS_INDEX_URLS is empty');
-    }
     const seeds = parseBlockNodes(process.env.S3DFS_BLOCK_NODES ?? 'block1=127.0.0.1:9100');
     const dataReplicas = Math.max(1, Number(process.env.S3DFS_DATA_REPLICAS ?? 3) || 3);
-    this.kv = new IndexClient(urls);
+    if (process.env.DLEVELDB_DATA_DIR) {
+      if (!process.env.DLEVELDB_PORT || !process.env.DLEVELDB_ADVERTISE_ADDR) {
+        throw new ControlError('INDEX_UNAVAILABLE', 'embedded index needs DLEVELDB_PORT and DLEVELDB_ADVERTISE_ADDR');
+      }
+      const { DLevelDB, loadConfig, listenDLevelDB } = await import('dleveldb');
+      const db = await DLevelDB.open(loadConfig());
+      this.indexDb = db;
+      this.indexHttp = await listenDLevelDB(db);
+      this.kv = new DirectIndex(db);
+    } else {
+      const urls = parseIndexUrls(process.env.S3DFS_INDEX_URLS ?? 'http://127.0.0.1:9800');
+      if (urls.length === 0) {
+        throw new ControlError('INDEX_UNAVAILABLE', 'S3DFS_INDEX_URLS is empty');
+      }
+      this.kv = new IndexClient(urls);
+    }
     this.registry = new NodeRegistry(this.kv, seeds);
     this.cluster = new ObjectCluster(this.kv, this.registry, dataReplicas);
     await this.registry.checkAll();
@@ -97,7 +112,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
         .catch(() => undefined);
     }, interval);
     this.timer.unref();
-    const repairEvery = Number(process.env.S3DFS_REPAIR_INTERVAL_MS ?? 30_000);
+    const repairEvery = Number(process.env.S3DFS_REPAIR_INTERVAL_MS ?? 3_600_000);
     if (repairEvery > 0) {
       this.repairTimer = setInterval(() => {
         if (this.repairing) {
@@ -134,6 +149,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     if (this.scaleTimer) {
       clearInterval(this.scaleTimer);
     }
+    if (this.indexHttp) {
+      await new Promise<void>((resolve) => this.indexHttp?.close(() => resolve()));
+    }
+    await this.indexDb?.close();
   }
 
   beginRequest(): void {
@@ -159,7 +178,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  index(): IndexClient {
+  index(): KvIndex {
     return this.kv;
   }
 

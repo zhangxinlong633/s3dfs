@@ -1,4 +1,4 @@
-import type { IndexClient } from '@s3dfs/control';
+import type { KvIndex } from '@s3dfs/control';
 import type { BucketConfig, ConfigStore, ObjectUserMeta, ObjectVersion, VersionStore } from './product';
 import type { StoredPart, StoredUpload, UploadStore } from './multipart';
 
@@ -15,7 +15,7 @@ function partKey(id: string, partNumber: number): string {
 /** Manifest stays in the index. Part bytes go to the block store under a hidden key. */
 export class IndexUploadStore implements UploadStore {
   constructor(
-    private readonly kv: IndexClient,
+    private readonly kv: KvIndex,
     private readonly objects: PartObjects,
   ) {}
 
@@ -112,7 +112,7 @@ export class IndexUploadStore implements UploadStore {
 }
 
 export class IndexConfigStore implements ConfigStore {
-  constructor(private readonly kv: IndexClient) {}
+  constructor(private readonly kv: KvIndex) {}
 
   async get(bucket: string): Promise<BucketConfig> {
     const raw = await this.kv.get(`$cfg/${bucket}`);
@@ -129,7 +129,7 @@ export class IndexConfigStore implements ConfigStore {
 
 export class IndexVersionStore implements VersionStore {
   constructor(
-    private readonly kv: IndexClient,
+    private readonly kv: KvIndex,
     private readonly objects: PartObjects,
   ) {}
 
@@ -221,7 +221,7 @@ export class IndexVersionStore implements VersionStore {
 }
 
 export class IndexObjectMeta implements ObjectUserMeta {
-  constructor(private readonly kv: IndexClient) {}
+  constructor(private readonly kv: KvIndex) {}
 
   private key(bucket: string, objectKey: string): string {
     return `$umeta/${bucket}/${encodeURIComponent(objectKey)}`;

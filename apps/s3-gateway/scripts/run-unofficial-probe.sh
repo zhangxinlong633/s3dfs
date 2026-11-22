@@ -14,7 +14,7 @@ PROBE=/tmp/s3dfs-c-gw-probe
 rm -rf "$PROBE"
 mkdir -p "$PROBE/index" "$PROBE/block1" "$PROBE/logs"
 ROOT=/Users/bruce/git/s3dfs
-INDEX_CLI=/Users/bruce/git/dleveldb/packages/dleveldb/src/cli.ts
+INDEX_CLI=/Users/bruce/git/dleveldb/packages/dleveldb/src/dleveldb.ts
 PIDS=()
 
 cleanup() {
@@ -92,7 +92,7 @@ S3DFS_INDEX_URLS=http://127.0.0.1:39100 \
 S3DFS_FLUSH_INTERVAL_MS=20 \
 S3DFS_COMPACT_INTERVAL_MS=0 \
 S3DFS_REPAIR_INTERVAL_MS=0 \
-bun "$ROOT/apps/block/src/main.ts" >"$PROBE/logs/block.log" 2>&1 &
+bun "$ROOT/apps/block/src/block.ts" >"$PROBE/logs/block.log" 2>&1 &
 PIDS+=($!)
 echo "block pid ${PIDS[1]}"
 wait_port 39101 block 20

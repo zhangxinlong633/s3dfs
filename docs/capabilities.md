@@ -92,7 +92,7 @@
 | `S3DFS_DATA_DIR` | `./data/block` | 数据目录 |
 | `S3DFS_BLOCK_SIZE` | `1073741824` | 单个 block 大小 |
 | `S3DFS_BUFFER_SIZE` | `1048576` | 写缓冲 |
-| `S3DFS_FLUSH_INTERVAL_MS` | `50` | 定期 flush |
+| `S3DFS_FLUSH_INTERVAL_MS` | `1000` | 定期 flush |
 | `S3DFS_COMPACT_INTERVAL_MS` | `30000` | 后台 compact。`0` 关闭定时任务 |
 | `S3DFS_COMPACT_DEAD_RATIO` | `0.2` | 自动合并的空洞比例 |
 | `S3DFS_INDEX_URLS` | 未设置 | 设置后向索引注册 `$node/{nodeId}` |

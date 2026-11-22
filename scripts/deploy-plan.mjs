@@ -264,7 +264,7 @@ spec:
         - name: index
           image: dleveldb
           workingDir: /opt/dleveldb
-          command: ["sh", "-c", "n=$((\${HOSTNAME##*-}+1)); export DLEVELDB_NODE_ID=index$n DLEVELDB_PORT=9800 DLEVELDB_ADVERTISE_ADDR=s3dfs-index-\${HOSTNAME##*-}.s3dfs-index.s3dfs.svc:9800 DLEVELDB_DATA_DIR=/var/lib/s3dfs/index; exec bun packages/dleveldb/src/cli.ts"]
+          command: ["sh", "-c", "n=$((\${HOSTNAME##*-}+1)); export DLEVELDB_NODE_ID=index$n DLEVELDB_PORT=9800 DLEVELDB_ADVERTISE_ADDR=s3dfs-index-\${HOSTNAME##*-}.s3dfs-index.s3dfs.svc:9800 DLEVELDB_DATA_DIR=/var/lib/s3dfs/index; exec bun packages/dleveldb/src/dleveldb.ts"]
           envFrom:
             - configMapRef:
                 name: s3dfs
@@ -407,7 +407,7 @@ EnvironmentFile=-/etc/s3dfs/secret.env`,
   ).replace('数据在 /var/lib/s3dfs 下', '数据在 /var/lib/s3dfs/block 下');
   files['systemd/s3dfs-index@.service'] = unit(
     's3dfs index %i',
-    '/usr/bin/bun packages/dleveldb/src/cli.ts',
+    '/usr/bin/bun packages/dleveldb/src/dleveldb.ts',
     `WorkingDirectory=${plan.indexRoot}
 EnvironmentFile=/etc/s3dfs/index-%i.env`,
   );

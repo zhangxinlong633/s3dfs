@@ -54,8 +54,8 @@ copyTree(path.join(root, 'apps/web/.next'), path.join(dist, 'web/.next'));
 cpSync(path.join(root, 'apps/web/next.config.mjs'), path.join(dist, 'web/next.config.mjs'));
 
 for (const [name, entry] of [
-  ['block', 'apps/block/src/main.ts'],
-  ['patrol', 'apps/patrol/src/main.ts'],
+  ['block', 'apps/block/src/block.ts'],
+  ['patrol', 'apps/patrol/src/patrol.ts'],
 ]) {
   const built = spawnSync('bun', ['build', path.join(root, entry), '--outdir', path.join(dist, name), '--target', 'bun', '--packages', 'external'], {
     cwd: root,

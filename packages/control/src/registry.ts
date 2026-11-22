@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { blockHealth } from './block-client.js';
 import { NODE_PREFIX, nodeKey } from './keys.js';
-import type { IndexClient } from './kv-client.js';
+import type { KvIndex } from './kv-client.js';
 import type { BlockHealth, BlockNodeInfo, BlockNodeStatus } from './types.js';
 import { ControlError } from './types.js';
 
@@ -15,7 +15,7 @@ export class NodeRegistry {
   private readonly nodes = new Map<string, BlockNodeInfo>();
 
   constructor(
-    private readonly kv: IndexClient,
+    private readonly kv: KvIndex,
     seeds: SeedNode[] = [],
   ) {
     for (const seed of seeds) {
