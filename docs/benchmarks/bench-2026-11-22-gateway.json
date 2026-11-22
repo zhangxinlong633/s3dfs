@@ -1,0 +1,182 @@
+{
+  "at": "2026-11-22T11:31:26.003Z",
+  "until": "2026-11-22T11:33:28.245Z",
+  "payload": "random",
+  "note": "Three clients ran together against the C s3-gateway on port 19002. block.ts was not running. The local replica is written in-process; the other replicas use the peer gateway on port 9100. The gateway waits for every selected replica before it checks the write quorum and stores locators. Write quorum 1. The 16-core client and the remote 8-core client both used the 16-core gateway, so their 32-in-flight writes shared that process.",
+  "runs": [
+    {
+      "client": "16-core, gateway on the same machine",
+      "finishedAt": "2026-11-22T11:33:26.247Z",
+      "results": [
+        {
+          "name": "put 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 158.92370127318696,
+          "p50Us": 5716.217,
+          "p99Us": 16147.823,
+          "elapsedSec": 12.584655303
+        },
+        {
+          "name": "get 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 133.1550337808565,
+          "p50Us": 7685.072,
+          "p99Us": 17223.627,
+          "elapsedSec": 15.020085559
+        },
+        {
+          "name": "put 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 35.41440999221544,
+          "p50Us": 26899.431,
+          "p99Us": 41078.146,
+          "elapsedSec": 1.129483733
+        },
+        {
+          "name": "get 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 51.337753402669506,
+          "p50Us": 18655.559,
+          "p99Us": 30619.254,
+          "elapsedSec": 0.77915369
+        },
+        {
+          "name": "put 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 30.509812744052887,
+          "elapsedSec": 65.552680273
+        },
+        {
+          "name": "get 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 1019.7754238324331,
+          "elapsedSec": 1.96121612
+        }
+      ]
+    },
+    {
+      "client": "8-core, gateway on the same machine",
+      "finishedAt": "2026-11-22T11:31:26.003Z",
+      "results": [
+        {
+          "name": "put 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 147.21504905956783,
+          "p50Us": 6196.895,
+          "p99Us": 16349.443,
+          "elapsedSec": 13.585567595
+        },
+        {
+          "name": "get 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 118.12819985955717,
+          "p50Us": 8281.03,
+          "p99Us": 19730.009,
+          "elapsedSec": 16.930758298
+        },
+        {
+          "name": "put 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 35.355713122612336,
+          "p50Us": 28004.948,
+          "p99Us": 34669.054,
+          "elapsedSec": 1.13135888
+        },
+        {
+          "name": "get 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 63.364737684108405,
+          "p50Us": 15660.683,
+          "p99Us": 19880.382,
+          "elapsedSec": 0.631265929
+        },
+        {
+          "name": "put 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 1215.872712211701,
+          "elapsedSec": 1.644909027
+        },
+        {
+          "name": "get 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 732.7486385844461,
+          "elapsedSec": 2.729448947
+        }
+      ]
+    },
+    {
+      "client": "8-core, no local gateway, cluster network to the 16-core gateway",
+      "finishedAt": "2026-11-22T11:33:28.245Z",
+      "results": [
+        {
+          "name": "put 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 155.02984203690963,
+          "p50Us": 5885.483,
+          "p99Us": 15770.416,
+          "elapsedSec": 12.900742036
+        },
+        {
+          "name": "get 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 124.90916766148209,
+          "p50Us": 8099.1,
+          "p99Us": 19778.897,
+          "elapsedSec": 16.011634994
+        },
+        {
+          "name": "put 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 38.44534624283464,
+          "p50Us": 25792.828,
+          "p99Us": 33595.976,
+          "elapsedSec": 1.040438022
+        },
+        {
+          "name": "get 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 57.800349411493244,
+          "p50Us": 16789.096,
+          "p99Us": 26090.523,
+          "elapsedSec": 0.692037339
+        },
+        {
+          "name": "put 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 30.49815448674736,
+          "elapsedSec": 65.577738511
+        },
+        {
+          "name": "get 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 1036.9096239634962,
+          "elapsedSec": 1.928808407
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,182 @@
+{
+  "at": "2026-11-22T11:09:39.051Z",
+  "until": "2026-11-22T11:10:04.727Z",
+  "payload": "random",
+  "note": "Data directories were emptied first. Three clients ran together against the Nest API on port 9000. Object replicas 3, write quorum 1. Index write quorum 1. recmap is no longer written; open scans .blk. Compression tries zstd.",
+  "runs": [
+    {
+      "client": "16-core, API on the same machine",
+      "finishedAt": "2026-11-22T11:10:00.296Z",
+      "results": [
+        {
+          "name": "put 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 78.72263982406623,
+          "p50Us": 11564.573,
+          "p99Us": 25106.513,
+          "elapsedSec": 25.405652103
+        },
+        {
+          "name": "get 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 57.33393213820868,
+          "p50Us": 14231.422,
+          "p99Us": 80941.752,
+          "elapsedSec": 34.883356599
+        },
+        {
+          "name": "put 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 30.820137789577913,
+          "p50Us": 31035.973,
+          "p99Us": 41957.345,
+          "elapsedSec": 1.297852731
+        },
+        {
+          "name": "get 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 36.340540562560946,
+          "p50Us": 25362.472,
+          "p99Us": 44303.488,
+          "elapsedSec": 1.100699092
+        },
+        {
+          "name": "put 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 432.63678853642654,
+          "elapsedSec": 4.62281538
+        },
+        {
+          "name": "get 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 263.4519340297131,
+          "elapsedSec": 7.591517623
+        }
+      ]
+    },
+    {
+      "client": "8-core, API on the same machine",
+      "finishedAt": "2026-11-22T11:09:39.051Z",
+      "results": [
+        {
+          "name": "put 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 92.31885857757935,
+          "p50Us": 10033.75,
+          "p99Us": 22103.612,
+          "elapsedSec": 21.664046012
+        },
+        {
+          "name": "get 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 86.06342561239796,
+          "p50Us": 10782.567,
+          "p99Us": 21166.778,
+          "elapsedSec": 23.238675265
+        },
+        {
+          "name": "put 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 30.86335107488379,
+          "p50Us": 31336.917,
+          "p99Us": 41740.136,
+          "elapsedSec": 1.296035544
+        },
+        {
+          "name": "get 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 47.16150855941883,
+          "p50Us": 19661.371,
+          "p99Us": 42321.874,
+          "elapsedSec": 0.84814929
+        },
+        {
+          "name": "put 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 551.0345971017198,
+          "elapsedSec": 3.629536168
+        },
+        {
+          "name": "get 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 713.1802884045886,
+          "elapsedSec": 2.804339986
+        }
+      ]
+    },
+    {
+      "client": "8-core, no local API, cluster network to the 16-core API",
+      "finishedAt": "2026-11-22T11:10:04.727Z",
+      "results": [
+        {
+          "name": "put 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 78.19872514714119,
+          "p50Us": 11695.901,
+          "p99Us": 25622.906,
+          "elapsedSec": 25.57586452
+        },
+        {
+          "name": "get 1KiB",
+          "ops": 2000,
+          "warmup": 200,
+          "opsPerSec": 55.86963353519214,
+          "p50Us": 14583.333,
+          "p99Us": 81987.445,
+          "elapsedSec": 35.797621596
+        },
+        {
+          "name": "put 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 16.463883463054884,
+          "p50Us": 67624.306,
+          "p99Us": 97371.522,
+          "elapsedSec": 2.429560443
+        },
+        {
+          "name": "get 1MiB",
+          "ops": 40,
+          "warmup": 4,
+          "opsPerSec": 9.524456570034337,
+          "p50Us": 78218.267,
+          "p99Us": 877710.211,
+          "elapsedSec": 4.199714672
+        },
+        {
+          "name": "put 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 330.20618036753956,
+          "elapsedSec": 6.056821825
+        },
+        {
+          "name": "get 1KiB x32",
+          "ops": 2000,
+          "warmup": 64,
+          "inflight": 32,
+          "opsPerSec": 493.7179102289347,
+          "elapsedSec": 4.050896187
+        }
+      ]
+    }
+  ]
+}
