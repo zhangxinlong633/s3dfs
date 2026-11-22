@@ -26,6 +26,7 @@ export interface NativeOptions {
   bufferSize?: number;
   fsyncOnFlush?: boolean;
   writeThreads?: number;
+  writeBlocks?: number;
 }
 
 export type CompressType = 'none' | 'zstd' | 'gzip';

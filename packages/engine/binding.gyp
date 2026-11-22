@@ -4,6 +4,7 @@
       "target_name": "s3dfs_engine",
       "sources": [
         "native/engine.c",
+        "native/engine_lane.c",
         "native/http.c",
         "native/binding.c"
       ],

@@ -50,7 +50,8 @@ export function startDisk(kv?: KvIndex): RunningDisk {
     blockSize: Number(process.env.S3DFS_BLOCK_SIZE ?? 1_073_741_824) || undefined,
     bufferSize: Number(process.env.S3DFS_BUFFER_SIZE ?? 1_048_576) || undefined,
     fsyncOnFlush: process.env.S3DFS_FSYNC_ON_FLUSH !== '0',
-    writeThreads: Number(process.env.S3DFS_BLOCK_WRITE_THREADS ?? 4) || 4,
+    writeThreads: Number(process.env.S3DFS_BLOCK_WRITE_THREADS ?? 32) || 32,
+    writeBlocks: Number(process.env.S3DFS_WRITE_BLOCKS ?? 8) || 8,
   });
   let blockState: BlockState = 'starting';
   const indexUrls = parseIndexUrls(process.env.S3DFS_INDEX_URLS);
@@ -174,8 +175,8 @@ export function startDisk(kv?: KvIndex): RunningDisk {
 
   const local: LocalDisk = {
     address: advertise,
-    put(key: string, value: Buffer, meta?: PutMeta): ExtentLocator {
-      return store.put(key, value, meta);
+    put(key: string, value: Buffer, meta?: PutMeta): Promise<ExtentLocator> {
+      return store.putAsync(key, value, meta);
     },
     get(key: string, locator: ExtentLocator, range?: { start: number; end: number }): ObjectValue | null {
       if (!range) {

@@ -32,6 +32,7 @@ typedef struct s3dfs_options {
     uint64_t block_size;  /* default 1 GiB */
     uint32_t buffer_size; /* default 1 MiB group-commit buffer */
     int fsync_on_flush;   /* default 1 */
+    int writers;          /* open block files, one write thread each; default 8, max 16 */
 } s3dfs_options;
 
 typedef struct s3dfs_stats {

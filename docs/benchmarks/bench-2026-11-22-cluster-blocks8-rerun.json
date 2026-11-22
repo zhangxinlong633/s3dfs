@@ -1,0 +1,144 @@
+{
+  "at": "2026-11-22T13:52:07.127Z",
+  "compress": "none",
+  "results": [
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 200,
+      "inflight": 1,
+      "opsPerSec": 66.09640961909268,
+      "p50Us": 7115.513999997347,
+      "p99Us": 21041.181999999935,
+      "elapsedSec": 30.258829663
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 40,
+      "inflight": 1,
+      "opsPerSec": 133.2215518807191,
+      "p50Us": 7226.0800000003655,
+      "p99Us": 14750.691000001098,
+      "elapsedSec": 3.002517192999996
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 1,
+      "opsPerSec": 76.9144065986809,
+      "p50Us": 8963.345999996818,
+      "p99Us": 305573.02999999956,
+      "elapsedSec": 1.0401172359999982
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 1,
+      "opsPerSec": 36.19244317910146,
+      "p50Us": 27128.29200000124,
+      "p99Us": 35357.69199999777,
+      "elapsedSec": 1.1052030890000024
+    },
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 6,
+      "inflight": 3,
+      "opsPerSec": 260.5647474786824,
+      "elapsedSec": 7.675635400999999
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 6,
+      "inflight": 3,
+      "opsPerSec": 302.176665396644,
+      "elapsedSec": 1.323728949999997
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 6,
+      "inflight": 3,
+      "opsPerSec": 254.25774942024466,
+      "elapsedSec": 0.31464134399999605
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 3,
+      "opsPerSec": 69.56632404028834,
+      "elapsedSec": 0.574990853000003
+    },
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 20,
+      "inflight": 10,
+      "opsPerSec": 410.38301413180926,
+      "elapsedSec": 4.873496054000003
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 20,
+      "inflight": 10,
+      "opsPerSec": 224.16989508163525,
+      "elapsedSec": 1.784360918999999
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 10,
+      "opsPerSec": 370.14300488873766,
+      "elapsedSec": 0.21613268100000277
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 10,
+      "opsPerSec": 4.464627607595011,
+      "elapsedSec": 8.959313859000002
+    },
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 60,
+      "inflight": 30,
+      "opsPerSec": 586.3882875994983,
+      "elapsedSec": 3.410709323999996
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 40,
+      "inflight": 30,
+      "opsPerSec": 585.0389424590271,
+      "elapsedSec": 0.6837151700000104
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 30,
+      "opsPerSec": 442.2947812339559,
+      "elapsedSec": 0.18087484499999845
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 30,
+      "opsPerSec": 92.37713703363472,
+      "elapsedSec": 0.43300757400000295
+    }
+  ],
+  "note": "Redeployed build. 8 write threads, one .blk each. Slot update is a 4-byte pwrite plus the page CRC. Write quorum 1, compress none. Disk already held earlier bench objects. Client on the 16-core host, local API.",
+  "payload": "random"
+}

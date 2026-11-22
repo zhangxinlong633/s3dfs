@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 
-#include "s3dfs.h"
+#include "engine_int.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -41,15 +41,6 @@
 #define S3DFS_KIND_EXTENT 2
 #define S3DFS_KIND_EXTENT_LAST 3
 #define S3DFS_KIND_TOMBSTONE 4
-#define S3DFS_PAGE_SLOTS 20480u
-#define S3DFS_PAGE_SLOT 4u
-#define S3DFS_PAGE_DATA S3DFS_PAGE_SLOTS
-#define S3DFS_PAGE_VALUE (S3DFS_PAGE_SLOTS * S3DFS_PAGE_SLOT)
-#define S3DFS_PAGE_TLV 6u
-#define S3DFS_PAGE_META 16u
-#define S3DFS_PAGE_HEADER (S3DFS_PAGE_TLV + S3DFS_PAGE_META)
-#define S3DFS_PAGE_LEN (S3DFS_PAGE_META + S3DFS_PAGE_VALUE)
-#define S3DFS_PAGE_ON_DISK (S3DFS_PAGE_TLV + S3DFS_PAGE_LEN)
 
 typedef struct {
     const uint8_t *key;
@@ -80,42 +71,6 @@ typedef struct {
     uint32_t extent_count;
 } s3dfs_ext_link;
 
-struct s3dfs_store {
-    char data_dir[4096];
-    char blocks_dir[4096];
-    uint64_t block_size;
-    uint32_t buffer_size;
-    int fsync_on_flush;
-
-    int wr_fd;
-    uint64_t wr_block_id;
-    uint64_t wr_size;
-    uint8_t *buf;
-    uint32_t buf_used;
-    uint64_t put_generation;
-    uint64_t next_rec_id;
-    uint64_t dead_bytes;
-    uint64_t tickets;
-    int pending_sync;
-
-    struct s3dfs_rec_ent *rec_tab;
-    uint32_t rec_cap;
-    uint32_t rec_count;
-    struct s3dfs_key_ent *key_tab;
-    uint32_t key_cap;
-    uint32_t key_count;
-    struct s3dfs_page_ent *pages;
-    uint32_t page_n;
-    uint32_t page_cap;
-    uint8_t *page_slots;
-    uint8_t **compact_slots;
-    uint32_t page_cached;
-    int page_dirty;
-
-    s3dfs_stats stats;
-    pthread_mutex_t mu;
-};
-
 #define S3DFS_MAP_EMPTY 0
 #define S3DFS_MAP_DEL 1
 #define S3DFS_MAP_LIVE 2
@@ -135,15 +90,6 @@ typedef struct s3dfs_key_ent {
     char *key;
     uint64_t rec_id;
 } s3dfs_key_ent;
-
-typedef struct s3dfs_page_ent {
-    uint64_t block_id;
-    uint64_t first_rec_id;
-    uint64_t file_off;
-    uint64_t next_off;
-    uint64_t src_block;
-    uint32_t filled;
-} s3dfs_page_ent;
 
 static int load_record(s3dfs_store *s, uint64_t block_id, uint64_t offset, uint32_t rec_len, uint8_t **out,
                        s3dfs_rec_view *view);
@@ -254,8 +200,6 @@ static void maps_free(s3dfs_store *s)
     s->pages = NULL;
     s->page_n = 0;
     s->page_cap = 0;
-    free(s->page_slots);
-    s->page_slots = NULL;
 }
 
 static int rec_map_grow(s3dfs_store *s);
@@ -836,18 +780,18 @@ static int cmp_u64(const void *a, const void *b)
 
 static int close_write_fd(s3dfs_store *s)
 {
-    if (s->wr_fd >= 0) {
-        if (s->fsync_on_flush && s->pending_sync) {
-            if (fsync(s->wr_fd) != 0) {
-                close(s->wr_fd);
-                s->wr_fd = -1;
+    if (lane_of(s)->fd >= 0) {
+        if (s->fsync_on_flush && lane_of(s)->pending_sync) {
+            if (fsync(lane_of(s)->fd) != 0) {
+                close(lane_of(s)->fd);
+                lane_of(s)->fd = -1;
                 return S3DFS_ERR_IO;
             }
             s->stats.fsyncs++;
-            s->pending_sync = 0;
+            lane_of(s)->pending_sync = 0;
         }
-        close(s->wr_fd);
-        s->wr_fd = -1;
+        close(lane_of(s)->fd);
+        lane_of(s)->fd = -1;
     }
     return S3DFS_OK;
 }
@@ -869,41 +813,49 @@ static int open_block_for_write(s3dfs_store *s, uint64_t id, uint64_t existing_s
         close(fd);
         return S3DFS_ERR_IO;
     }
-    s->wr_fd = fd;
-    s->wr_block_id = id;
-    s->wr_size = existing_size;
+    lane_of(s)->fd = fd;
+    lane_of(s)->block_id = id;
+    lane_of(s)->size = existing_size;
+    return S3DFS_OK;
+}
+
+static int flush_bytes_unlocked(s3dfs_store *s)
+{
+    if (lane_of(s)->buf_used == 0) {
+        return S3DFS_OK;
+    }
+    if (lane_of(s)->fd < 0) {
+        return S3DFS_ERR_IO;
+    }
+    s3dfs_store_io_begin(s);
+    int wrote = pwrite_fully(lane_of(s)->fd, lane_of(s)->buf, lane_of(s)->buf_used, (off_t)lane_of(s)->size);
+    s3dfs_store_io_end(s);
+    if (wrote != 0) {
+        return S3DFS_ERR_IO;
+    }
+    lane_of(s)->size += lane_of(s)->buf_used;
+    s->stats.bytes_on_disk += lane_of(s)->buf_used;
+    lane_of(s)->buf_used = 0;
+    s->stats.flushes++;
+    lane_of(s)->pending_sync = 1;
+    if (lane_of(s)->size >= s->block_size) {
+        return close_write_fd(s);
+    }
     return S3DFS_OK;
 }
 
 static int flush_buffer_unlocked(s3dfs_store *s)
 {
-    if (s->buf_used == 0) {
-        return page_flush_dirty(s);
-    }
-    if (s->wr_fd < 0) {
-        return S3DFS_ERR_IO;
-    }
-    if (pwrite_fully(s->wr_fd, s->buf, s->buf_used, (off_t)s->wr_size) != 0) {
-        return S3DFS_ERR_IO;
-    }
-    s->wr_size += s->buf_used;
-    s->stats.bytes_on_disk += s->buf_used;
-    s->buf_used = 0;
-    s->stats.flushes++;
-    s->pending_sync = 1;
-    if (s->wr_size >= s->block_size) {
-        int rc = page_flush_dirty(s);
-        if (rc != S3DFS_OK) {
-            return rc;
-        }
-        return close_write_fd(s);
+    int rc = flush_bytes_unlocked(s);
+    if (rc != S3DFS_OK) {
+        return rc;
     }
     return page_flush_dirty(s);
 }
 
 static int ensure_writer(s3dfs_store *s, uint32_t need)
 {
-    if (s->wr_fd >= 0 && s->wr_size + s->buf_used + need > s->block_size) {
+    if (lane_of(s)->fd >= 0 && lane_of(s)->size + lane_of(s)->buf_used + need > s->block_size) {
         int rc = flush_buffer_unlocked(s);
         if (rc != S3DFS_OK) {
             return rc;
@@ -913,10 +865,10 @@ static int ensure_writer(s3dfs_store *s, uint32_t need)
             return rc;
         }
     }
-    if (s->wr_fd < 0) {
-        uint64_t id = s->wr_block_id + 1;
+    if (lane_of(s)->fd < 0) {
+        uint64_t id = s->next_block_id++;
         if (id == 0) {
-            id = 1;
+            id = s->next_block_id++;
         }
         int rc = open_block_for_write(s, id, 0);
         if (rc != S3DFS_OK) {
@@ -924,7 +876,7 @@ static int ensure_writer(s3dfs_store *s, uint32_t need)
         }
         s->stats.block_files++;
     }
-    if (s->buf_used + need > s->buffer_size) {
+    if (lane_of(s)->buf_used + need > s->buffer_size) {
         int rc = flush_buffer_unlocked(s);
         if (rc != S3DFS_OK) {
             return rc;
@@ -935,27 +887,30 @@ static int ensure_writer(s3dfs_store *s, uint32_t need)
 
 static int page_pwrite(s3dfs_store *s, uint64_t block, uint64_t off, const void *data, uint32_t len)
 {
-    if (s->wr_fd >= 0 && block == s->wr_block_id) {
-        if (pwrite(s->wr_fd, data, len, (off_t)off) != (ssize_t)len) {
-            return S3DFS_ERR_IO;
-        }
-        return S3DFS_OK;
+    s3dfs_store_io_begin(s);
+    int rc;
+    if (lane_of(s)->fd >= 0 && block == lane_of(s)->block_id) {
+        rc = pwrite(lane_of(s)->fd, data, len, (off_t)off) == (ssize_t)len ? S3DFS_OK : S3DFS_ERR_IO;
+        s3dfs_store_io_end(s);
+        return rc;
     }
     char path[4096];
     block_path(s, block, path, sizeof(path));
     int fd = open(path, O_RDWR);
     if (fd < 0) {
+        s3dfs_store_io_end(s);
         return S3DFS_ERR_IO;
     }
-    int rc = pwrite(fd, data, len, (off_t)off) == (ssize_t)len ? S3DFS_OK : S3DFS_ERR_IO;
+    rc = pwrite(fd, data, len, (off_t)off) == (ssize_t)len ? S3DFS_OK : S3DFS_ERR_IO;
     close(fd);
+    s3dfs_store_io_end(s);
     return rc;
 }
 
 static int page_pread(s3dfs_store *s, uint64_t block, uint64_t off, void *data, uint32_t len)
 {
-    if (s->wr_fd >= 0 && block == s->wr_block_id) {
-        if (pread(s->wr_fd, data, len, (off_t)off) != (ssize_t)len) {
+    if (lane_of(s)->fd >= 0 && block == lane_of(s)->block_id) {
+        if (pread(lane_of(s)->fd, data, len, (off_t)off) != (ssize_t)len) {
             return S3DFS_ERR_IO;
         }
         return S3DFS_OK;
@@ -1016,52 +971,52 @@ static int page_record_len(s3dfs_store *s, uint64_t block, uint64_t off, uint32_
 
 static int page_flush_dirty(s3dfs_store *s)
 {
-    if (!s->page_dirty || !s->page_slots || s->page_cached >= s->page_n) {
+    if (!lane_of(s)->page_dirty || !lane_of(s)->page_slots || lane_of(s)->page_cached >= s->page_n) {
         return S3DFS_OK;
     }
-    s3dfs_page_ent *page = &s->pages[s->page_cached];
+    s3dfs_page_ent *page = &s->pages[lane_of(s)->page_cached];
     uint8_t header[S3DFS_PAGE_HEADER];
-    uint32_t value_crc = crc32_update(0, s->page_slots, S3DFS_PAGE_VALUE);
+    uint32_t value_crc = crc32_update(0, lane_of(s)->page_slots, S3DFS_PAGE_VALUE);
     page_fill_header(header, page->first_rec_id, page->next_off, value_crc);
     int rc = page_pwrite(s, page->block_id, page->file_off, header, S3DFS_PAGE_HEADER);
     if (rc != S3DFS_OK) {
         return rc;
     }
-    rc = page_pwrite(s, page->block_id, page->file_off + S3DFS_PAGE_HEADER, s->page_slots, S3DFS_PAGE_VALUE);
+    rc = page_pwrite(s, page->block_id, page->file_off + S3DFS_PAGE_HEADER, lane_of(s)->page_slots, S3DFS_PAGE_VALUE);
     if (rc != S3DFS_OK) {
         return rc;
     }
-    s->page_dirty = 0;
-    s->pending_sync = 1;
+    lane_of(s)->page_dirty = 0;
+    lane_of(s)->pending_sync = 1;
     return S3DFS_OK;
 }
 
 static int page_cache(s3dfs_store *s, uint32_t index, const uint8_t *slots_or_null)
 {
-    if (s->page_cached == index && s->page_slots && !slots_or_null) {
+    if (lane_of(s)->page_cached == index && lane_of(s)->page_slots && !slots_or_null) {
         return S3DFS_OK;
     }
     int rc = page_flush_dirty(s);
     if (rc != S3DFS_OK) {
         return rc;
     }
-    if (!s->page_slots) {
-        s->page_slots = (uint8_t *)malloc(S3DFS_PAGE_VALUE);
-        if (!s->page_slots) {
+    if (!lane_of(s)->page_slots) {
+        lane_of(s)->page_slots = (uint8_t *)malloc(S3DFS_PAGE_VALUE);
+        if (!lane_of(s)->page_slots) {
             return S3DFS_ERR_NOMEM;
         }
     }
     if (slots_or_null) {
-        memcpy(s->page_slots, slots_or_null, S3DFS_PAGE_VALUE);
+        memcpy(lane_of(s)->page_slots, slots_or_null, S3DFS_PAGE_VALUE);
     } else {
         s3dfs_page_ent *page = &s->pages[index];
-        rc = page_pread(s, page->block_id, page->file_off + S3DFS_PAGE_HEADER, s->page_slots, S3DFS_PAGE_VALUE);
+        rc = page_pread(s, page->block_id, page->file_off + S3DFS_PAGE_HEADER, lane_of(s)->page_slots, S3DFS_PAGE_VALUE);
         if (rc != S3DFS_OK) {
             return rc;
         }
     }
-    s->page_cached = index;
-    s->page_dirty = 0;
+    lane_of(s)->page_cached = index;
+    lane_of(s)->page_dirty = 0;
     return S3DFS_OK;
 }
 
@@ -1090,8 +1045,8 @@ static int page_push_image(s3dfs_store *s, uint64_t block, uint64_t first, uint6
         free(copy);
         return rc;
     }
-    free(s->page_slots);
-    s->page_slots = copy;
+    free(lane_of(s)->page_slots);
+    lane_of(s)->page_slots = copy;
     s3dfs_page_ent *page = &s->pages[s->page_n];
     page->block_id = block;
     page->first_rec_id = first;
@@ -1107,9 +1062,11 @@ static int page_push_image(s3dfs_store *s, uint64_t block, uint64_t first, uint6
             }
         }
     }
-    s->page_cached = s->page_n;
+    lane_of(s)->page_cached = s->page_n;
+    lane_of(s)->page_index = s->page_n;
+    lane_of(s)->fresh_page = 0;
     s->page_n++;
-    s->page_dirty = dirty;
+    lane_of(s)->page_dirty = dirty;
     if (dirty) {
         return page_flush_dirty(s);
     }
@@ -1123,21 +1080,21 @@ static int page_write_new(s3dfs_store *s, uint64_t first, uint64_t at)
         return S3DFS_ERR_NOMEM;
     }
     page_fill_header(image, first, 0, crc32_update(0, image + S3DFS_PAGE_HEADER, S3DFS_PAGE_VALUE));
-    int rc = page_pwrite(s, s->wr_block_id, at, image, S3DFS_PAGE_ON_DISK);
+    int rc = page_pwrite(s, lane_of(s)->block_id, at, image, S3DFS_PAGE_ON_DISK);
     if (rc != S3DFS_OK) {
         free(image);
         return rc;
     }
-    rc = page_push_image(s, s->wr_block_id, first, at, image + S3DFS_PAGE_HEADER, 0);
+    rc = page_push_image(s, lane_of(s)->block_id, first, at, image + S3DFS_PAGE_HEADER, 0);
     free(image);
     if (rc != S3DFS_OK) {
         return rc;
     }
-    if (at == s->wr_size) {
-        s->wr_size += S3DFS_PAGE_ON_DISK;
+    if (at == lane_of(s)->size) {
+        lane_of(s)->size += S3DFS_PAGE_ON_DISK;
         s->stats.bytes_on_disk += S3DFS_PAGE_ON_DISK;
     }
-    s->pending_sync = 1;
+    lane_of(s)->pending_sync = 1;
     return S3DFS_OK;
 }
 
@@ -1148,10 +1105,6 @@ static int page_link_prev(s3dfs_store *s, uint32_t prev_index, uint64_t next_off
         return S3DFS_ERR_ARGS;
     }
     prev->next_off = next_off;
-    if (s->page_cached == prev_index && s->page_slots) {
-        s->page_dirty = 1;
-        return page_flush_dirty(s);
-    }
     uint8_t raw[4];
     wr_u32(raw, (uint32_t)next_off);
     return page_pwrite(s, prev->block_id, prev->file_off + 14, raw, 4);
@@ -1159,11 +1112,12 @@ static int page_link_prev(s3dfs_store *s, uint32_t prev_index, uint64_t next_off
 
 static int page_reserve(s3dfs_store *s, uint64_t rec_id, uint32_t obj_total)
 {
-    s3dfs_page_ent *cur = s->page_n ? &s->pages[s->page_n - 1] : NULL;
-    int reuse = cur && s->wr_fd >= 0 && cur->block_id == s->wr_block_id && cur->filled < S3DFS_PAGE_DATA &&
+    s3dfs_lane *w = lane_of(s);
+    s3dfs_page_ent *cur = (w->page_index != UINT32_MAX && w->page_index < s->page_n) ? &s->pages[w->page_index] : NULL;
+    int reuse = !w->fresh_page && cur && w->fd >= 0 && cur->block_id == w->block_id && cur->filled < S3DFS_PAGE_DATA &&
                 cur->first_rec_id + cur->filled == rec_id;
     if (reuse) {
-        if (s->wr_size + s->buf_used + obj_total <= s->block_size) {
+        if (lane_of(s)->size + lane_of(s)->buf_used + obj_total <= s->block_size) {
             return S3DFS_OK;
         }
         int rc = flush_buffer_unlocked(s);
@@ -1174,7 +1128,7 @@ static int page_reserve(s3dfs_store *s, uint64_t rec_id, uint32_t obj_total)
         if (rc != S3DFS_OK) {
             return rc;
         }
-    } else if (s->buf_used) {
+    } else if (lane_of(s)->buf_used) {
         int rc = flush_buffer_unlocked(s);
         if (rc != S3DFS_OK) {
             return rc;
@@ -1183,16 +1137,16 @@ static int page_reserve(s3dfs_store *s, uint64_t rec_id, uint32_t obj_total)
     if (S3DFS_PAGE_ON_DISK + (uint64_t)obj_total > s->block_size) {
         return S3DFS_ERR_ARGS;
     }
-    if (s->wr_fd >= 0 && s->wr_size + S3DFS_PAGE_ON_DISK + obj_total > s->block_size) {
+    if (lane_of(s)->fd >= 0 && lane_of(s)->size + S3DFS_PAGE_ON_DISK + obj_total > s->block_size) {
         int rc = close_write_fd(s);
         if (rc != S3DFS_OK) {
             return rc;
         }
     }
-    if (s->wr_fd < 0) {
-        uint64_t id = s->wr_block_id + 1;
+    if (lane_of(s)->fd < 0) {
+        uint64_t id = s->next_block_id++;
         if (id == 0) {
-            id = 1;
+            id = s->next_block_id++;
         }
         int rc = open_block_for_write(s, id, 0);
         if (rc != S3DFS_OK) {
@@ -1201,13 +1155,13 @@ static int page_reserve(s3dfs_store *s, uint64_t rec_id, uint32_t obj_total)
         s->stats.block_files++;
         return page_write_new(s, rec_id, 0);
     }
-    uint64_t at = s->wr_size;
-    uint32_t prev = s->page_n ? s->page_n - 1 : UINT32_MAX;
+    uint64_t at = lane_of(s)->size;
+    uint32_t prev = lane_of(s)->page_index;
     int rc = page_write_new(s, rec_id, at);
     if (rc != S3DFS_OK) {
         return rc;
     }
-    if (prev != UINT32_MAX && s->pages[prev].block_id == s->wr_block_id) {
+    if (prev != UINT32_MAX && s->pages[prev].block_id == lane_of(s)->block_id) {
         return page_link_prev(s, prev, at);
     }
     return S3DFS_OK;
@@ -1230,18 +1184,42 @@ static int page_find(s3dfs_store *s, uint64_t rec_id, uint32_t *index_out, uint3
     return -1;
 }
 
+static int page_store_slot(s3dfs_store *s, uint32_t index, uint32_t slot)
+{
+    if (!lane_of(s)->page_slots || lane_of(s)->page_cached != index || index >= s->page_n || slot >= S3DFS_PAGE_DATA) {
+        return S3DFS_ERR_IO;
+    }
+    s3dfs_page_ent *page = &s->pages[index];
+    uint8_t raw[4];
+    memcpy(raw, lane_of(s)->page_slots + (size_t)slot * S3DFS_PAGE_SLOT, 4);
+    uint64_t at = page->file_off + S3DFS_PAGE_HEADER + (uint64_t)slot * S3DFS_PAGE_SLOT;
+    int rc = page_pwrite(s, page->block_id, at, raw, 4);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    uint32_t value_crc = crc32_update(0, lane_of(s)->page_slots, S3DFS_PAGE_VALUE);
+    wr_u32(raw, value_crc);
+    rc = page_pwrite(s, page->block_id, page->file_off + 18, raw, 4);
+    if (rc != S3DFS_OK) {
+        return rc;
+    }
+    lane_of(s)->page_dirty = 0;
+    lane_of(s)->pending_sync = 1;
+    return S3DFS_OK;
+}
+
 static int page_note(s3dfs_store *s, uint64_t rec_id, uint64_t block, uint64_t off, uint32_t rec_len)
 {
     uint32_t index = 0, slot = 0;
     if (page_find(s, rec_id, &index, &slot) != 0) {
-        if (!s->page_n) {
+        if (lane_of(s)->page_index == UINT32_MAX || lane_of(s)->page_index >= s->page_n) {
             return S3DFS_ERR_IO;
         }
-        s3dfs_page_ent *page = &s->pages[s->page_n - 1];
+        s3dfs_page_ent *page = &s->pages[lane_of(s)->page_index];
         if (rec_id < page->first_rec_id || rec_id >= page->first_rec_id + S3DFS_PAGE_DATA) {
             return S3DFS_ERR_IO;
         }
-        index = s->page_n - 1;
+        index = lane_of(s)->page_index;
         slot = (uint32_t)(rec_id - page->first_rec_id);
     }
     int rc = page_cache(s, index, NULL);
@@ -1252,16 +1230,19 @@ static int page_note(s3dfs_store *s, uint64_t rec_id, uint64_t block, uint64_t o
         return S3DFS_ERR_IO;
     }
     (void)rec_len;
-    wr_u32(s->page_slots + slot * S3DFS_PAGE_SLOT, (uint32_t)off);
+    wr_u32(lane_of(s)->page_slots + slot * S3DFS_PAGE_SLOT, (uint32_t)off);
     if (s->pages[index].filled < slot + 1) {
         s->pages[index].filled = slot + 1;
     }
-    s->page_dirty = 1;
+    lane_of(s)->page_dirty = 1;
     s->stats.index_slots++;
-    if (s->buf_used) {
-        return flush_buffer_unlocked(s);
+    if (lane_of(s)->buf_used) {
+        rc = flush_bytes_unlocked(s);
+        if (rc != S3DFS_OK) {
+            return rc;
+        }
     }
-    return page_flush_dirty(s);
+    return page_store_slot(s, index, slot);
 }
 
 static int page_lookup(s3dfs_store *s, uint64_t rec_id, s3dfs_rec_ent *out)
@@ -1276,8 +1257,8 @@ static int page_lookup(s3dfs_store *s, uint64_t rec_id, s3dfs_rec_ent *out)
     if (page->src_block && s->compact_slots && s->compact_slots[index]) {
         memcpy(raw, s->compact_slots[index] + slot * S3DFS_PAGE_SLOT, S3DFS_PAGE_SLOT);
         block = page->src_block;
-    } else if (s->page_slots && s->page_cached == index) {
-        memcpy(raw, s->page_slots + slot * S3DFS_PAGE_SLOT, S3DFS_PAGE_SLOT);
+    } else if (lane_of(s)->page_slots && lane_of(s)->page_cached == index) {
+        memcpy(raw, lane_of(s)->page_slots + slot * S3DFS_PAGE_SLOT, S3DFS_PAGE_SLOT);
     } else if (page_pread(s, page->block_id, page->file_off + S3DFS_PAGE_HEADER + (uint64_t)slot * S3DFS_PAGE_SLOT, raw,
                           S3DFS_PAGE_SLOT) != S3DFS_OK) {
         return -1;
@@ -1309,19 +1290,19 @@ static void page_clear(s3dfs_store *s, uint64_t rec_id)
     if (page_cache(s, index, NULL) != S3DFS_OK) {
         return;
     }
-    uint32_t off = rd_u32(s->page_slots + slot * S3DFS_PAGE_SLOT);
+    uint32_t off = rd_u32(lane_of(s)->page_slots + slot * S3DFS_PAGE_SLOT);
     s3dfs_page_ent *page = &s->pages[index];
     uint64_t block = page->src_block ? page->src_block : page->block_id;
     uint32_t rec_len = 0;
     if (off) {
         page_record_len(s, block, off, &rec_len);
     }
-    wr_u32(s->page_slots + slot * S3DFS_PAGE_SLOT, 0);
-    s->page_dirty = 1;
+    wr_u32(lane_of(s)->page_slots + slot * S3DFS_PAGE_SLOT, 0);
+    lane_of(s)->page_dirty = 1;
     if (rec_len) {
         s->dead_bytes += rec_len;
     }
-    page_flush_dirty(s);
+    page_store_slot(s, index, slot);
 }
 
 static int pages_load(s3dfs_store *s)
@@ -1379,8 +1360,8 @@ static int pages_load(s3dfs_store *s)
                 free(ids);
                 return rc;
             }
-            if (s->pages[s->page_n - 1].first_rec_id + s->pages[s->page_n - 1].filled > s->next_rec_id) {
-                s->next_rec_id = s->pages[s->page_n - 1].first_rec_id + s->pages[s->page_n - 1].filled;
+            if (s->pages[s->page_n - 1].first_rec_id + S3DFS_PAGE_DATA > s->next_rec_id) {
+                s->next_rec_id = s->pages[s->page_n - 1].first_rec_id + S3DFS_PAGE_DATA;
             }
             if (!next || next <= off || next + S3DFS_PAGE_ON_DISK > (uint64_t)st.st_size) {
                 break;
@@ -1416,10 +1397,10 @@ static int append_raw_unlocked(s3dfs_store *s, const uint8_t *rec, uint32_t tota
             return rc;
         }
     }
-    uint64_t offset = s->wr_size + s->buf_used;
-    if (total <= s->buffer_size - s->buf_used) {
-        memcpy(s->buf + s->buf_used, rec, total);
-        s->buf_used += total;
+    uint64_t offset = lane_of(s)->size + lane_of(s)->buf_used;
+    if (total <= s->buffer_size - lane_of(s)->buf_used) {
+        memcpy(lane_of(s)->buf + lane_of(s)->buf_used, rec, total);
+        lane_of(s)->buf_used += total;
     } else {
         rc = flush_buffer_unlocked(s);
         if (rc != S3DFS_OK) {
@@ -1429,22 +1410,25 @@ static int append_raw_unlocked(s3dfs_store *s, const uint8_t *rec, uint32_t tota
         if (rc != S3DFS_OK) {
             return rc;
         }
-        offset = s->wr_size + s->buf_used;
-        if (total <= s->buffer_size - s->buf_used) {
-            memcpy(s->buf + s->buf_used, rec, total);
-            s->buf_used += total;
+        offset = lane_of(s)->size + lane_of(s)->buf_used;
+        if (total <= s->buffer_size - lane_of(s)->buf_used) {
+            memcpy(lane_of(s)->buf + lane_of(s)->buf_used, rec, total);
+            lane_of(s)->buf_used += total;
         } else {
-            if (s->wr_fd < 0 || pwrite_fully(s->wr_fd, rec, total, (off_t)s->wr_size) != 0) {
+            s3dfs_store_io_begin(s);
+            int wrote = (lane_of(s)->fd < 0) ? -1 : pwrite_fully(lane_of(s)->fd, rec, total, (off_t)lane_of(s)->size);
+            s3dfs_store_io_end(s);
+            if (wrote != 0) {
                 return S3DFS_ERR_IO;
             }
-            s->wr_size += total;
+            lane_of(s)->size += total;
             s->stats.bytes_on_disk += total;
             s->stats.flushes++;
-            s->pending_sync = 1;
+            lane_of(s)->pending_sync = 1;
         }
     }
     if (out_block) {
-        *out_block = s->wr_block_id;
+        *out_block = lane_of(s)->block_id;
     }
     if (out_off) {
         *out_off = offset;
@@ -1485,13 +1469,13 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
         }
     }
 
-    uint64_t offset = s->wr_size + s->buf_used;
-    if (total <= s->buffer_size - s->buf_used) {
-        if (build_record(s->buf + s->buf_used, total, key, key_len, value, value_len, kind, rec_id, crc,
+    uint64_t offset = lane_of(s)->size + lane_of(s)->buf_used;
+    if (total <= s->buffer_size - lane_of(s)->buf_used) {
+        if (build_record(lane_of(s)->buf + lane_of(s)->buf_used, total, key, key_len, value, value_len, kind, rec_id, crc,
                          mtime_ms, link, meta) != 0) {
             return S3DFS_ERR;
         }
-        s->buf_used += total;
+        lane_of(s)->buf_used += total;
     } else {
         uint8_t *tmp = (uint8_t *)malloc(total);
         if (!tmp) {
@@ -1502,19 +1486,22 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
             free(tmp);
             return S3DFS_ERR;
         }
-        if (s->wr_fd < 0 || pwrite_fully(s->wr_fd, tmp, total, (off_t)s->wr_size) != 0) {
+        s3dfs_store_io_begin(s);
+        int wrote = (lane_of(s)->fd < 0) ? -1 : pwrite_fully(lane_of(s)->fd, tmp, total, (off_t)lane_of(s)->size);
+        s3dfs_store_io_end(s);
+        if (wrote != 0) {
             free(tmp);
             return S3DFS_ERR_IO;
         }
         free(tmp);
-        s->wr_size += total;
+        lane_of(s)->size += total;
         s->stats.bytes_on_disk += total;
         s->stats.flushes++;
-        s->pending_sync = 1;
+        lane_of(s)->pending_sync = 1;
     }
 
     if (out_block) {
-        *out_block = s->wr_block_id;
+        *out_block = lane_of(s)->block_id;
     }
     if (out_off) {
         *out_off = offset;
@@ -1523,7 +1510,7 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
         *out_rec_len = total;
     }
     if (rec_id) {
-        rc = page_note(s, rec_id, s->wr_block_id, offset, total);
+        rc = page_note(s, rec_id, lane_of(s)->block_id, offset, total);
         if (rc != S3DFS_OK) {
             return rc;
         }
@@ -1592,6 +1579,20 @@ static uint32_t count_extents(uint32_t value_len, uint32_t key_len, uint64_t rem
     return n;
 }
 
+static uint64_t lane_alloc_rec(s3dfs_store *s)
+{
+    s3dfs_lane *w = lane_of(s);
+    if (w->rec_cursor && w->rec_cursor < w->rec_end) {
+        return w->rec_cursor++;
+    }
+    uint64_t first = s->next_rec_id ? s->next_rec_id : 1;
+    s->next_rec_id = first + S3DFS_PAGE_DATA;
+    w->rec_cursor = first + 1;
+    w->rec_end = first + S3DFS_PAGE_DATA;
+    w->fresh_page = 1;
+    return first;
+}
+
 static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len, const void *value,
                                uint32_t value_len, uint32_t crc, uint64_t mtime, const s3dfs_put_meta *meta,
                                s3dfs_locator *out)
@@ -1605,14 +1606,14 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
     int with_meta = (meta && meta->has_meta) ? 1 : 0;
     uint32_t simple = rec_overhead(key_len, value_len, 0, with_meta);
     int page_ready = 0;
-    if (s->page_n && s->wr_fd >= 0) {
+    if (s->page_n && lane_of(s)->fd >= 0) {
         s3dfs_page_ent *tail = &s->pages[s->page_n - 1];
-        page_ready = tail->block_id == s->wr_block_id && tail->filled < S3DFS_PAGE_DATA;
+        page_ready = tail->block_id == lane_of(s)->block_id && tail->filled < S3DFS_PAGE_DATA;
     }
     uint64_t page_need = page_ready ? 0 : S3DFS_PAGE_ON_DISK;
-    uint64_t used = (s->wr_fd >= 0) ? (s->wr_size + s->buf_used) : 0;
+    uint64_t used = (lane_of(s)->fd >= 0) ? (lane_of(s)->size + lane_of(s)->buf_used) : 0;
     uint64_t remain = 0;
-    if (s->wr_fd < 0) {
+    if (lane_of(s)->fd < 0) {
         remain = s->block_size > page_need ? s->block_size - page_need : 0;
     } else if (used + page_need < s->block_size) {
         remain = s->block_size - used - page_need;
@@ -1621,7 +1622,7 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
     if (simple <= s->block_size && simple <= remain) {
         uint64_t block = 0, off = 0;
         uint32_t rec_len = 0;
-        uint64_t rec_id = s->next_rec_id++;
+        uint64_t rec_id = lane_alloc_rec(s);
         int rc = append_record(s, key, key_len, value, value_len, S3DFS_KIND_OBJECT, rec_id, crc, mtime, NULL,
                                meta, &block, &off, &rec_len);
         if (rc != S3DFS_OK) {
@@ -1651,7 +1652,7 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
         if (simple <= remain) {
             uint64_t block = 0, off = 0;
             uint32_t rec_len = 0;
-            uint64_t rec_id = s->next_rec_id++;
+            uint64_t rec_id = lane_alloc_rec(s);
             rc = append_record(s, key, key_len, value, value_len, S3DFS_KIND_OBJECT, rec_id, crc, mtime, NULL,
                                meta, &block, &off, &rec_len);
             if (rc != S3DFS_OK) {
@@ -1680,14 +1681,14 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
     uint32_t last_rec_len = 0;
 
     while (left) {
-        used = (s->wr_fd >= 0) ? (s->wr_size + s->buf_used) : 0;
+        used = (lane_of(s)->fd >= 0) ? (lane_of(s)->size + lane_of(s)->buf_used) : 0;
         page_ready = 0;
-        if (s->page_n && s->wr_fd >= 0) {
+        if (s->page_n && lane_of(s)->fd >= 0) {
             s3dfs_page_ent *tail = &s->pages[s->page_n - 1];
-            page_ready = tail->block_id == s->wr_block_id && tail->filled < S3DFS_PAGE_DATA;
+            page_ready = tail->block_id == lane_of(s)->block_id && tail->filled < S3DFS_PAGE_DATA;
         }
         page_need = page_ready ? 0 : S3DFS_PAGE_ON_DISK;
-        if (s->wr_fd < 0) {
+        if (lane_of(s)->fd < 0) {
             remain = s->block_size > page_need ? s->block_size - page_need : 0;
         } else if (used + page_need < s->block_size) {
             remain = s->block_size - used - page_need;
@@ -1736,7 +1737,7 @@ static int put_object_unlocked(s3dfs_store *s, const char *key, uint32_t key_len
         uint8_t kind = is_last ? (uint8_t)S3DFS_KIND_EXTENT_LAST : (uint8_t)S3DFS_KIND_EXTENT;
         uint64_t block = 0, off = 0;
         uint32_t rec_len = 0;
-        uint64_t rec_id = s->next_rec_id++;
+        uint64_t rec_id = lane_alloc_rec(s);
         int rc = append_record(s, key, key_len, src, chunk, kind, rec_id, is_last ? crc : 0, mtime, &link,
                                is_last ? meta : NULL, &block, &off, &rec_len);
         if (rc != S3DFS_OK) {
@@ -1770,10 +1771,10 @@ static int load_bytes(s3dfs_store *s, uint64_t block_id, uint64_t offset, uint32
     if (!tmp) {
         return S3DFS_ERR_NOMEM;
     }
-    if (s->wr_fd >= 0 && block_id == s->wr_block_id && offset >= s->wr_size) {
-        uint64_t buf_off = offset - s->wr_size;
-        if (buf_off + rec_len <= s->buf_used) {
-            memcpy(tmp, s->buf + buf_off, rec_len);
+    if (lane_of(s)->fd >= 0 && block_id == lane_of(s)->block_id && offset >= lane_of(s)->size) {
+        uint64_t buf_off = offset - lane_of(s)->size;
+        if (buf_off + rec_len <= lane_of(s)->buf_used) {
+            memcpy(tmp, lane_of(s)->buf + buf_off, rec_len);
             *out = tmp;
             return S3DFS_OK;
         }
@@ -1782,8 +1783,8 @@ static int load_bytes(s3dfs_store *s, uint64_t block_id, uint64_t offset, uint32
     }
     char path[4096];
     block_path(s, block_id, path, sizeof(path));
-    int same = (s->wr_fd >= 0 && block_id == s->wr_block_id);
-    int fd = same ? s->wr_fd : open(path, O_RDONLY);
+    int same = (lane_of(s)->fd >= 0 && block_id == lane_of(s)->block_id);
+    int fd = same ? lane_of(s)->fd : open(path, O_RDONLY);
     if (fd < 0) {
         free(tmp);
         return S3DFS_ERR_IO;
@@ -1950,11 +1951,10 @@ static int recover_writer(s3dfs_store *s)
         last_size = sz;
     }
     free(ids);
-    if (last_id && last_size < s->block_size) {
+    s->next_block_id = last_id ? last_id + 1 : 1;
+    if (s->nlanes <= 1 && last_id && last_size > 0 && last_size < s->block_size) {
         return open_block_for_write(s, last_id, last_size);
     }
-    s->wr_block_id = last_id;
-    s->wr_size = last_size;
     return S3DFS_OK;
 }
 
@@ -1976,16 +1976,43 @@ s3dfs_store *s3dfs_open(const char *data_dir, const s3dfs_options *opt)
         s->buffer_size = S3DFS_MIN_BUFFER_SIZE;
     }
     s->fsync_on_flush = (!opt || opt->fsync_on_flush) ? 1 : 0;
-    s->wr_fd = -1;
     s->next_rec_id = 1;
-    s->buf = (uint8_t *)malloc(s->buffer_size);
+    s->next_block_id = 1;
     pthread_mutex_init(&s->mu, NULL);
-    if (!s->buf || maps_init(s) != 0 || mkdir_p(s->data_dir) != 0 || mkdir_p(s->blocks_dir) != 0 ||
-        recover_writer(s) != S3DFS_OK || pages_load(s) != S3DFS_OK) {
+    uint32_t writers = (opt && opt->writers > 0) ? (uint32_t)opt->writers : 8;
+    if (s3dfs_lanes_init(s, writers) != 0 || maps_init(s) != 0 || mkdir_p(s->data_dir) != 0 ||
+        mkdir_p(s->blocks_dir) != 0 || recover_writer(s) != S3DFS_OK || pages_load(s) != S3DFS_OK) {
+        s3dfs_close(s);
+        return NULL;
+    }
+    if (s->nlanes == 1 && s->lanes[0].fd >= 0) {
+        s3dfs_lane *w = &s->lanes[0];
+        for (uint32_t i = s->page_n; i > 0; i--) {
+            if (s->pages[i - 1].block_id == w->block_id) {
+                w->page_index = i - 1;
+                w->rec_cursor = s->pages[i - 1].first_rec_id + s->pages[i - 1].filled;
+                w->rec_end = s->pages[i - 1].first_rec_id + S3DFS_PAGE_DATA;
+                if (w->rec_cursor == 0) {
+                    w->rec_cursor = 1;
+                }
+                break;
+            }
+        }
+    }
+    if (s3dfs_lanes_start(s) != 0) {
         s3dfs_close(s);
         return NULL;
     }
     return s;
+}
+
+static void close_flush_job(void *arg)
+{
+    s3dfs_store *s = (s3dfs_store *)arg;
+    s3dfs_store_lock(s);
+    flush_buffer_unlocked(s);
+    close_write_fd(s);
+    s3dfs_store_unlock(s);
 }
 
 void s3dfs_close(s3dfs_store *s)
@@ -1993,29 +2020,35 @@ void s3dfs_close(s3dfs_store *s)
     if (!s) {
         return;
     }
-    pthread_mutex_lock(&s->mu);
-    flush_buffer_unlocked(s);
-    close_write_fd(s);
-    free(s->buf);
-    s->buf = NULL;
+    if (s->lanes && s->lanes[0].started) {
+        s3dfs_lane_call_all(s, close_flush_job, s);
+    }
+    s3dfs_lanes_stop(s);
     maps_free(s);
-    pthread_mutex_unlock(&s->mu);
     pthread_mutex_destroy(&s->mu);
     free(s);
 }
 
-int s3dfs_put(s3dfs_store *s, const char *key, uint32_t key_len, const void *value, uint32_t value_len,
-              const s3dfs_put_meta *meta, s3dfs_locator *out)
+typedef struct {
+    s3dfs_store *s;
+    const char *key;
+    uint32_t key_len;
+    const void *value;
+    uint32_t value_len;
+    const s3dfs_put_meta *meta;
+    s3dfs_locator *out;
+    int rc;
+} put_job_arg;
+
+static int put_on_lane(s3dfs_store *s, const char *key, uint32_t key_len, const void *value, uint32_t value_len,
+                       const s3dfs_put_meta *meta, s3dfs_locator *out)
 {
-    if (!s || !key || key_len == 0) {
-        return S3DFS_ERR_ARGS;
-    }
     uint64_t mtime = now_ms();
     uint32_t crc = crc32_key_value(key, key_len, value, value_len);
     s3dfs_locator loc;
     memset(&loc, 0, sizeof(loc));
     uint64_t t0 = mono_us();
-    pthread_mutex_lock(&s->mu);
+    s3dfs_store_lock(s);
     uint64_t t1 = mono_us();
     int rc = put_object_unlocked(s, key, key_len, value, value_len, crc, mtime, meta, &loc);
     if (rc == S3DFS_OK) {
@@ -2024,11 +2057,36 @@ int s3dfs_put(s3dfs_store *s, const char *key, uint32_t key_len, const void *val
     }
     note_us(&s->stats.put_wait_us, &s->stats.put_wait_max_us, t1 - t0);
     note_us(&s->stats.put_hold_us, &s->stats.put_hold_max_us, mono_us() - t1);
-    pthread_mutex_unlock(&s->mu);
+    s3dfs_store_unlock(s);
     if (rc == S3DFS_OK && out) {
         *out = loc;
     }
     return rc;
+}
+
+static void put_job(void *arg)
+{
+    put_job_arg *job = (put_job_arg *)arg;
+    job->rc = put_on_lane(job->s, job->key, job->key_len, job->value, job->value_len, job->meta, job->out);
+}
+
+int s3dfs_put(s3dfs_store *s, const char *key, uint32_t key_len, const void *value, uint32_t value_len,
+              const s3dfs_put_meta *meta, s3dfs_locator *out)
+{
+    if (!s || !key || key_len == 0) {
+        return S3DFS_ERR_ARGS;
+    }
+    put_job_arg job;
+    memset(&job, 0, sizeof(job));
+    job.s = s;
+    job.key = key;
+    job.key_len = key_len;
+    job.value = value;
+    job.value_len = value_len;
+    job.meta = meta;
+    job.out = out;
+    s3dfs_lane_call(s, key, key_len, put_job, &job);
+    return job.rc;
 }
 
 int s3dfs_put_batch(s3dfs_store *s, const s3dfs_put_item *items, uint32_t n, const s3dfs_put_meta *meta,
@@ -2037,30 +2095,36 @@ int s3dfs_put_batch(s3dfs_store *s, const s3dfs_put_item *items, uint32_t n, con
     if (!s || (n > 0 && !items)) {
         return S3DFS_ERR_ARGS;
     }
-    pthread_mutex_lock(&s->mu);
     int rc = S3DFS_OK;
     for (uint32_t i = 0; i < n; i++) {
         if (!items[i].key || items[i].key_len == 0) {
             rc = S3DFS_ERR_ARGS;
             break;
         }
-        uint64_t mtime = now_ms();
-        uint32_t crc = crc32_key_value(items[i].key, items[i].key_len, items[i].value, items[i].value_len);
         s3dfs_locator loc;
         memset(&loc, 0, sizeof(loc));
-        rc = put_object_unlocked(s, items[i].key, items[i].key_len, items[i].value, items[i].value_len, crc,
-                                 mtime, meta, &loc);
+        rc = s3dfs_put(s, items[i].key, items[i].key_len, items[i].value, items[i].value_len, meta, out ? &loc : NULL);
         if (rc != S3DFS_OK) {
             break;
         }
-        s->stats.puts++;
-        s->stats.bytes_logical += items[i].value_len;
         if (out) {
             out[i] = loc;
         }
     }
-    pthread_mutex_unlock(&s->mu);
     return rc;
+}
+
+typedef struct {
+    s3dfs_store *s;
+    const char *key;
+    uint32_t key_len;
+    int rc;
+} tomb_job_arg;
+
+static void tomb_job(void *arg)
+{
+    tomb_job_arg *job = (tomb_job_arg *)arg;
+    job->rc = s3dfs_tombstone(job->s, job->key, job->key_len);
 }
 
 int s3dfs_tombstone(s3dfs_store *s, const char *key, uint32_t key_len)
@@ -2068,14 +2132,23 @@ int s3dfs_tombstone(s3dfs_store *s, const char *key, uint32_t key_len)
     if (!s || !key || key_len == 0) {
         return S3DFS_ERR_ARGS;
     }
+    if (!s3dfs_tls_lane) {
+        tomb_job_arg job;
+        job.s = s;
+        job.key = key;
+        job.key_len = key_len;
+        job.rc = 0;
+        s3dfs_lane_call(s, key, key_len, tomb_job, &job);
+        return job.rc;
+    }
     uint64_t mtime = now_ms();
-    pthread_mutex_lock(&s->mu);
+    s3dfs_store_lock(s);
     s3dfs_key_ent existing;
     if (key_map_get(s, key, key_len, &existing) == 0 && existing.rec_id &&
         existing.kind != S3DFS_KIND_TOMBSTONE) {
         retire_chain_unlocked(s, existing.rec_id);
     }
-    uint64_t rec_id = s->next_rec_id++;
+    uint64_t rec_id = lane_alloc_rec(s);
     int rc = append_record(s, key, key_len, NULL, 0, S3DFS_KIND_TOMBSTONE, rec_id, 0, mtime, NULL, NULL, NULL,
                            NULL, NULL);
     if (rc == S3DFS_OK) {
@@ -2083,11 +2156,11 @@ int s3dfs_tombstone(s3dfs_store *s, const char *key, uint32_t key_len)
         s->tickets++;
         /* The tombstone record itself is dead payload once compact runs. */
         if (key_map_put(s, key, key_len, rec_id, S3DFS_KIND_TOMBSTONE) != 0) {
-            pthread_mutex_unlock(&s->mu);
+            s3dfs_store_unlock(s);
             return S3DFS_ERR_NOMEM;
         }
     }
-    pthread_mutex_unlock(&s->mu);
+    s3dfs_store_unlock(s);
     return rc;
 }
 static int walk_chain(s3dfs_store *s, const s3dfs_locator *loc, const char *key, uint32_t key_len,
@@ -2344,10 +2417,34 @@ struct s3dfs_writer {
     int alive;
 };
 
+typedef struct {
+    s3dfs_store *s;
+    const char *key;
+    uint32_t key_len;
+    const s3dfs_put_meta *meta;
+    s3dfs_writer *out;
+} begin_job_arg;
+
+static void begin_job(void *arg)
+{
+    begin_job_arg *job = (begin_job_arg *)arg;
+    job->out = s3dfs_write_begin(job->s, job->key, job->key_len, job->meta);
+}
+
 s3dfs_writer *s3dfs_write_begin(s3dfs_store *s, const char *key, uint32_t key_len, const s3dfs_put_meta *meta)
 {
     if (!s || !key || key_len == 0) {
         return NULL;
+    }
+    if (!s3dfs_tls_lane) {
+        begin_job_arg job;
+        job.s = s;
+        job.key = key;
+        job.key_len = key_len;
+        job.meta = meta;
+        job.out = NULL;
+        s3dfs_lane_call(s, key, key_len, begin_job, &job);
+        return job.out;
     }
     s3dfs_writer *w = (s3dfs_writer *)calloc(1, sizeof(*w));
     if (!w) {
@@ -2366,7 +2463,7 @@ s3dfs_writer *s3dfs_write_begin(s3dfs_store *s, const char *key, uint32_t key_le
     if (meta && meta->has_meta) {
         w->meta = *meta;
     }
-    pthread_mutex_lock(&s->mu);
+    s3dfs_store_lock(s);
     s3dfs_key_ent existing;
     if (key_map_get(s, key, key_len, &existing) == 0 && existing.rec_id && existing.kind != S3DFS_KIND_TOMBSTONE) {
         retire_chain_unlocked(s, existing.rec_id);
@@ -2374,8 +2471,21 @@ s3dfs_writer *s3dfs_write_begin(s3dfs_store *s, const char *key, uint32_t key_le
     }
     w->generation = ++s->put_generation;
     w->alive = 1;
-    pthread_mutex_unlock(&s->mu);
+    s3dfs_store_unlock(s);
     return w;
+}
+
+typedef struct {
+    s3dfs_writer *w;
+    const void *data;
+    uint32_t len;
+    int rc;
+} write_job_arg;
+
+static void write_job(void *arg)
+{
+    write_job_arg *job = (write_job_arg *)arg;
+    job->rc = s3dfs_write(job->w, job->data, job->len);
 }
 
 int s3dfs_write(s3dfs_writer *w, const void *data, uint32_t len)
@@ -2386,7 +2496,16 @@ int s3dfs_write(s3dfs_writer *w, const void *data, uint32_t len)
     if (len == 0) {
         return S3DFS_OK;
     }
-    pthread_mutex_lock(&w->store->mu);
+    if (!s3dfs_tls_lane) {
+        write_job_arg job;
+        job.w = w;
+        job.data = data;
+        job.len = len;
+        job.rc = 0;
+        s3dfs_lane_call(w->store, w->key, w->key_len, write_job, &job);
+        return job.rc;
+    }
+    s3dfs_store_lock(w->store);
     w->crc = crc32_update(w->crc, data, len);
     s3dfs_ext_link link;
     memset(&link, 0, sizeof(link));
@@ -2395,7 +2514,7 @@ int s3dfs_write(s3dfs_writer *w, const void *data, uint32_t len)
     link.generation = w->generation;
     uint64_t block = 0, off = 0;
     uint32_t rec_len = 0;
-    uint64_t rec_id = w->store->next_rec_id++;
+    uint64_t rec_id = lane_alloc_rec(w->store);
     int rc = append_record(w->store, w->key, w->key_len, data, len, S3DFS_KIND_EXTENT, rec_id, 0, w->mtime, &link,
                            NULL, &block, &off, &rec_len);
     if (rc == S3DFS_OK) {
@@ -2404,7 +2523,7 @@ int s3dfs_write(s3dfs_writer *w, const void *data, uint32_t len)
         w->extents++;
         w->total += len;
     }
-    pthread_mutex_unlock(&w->store->mu);
+    s3dfs_store_unlock(w->store);
     return rc;
 }
 
@@ -2416,12 +2535,32 @@ void s3dfs_write_set_meta(s3dfs_writer *w, const s3dfs_put_meta *meta)
     w->meta = *meta;
 }
 
+typedef struct {
+    s3dfs_writer *w;
+    s3dfs_locator *out;
+    int rc;
+} finish_job_arg;
+
+static void finish_job(void *arg)
+{
+    finish_job_arg *job = (finish_job_arg *)arg;
+    job->rc = s3dfs_write_finish(job->w, job->out);
+}
+
 int s3dfs_write_finish(s3dfs_writer *w, s3dfs_locator *out)
 {
     if (!w || !w->alive || !out) {
         return S3DFS_ERR_ARGS;
     }
-    pthread_mutex_lock(&w->store->mu);
+    if (!s3dfs_tls_lane) {
+        finish_job_arg job;
+        job.w = w;
+        job.out = out;
+        job.rc = 0;
+        s3dfs_lane_call(w->store, w->key, w->key_len, finish_job, &job);
+        return job.rc;
+    }
+    s3dfs_store_lock(w->store);
     uint8_t empty = 0;
     s3dfs_ext_link link;
     memset(&link, 0, sizeof(link));
@@ -2432,7 +2571,7 @@ int s3dfs_write_finish(s3dfs_writer *w, s3dfs_locator *out)
     link.extent_count = w->extents + 1;
     uint64_t block = 0, off = 0;
     uint32_t rec_len = 0;
-    uint64_t rec_id = w->store->next_rec_id++;
+    uint64_t rec_id = lane_alloc_rec(w->store);
     const s3dfs_put_meta *meta = w->meta.has_meta ? &w->meta : NULL;
     int rc = append_record(w->store, w->key, w->key_len, &empty, 0, S3DFS_KIND_EXTENT_LAST, rec_id, w->crc, w->mtime,
                            &link, meta, &block, &off, &rec_len);
@@ -2447,7 +2586,7 @@ int s3dfs_write_finish(s3dfs_writer *w, s3dfs_locator *out)
                          rec_id, block, off, rec_len, meta);
         }
     }
-    pthread_mutex_unlock(&w->store->mu);
+    s3dfs_store_unlock(w->store);
     w->alive = 0;
     free(w->key);
     free(w);
@@ -2672,10 +2811,10 @@ static int scan_block_records(s3dfs_store *s, uint64_t id, uint64_t file_end, in
         if (off + S3DFS_PAGE_ON_DISK <= file_end) {
             uint8_t probe[S3DFS_PAGE_TLV];
             int page = 0;
-            if (include_buf && s->wr_fd >= 0 && id == s->wr_block_id && off >= s->wr_size) {
-                uint64_t buf_off = off - s->wr_size;
-                if (buf_off + S3DFS_PAGE_TLV <= s->buf_used) {
-                    memcpy(probe, s->buf + buf_off, S3DFS_PAGE_TLV);
+            if (include_buf && lane_of(s)->fd >= 0 && id == lane_of(s)->block_id && off >= lane_of(s)->size) {
+                uint64_t buf_off = off - lane_of(s)->size;
+                if (buf_off + S3DFS_PAGE_TLV <= lane_of(s)->buf_used) {
+                    memcpy(probe, lane_of(s)->buf + buf_off, S3DFS_PAGE_TLV);
                     page = page_prefix(probe, S3DFS_PAGE_TLV);
                 }
             } else {
@@ -2699,18 +2838,18 @@ static int scan_block_records(s3dfs_store *s, uint64_t id, uint64_t file_end, in
         uint8_t head[8];
         uint8_t *raw = NULL;
         int from_buf = 0;
-        if (include_buf && s->wr_fd >= 0 && id == s->wr_block_id && off >= s->wr_size) {
-            uint64_t buf_off = off - s->wr_size;
-            if (buf_off + 8 > s->buf_used) {
+        if (include_buf && lane_of(s)->fd >= 0 && id == lane_of(s)->block_id && off >= lane_of(s)->size) {
+            uint64_t buf_off = off - lane_of(s)->size;
+            if (buf_off + 8 > lane_of(s)->buf_used) {
                 break;
             }
-            memcpy(head, s->buf + buf_off, 8);
+            memcpy(head, lane_of(s)->buf + buf_off, 8);
             from_buf = 1;
         } else {
             char path[4096];
             block_path(s, id, path, sizeof(path));
-            int same = (s->wr_fd >= 0 && id == s->wr_block_id);
-            int fd = same ? s->wr_fd : open(path, O_RDONLY);
+            int same = (lane_of(s)->fd >= 0 && id == lane_of(s)->block_id);
+            int fd = same ? lane_of(s)->fd : open(path, O_RDONLY);
             if (fd < 0) {
                 return S3DFS_ERR_IO;
             }
@@ -2734,8 +2873,8 @@ static int scan_block_records(s3dfs_store *s, uint64_t id, uint64_t file_end, in
         }
         s3dfs_rec_view view;
         if (from_buf) {
-            uint64_t buf_off = off - s->wr_size;
-            if (buf_off + total > s->buf_used || parse_record(s->buf + buf_off, total, &view) != 0) {
+            uint64_t buf_off = off - lane_of(s)->size;
+            if (buf_off + total > lane_of(s)->buf_used || parse_record(lane_of(s)->buf + buf_off, total, &view) != 0) {
                 break;
             }
             if (view.kind == S3DFS_KIND_OBJECT || view.kind == S3DFS_KIND_EXTENT_LAST ||
@@ -2922,9 +3061,9 @@ static int compact_unlocked(s3dfs_store *s)
                 return S3DFS_ERR_IO;
             }
         }
-        uint64_t id = s->wr_block_id + 1;
+        uint64_t id = s->next_block_id++;
         if (id == 0) {
-            id = 1;
+            id = s->next_block_id++;
         }
         rc = open_block_for_write(s, id, 0);
         if (rc != S3DFS_OK) {
@@ -2952,24 +3091,24 @@ static int compact_unlocked(s3dfs_store *s)
             uint64_t old_block = s->pages[pi].block_id;
             uint8_t header[S3DFS_PAGE_HEADER];
             page_fill_header(header, s->pages[pi].first_rec_id, next, zero_crc);
-            if (page_pwrite(s, s->wr_block_id, cursor, header, S3DFS_PAGE_HEADER) != S3DFS_OK ||
-                page_pwrite(s, s->wr_block_id, cursor + S3DFS_PAGE_HEADER, zeros, S3DFS_PAGE_VALUE) != S3DFS_OK) {
+            if (page_pwrite(s, lane_of(s)->block_id, cursor, header, S3DFS_PAGE_HEADER) != S3DFS_OK ||
+                page_pwrite(s, lane_of(s)->block_id, cursor + S3DFS_PAGE_HEADER, zeros, S3DFS_PAGE_VALUE) != S3DFS_OK) {
                 rc = S3DFS_ERR_IO;
                 break;
             }
             s->pages[pi].src_block = old_block;
-            s->pages[pi].block_id = s->wr_block_id;
+            s->pages[pi].block_id = lane_of(s)->block_id;
             s->pages[pi].file_off = cursor;
             s->pages[pi].next_off = next;
             cursor += S3DFS_PAGE_ON_DISK;
         }
         free(zeros);
-        s->wr_size = cursor;
+        lane_of(s)->size = cursor;
         s->stats.bytes_on_disk = cursor;
-        s->page_cached = UINT32_MAX;
-        free(s->page_slots);
-        s->page_slots = NULL;
-        s->page_dirty = 0;
+        lane_of(s)->page_cached = UINT32_MAX;
+        free(lane_of(s)->page_slots);
+        lane_of(s)->page_slots = NULL;
+        lane_of(s)->page_dirty = 0;
         s->compact_slots = images;
         if (rc != S3DFS_OK) {
             free(old_ids);
@@ -3015,9 +3154,9 @@ static int compact_unlocked(s3dfs_store *s)
         free(s->compact_slots);
         s->compact_slots = NULL;
     }
-    uint64_t new_id = s->wr_block_id;
+    uint64_t new_id = lane_of(s)->block_id;
     for (uint32_t i = 0; i < n_old; i++) {
-        if (s->wr_fd >= 0 && old_ids[i] == new_id) {
+        if (lane_of(s)->fd >= 0 && old_ids[i] == new_id) {
             continue;
         }
         char path[4096];
@@ -3026,9 +3165,19 @@ static int compact_unlocked(s3dfs_store *s)
     }
     free(old_ids);
     s->dead_bytes = 0;
-    s->stats.bytes_on_disk = s->wr_size;
-    s->stats.block_files = s->wr_fd >= 0 ? 1 : 0;
+    s->stats.bytes_on_disk = lane_of(s)->size;
+    s->stats.block_files = lane_of(s)->fd >= 0 ? 1 : 0;
     return page_flush_dirty(s);
+}
+
+static void compact_job(void *arg)
+{
+    s3dfs_store *s = (s3dfs_store *)arg;
+    s3dfs_store_lock(s);
+    s->exclusive = 1;
+    compact_unlocked(s);
+    s->exclusive = 0;
+    s3dfs_store_unlock(s);
 }
 
 int s3dfs_compact(s3dfs_store *s)
@@ -3036,10 +3185,16 @@ int s3dfs_compact(s3dfs_store *s)
     if (!s) {
         return S3DFS_ERR_ARGS;
     }
-    pthread_mutex_lock(&s->mu);
-    int rc = compact_unlocked(s);
-    pthread_mutex_unlock(&s->mu);
-    return rc;
+    s3dfs_lane_call_all(s, close_flush_job, s);
+    for (uint32_t i = 0; i < s->nlanes; i++) {
+        s->lanes[i].page_index = UINT32_MAX;
+        s->lanes[i].page_cached = UINT32_MAX;
+        s->lanes[i].fresh_page = 1;
+        s->lanes[i].rec_cursor = 0;
+        s->lanes[i].rec_end = 0;
+    }
+    s3dfs_lane_call_at(s, 0, compact_job, s);
+    return S3DFS_OK;
 }
 
 
@@ -3058,8 +3213,8 @@ int s3dfs_scan(s3dfs_store *s, s3dfs_scan_cb cb, void *user)
     }
     for (uint32_t i = 0; i < n; i++) {
         uint64_t end = 0;
-        if (s->wr_fd >= 0 && ids[i] == s->wr_block_id) {
-            end = s->wr_size + s->buf_used;
+        if (lane_of(s)->fd >= 0 && ids[i] == lane_of(s)->block_id) {
+            end = lane_of(s)->size + lane_of(s)->buf_used;
         } else {
             rc = scan_block_end(s, ids[i], &end);
             if (rc != S3DFS_OK) {
@@ -3068,7 +3223,7 @@ int s3dfs_scan(s3dfs_store *s, s3dfs_scan_cb cb, void *user)
                 return rc;
             }
         }
-        int include_buf = (s->wr_fd >= 0 && ids[i] == s->wr_block_id);
+        int include_buf = (lane_of(s)->fd >= 0 && ids[i] == lane_of(s)->block_id);
         rc = scan_block_records(s, ids[i], end, include_buf, cb, user);
         if (rc != S3DFS_OK) {
             free(ids);
@@ -3079,16 +3234,16 @@ int s3dfs_scan(s3dfs_store *s, s3dfs_scan_cb cb, void *user)
     /* A just-created block may only exist in the write buffer / wr_fd and already
        be in the directory after open_block_for_write. If the current writer is a
        new file not yet in the listing (shouldn't happen), scan it too. */
-    if (s->wr_fd >= 0 && s->buf_used + s->wr_size > 0) {
+    if (lane_of(s)->fd >= 0 && lane_of(s)->buf_used + lane_of(s)->size > 0) {
         int seen = 0;
         for (uint32_t i = 0; i < n; i++) {
-            if (ids[i] == s->wr_block_id) {
+            if (ids[i] == lane_of(s)->block_id) {
                 seen = 1;
                 break;
             }
         }
         if (!seen) {
-            rc = scan_block_records(s, s->wr_block_id, s->wr_size + s->buf_used, 1, cb, user);
+            rc = scan_block_records(s, lane_of(s)->block_id, lane_of(s)->size + lane_of(s)->buf_used, 1, cb, user);
         }
     }
     free(ids);
@@ -3129,8 +3284,8 @@ static int audit_block(s3dfs_store *s, uint64_t id, uint64_t file_end, s3dfs_aud
         uint8_t head[8];
         char path[4096];
         block_path(s, id, path, sizeof(path));
-        int same = (s->wr_fd >= 0 && id == s->wr_block_id);
-        int fd = same ? s->wr_fd : open(path, O_RDONLY);
+        int same = (lane_of(s)->fd >= 0 && id == lane_of(s)->block_id);
+        int fd = same ? lane_of(s)->fd : open(path, O_RDONLY);
         if (fd < 0) {
             return S3DFS_ERR_IO;
         }
@@ -3155,7 +3310,7 @@ static int audit_block(s3dfs_store *s, uint64_t id, uint64_t file_end, s3dfs_aud
         if (!raw) {
             return S3DFS_ERR_NOMEM;
         }
-        int read_fd = same ? s->wr_fd : open(path, O_RDONLY);
+        int read_fd = same ? lane_of(s)->fd : open(path, O_RDONLY);
         if (read_fd < 0 || pread(read_fd, raw, total, (off_t)off) != (ssize_t)total) {
             free(raw);
             if (read_fd >= 0 && !same) {
@@ -3204,8 +3359,8 @@ int s3dfs_audit(s3dfs_store *s, s3dfs_audit_report *out)
             break;
         }
         end = (uint64_t)st.st_size;
-        if (s->wr_fd >= 0 && ids[i] == s->wr_block_id && s->wr_size + s->buf_used > end) {
-            end = s->wr_size + s->buf_used;
+        if (lane_of(s)->fd >= 0 && ids[i] == lane_of(s)->block_id && lane_of(s)->size + lane_of(s)->buf_used > end) {
+            end = lane_of(s)->size + lane_of(s)->buf_used;
         }
         rc = audit_block(s, ids[i], end, out);
         if (rc != S3DFS_OK) {
@@ -3217,19 +3372,51 @@ int s3dfs_audit(s3dfs_store *s, s3dfs_audit_report *out)
     return rc;
 }
 
+static void flush_job(void *arg)
+{
+    s3dfs_store *s = (s3dfs_store *)arg;
+    uint64_t t0 = mono_us();
+    s3dfs_store_lock(s);
+    uint64_t t1 = mono_us();
+    flush_buffer_unlocked(s);
+    note_us(&s->stats.flush_wait_us, NULL, t1 - t0);
+    note_us(&s->stats.flush_hold_us, &s->stats.flush_hold_max_us, mono_us() - t1);
+    s3dfs_store_unlock(s);
+}
+
 int s3dfs_flush(s3dfs_store *s)
 {
     if (!s) {
         return S3DFS_ERR_ARGS;
     }
+    s3dfs_lane_call_all(s, flush_job, s);
+    return S3DFS_OK;
+}
+
+static void sync_job(void *arg)
+{
+    s3dfs_store *s = (s3dfs_store *)arg;
     uint64_t t0 = mono_us();
-    pthread_mutex_lock(&s->mu);
+    s3dfs_store_lock(s);
     uint64_t t1 = mono_us();
     int rc = flush_buffer_unlocked(s);
-    note_us(&s->stats.flush_wait_us, NULL, t1 - t0);
-    note_us(&s->stats.flush_hold_us, &s->stats.flush_hold_max_us, mono_us() - t1);
-    pthread_mutex_unlock(&s->mu);
-    return rc;
+    if (rc == S3DFS_OK && s->fsync_on_flush && lane_of(s)->pending_sync && lane_of(s)->fd >= 0) {
+        uint64_t fs0 = mono_us();
+        s3dfs_store_io_begin(s);
+        int failed = fsync(lane_of(s)->fd) != 0;
+        s3dfs_store_io_end(s);
+        if (failed) {
+            rc = S3DFS_ERR_IO;
+        } else {
+            s->stats.fsyncs++;
+            lane_of(s)->pending_sync = 0;
+        }
+        note_us(&s->stats.fsync_us, &s->stats.fsync_max_us, mono_us() - fs0);
+    }
+    note_us(&s->stats.sync_wait_us, NULL, t1 - t0);
+    note_us(&s->stats.sync_hold_us, &s->stats.sync_hold_max_us, mono_us() - t1);
+    s3dfs_store_unlock(s);
+    (void)rc;
 }
 
 int s3dfs_sync(s3dfs_store *s)
@@ -3237,24 +3424,8 @@ int s3dfs_sync(s3dfs_store *s)
     if (!s) {
         return S3DFS_ERR_ARGS;
     }
-    uint64_t t0 = mono_us();
-    pthread_mutex_lock(&s->mu);
-    uint64_t t1 = mono_us();
-    int rc = flush_buffer_unlocked(s);
-    if (rc == S3DFS_OK && s->fsync_on_flush && s->pending_sync && s->wr_fd >= 0) {
-        uint64_t fs0 = mono_us();
-        if (fsync(s->wr_fd) != 0) {
-            rc = S3DFS_ERR_IO;
-        } else {
-            s->stats.fsyncs++;
-            s->pending_sync = 0;
-        }
-        note_us(&s->stats.fsync_us, &s->stats.fsync_max_us, mono_us() - fs0);
-    }
-    note_us(&s->stats.sync_wait_us, NULL, t1 - t0);
-    note_us(&s->stats.sync_hold_us, &s->stats.sync_hold_max_us, mono_us() - t1);
-    pthread_mutex_unlock(&s->mu);
-    return rc;
+    s3dfs_lane_call_all(s, sync_job, s);
+    return S3DFS_OK;
 }
 
 void s3dfs_get_stats(s3dfs_store *s, s3dfs_stats *out)
@@ -3265,7 +3436,10 @@ void s3dfs_get_stats(s3dfs_store *s, s3dfs_stats *out)
     pthread_mutex_lock(&s->mu);
     s->stats.dead_bytes = s->dead_bytes;
     s->stats.tickets = s->tickets;
-    s->stats.unflushed_bytes = s->buf_used;
+    s->stats.unflushed_bytes = 0;
+    for (uint32_t i = 0; s->lanes && i < s->nlanes; i++) {
+        s->stats.unflushed_bytes += s->lanes[i].buf_used;
+    }
     *out = s->stats;
     pthread_mutex_unlock(&s->mu);
 }

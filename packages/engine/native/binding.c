@@ -467,7 +467,7 @@ static int ensure_writers(napi_env env, js_store *st)
     if (napi_create_threadsafe_function(env, NULL, NULL, name, 0, 1, NULL, NULL, NULL, finish_put, &st->completion) != napi_ok) {
         return -1;
     }
-    n = st->write_threads > 0 ? st->write_threads : 4;
+    n = st->write_threads > 0 ? st->write_threads : 32;
     st->threads = (pthread_t *)calloc((size_t)n, sizeof(pthread_t));
     if (!st->threads) {
         return -1;
@@ -1659,7 +1659,7 @@ static napi_value StoreCtor(napi_env env, napi_callback_info info)
     }
     pthread_mutex_init(&st->qmu, NULL);
     pthread_cond_init(&st->qcv, NULL);
-    st->write_threads = 4;
+    st->write_threads = 32;
     st->next_writer = 1;
     dir = utf8_dup(env, args[0], NULL);
     if (!dir) {
@@ -1687,6 +1687,13 @@ static napi_value StoreCtor(napi_env env, napi_callback_info info)
                 bool b = false;
                 napi_get_value_bool(env, prop, &b);
                 opt.fsync_on_flush = b ? 1 : 0;
+            }
+            if (named(env, args[1], "writeBlocks", &pt, &prop) && pt == napi_number) {
+                int32_t n = 0;
+                napi_get_value_int32(env, prop, &n);
+                if (n > 0 && n <= 16) {
+                    opt.writers = n;
+                }
             }
             if (named(env, args[1], "writeThreads", &pt, &prop) && pt == napi_number) {
                 int32_t n = 0;

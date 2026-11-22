@@ -1334,8 +1334,8 @@ int s3dfs_http_listen(s3dfs_store *store, const char *host, int port, int thread
     if (threads < 1) {
         threads = 1;
     }
-    if (threads > 32) {
-        threads = 32;
+    if (threads > 128) {
+        threads = 128;
     }
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
