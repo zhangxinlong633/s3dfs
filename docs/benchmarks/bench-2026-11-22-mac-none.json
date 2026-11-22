@@ -1,0 +1,78 @@
+{
+  "at": "2026-11-22T13:03:03.154Z",
+  "payload": "random",
+  "compress": "none",
+  "note": "Mac localhost. One API process with the disk inside it, plus two peer disk processes. Object replicas 3, write quorum 1. Index write quorum 1. Random bytes, compression off. RECID_v1 page, 20480 u32 slots. Not the three-VM cluster.",
+  "results": [
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 200,
+      "opsPerSec": 1050.0046105439949,
+      "p50Us": 877.2920000000113,
+      "p99Us": 1863.5419999999385,
+      "elapsedSec": 1.9047535409999998
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 40,
+      "opsPerSec": 1022.5091535147232,
+      "p50Us": 918.7919999999394,
+      "p99Us": 1648.9580000002206,
+      "elapsedSec": 0.3911945420000002
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "opsPerSec": 569.7189060328777,
+      "p50Us": 1626.0000000002037,
+      "p99Us": 4235.41699999987,
+      "elapsedSec": 0.1404201250000001
+    },
+    {
+      "name": "get 1KiB",
+      "ops": 2000,
+      "warmup": 200,
+      "opsPerSec": 1109.3844005160577,
+      "p50Us": 780.2909999995791,
+      "p99Us": 2044.9579999994967,
+      "elapsedSec": 1.8028016250000005
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "opsPerSec": 113.82272668619099,
+      "p50Us": 9297.790999999961,
+      "p99Us": 13391.709000000446,
+      "elapsedSec": 0.35142366700000005
+    },
+    {
+      "name": "get 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "opsPerSec": 287.8888748942906,
+      "p50Us": 3446.1670000000595,
+      "p99Us": 4166.62499999984,
+      "elapsedSec": 0.1389425000000001
+    },
+    {
+      "name": "put 1KiB x32",
+      "ops": 2000,
+      "warmup": 64,
+      "inflight": 32,
+      "opsPerSec": 2359.7830425853676,
+      "elapsedSec": 0.8475355420000006
+    },
+    {
+      "name": "get 1KiB x32",
+      "ops": 2000,
+      "warmup": 64,
+      "inflight": 32,
+      "opsPerSec": 4467.348290946103,
+      "elapsedSec": 0.44769287500000066
+    }
+  ]
+}

@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dleveldbCli = path.resolve(root, '../dleveldb/packages/dleveldb/src/dleveldb.ts');
-const blockMain = path.join(root, 'apps/block/src/block.ts');
+const blockMain = path.join(root, 'apps/api/src/engine/disk.ts');
 const bun = process.env.BUN_BIN ?? 'bun';
 process.env.S3DFS_STRICT_LAYOUT ??= '0';
 const ops = Number(process.env.S3DFS_BENCH_OPS ?? 5000);
@@ -26,7 +26,7 @@ const children = [];
 let nextPort = 19_200;
 
 function run(command, args, env = {}) {
-  const cwd = args[0] === blockMain ? path.join(root, 'apps/block') : root;
+  const cwd = root;
   const child = spawn(command, args, {
     cwd,
     env: { ...process.env, ...env },
@@ -177,7 +177,7 @@ async function startCluster(blockCount, dataReplicas, compressType = 'none') {
     run(bun, [blockMain], {
       S3DFS_BLOCK_NODE_ID: id,
       S3DFS_BLOCK_PORT: String(port),
-      S3DFS_ADVERTISE_ADDR: `127.0.0.1:${port}`,
+      S3DFS_BLOCK_ADVERTISE: `127.0.0.1:${port}`,
       S3DFS_DATA_DIR: path.join(dir, id),
       S3DFS_INDEX_URLS: `http://127.0.0.1:${indexPort}`,
       S3DFS_FLUSH_INTERVAL_MS: '20',

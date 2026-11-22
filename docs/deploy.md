@@ -80,23 +80,23 @@ C 网关使用同一对密钥和同一套法定人数、故障域规则。它认
 
 | 用途 | 现在有的 |
 | --- | --- |
-| 开发 | README 的 `pnpm dev:index`、`dev:block`、`dev:api`、`dev:web` 和 `pnpm patrol`。单机。`pnpm dev:api` 把副本设为 1 并关闭严格布局 |
+| 开发 | README 的 `pnpm dev:index`、`dev:api`、`dev:web` 和 `pnpm patrol`。单机。`pnpm dev:api` 把副本设为 1 并关闭严格布局 |
 | 发版目录 | `bun scripts/release.mjs 0.1.1` 先跑测试，通过后才编译进 `dist/`，再打成 `release/s3dfs-0.1.1-<系统>-<架构>.tar.gz`。`--tag` 把这个压缩包挂到同名 GitHub Release。测试失败不打包、不打标签 |
 | 变量例子 | 仓库根 `.env.example`。按环境摆机器用 `deploy/envs/prod.env` 和 `deploy/envs/local.env` |
 | 本机演练 | `scripts/drill-local.mjs`，笔记在 [2026-11-21 本机演练](milestones/2026-11-21-local-drill.md) |
-| 安装脚本 | `bun scripts/deploy.mjs render --env deploy/envs/prod.env --out deploy/out/prod` 按副本数、索引台数、API 台数和 zone 写出 systemd、Docker Compose 和 Kubernetes 清单 |
+| 安装脚本 | `bun scripts/deploy.mjs render --env deploy/envs/prod.env --out deploy/out/prod` 按副本数、索引台数和 zone 写出 systemd、Docker Compose 和 Kubernetes 清单。每台存储机的 API 同时打开本机磁盘 |
 
 `S3DFS_SCALE_UP_CMD` 和 `S3DFS_SCALE_DOWN_CMD` 不配时，加机器和减机器不执行。告警还没有送到外部值班，索引、block、API 的升级和回退顺序也还没有写成步骤。这两项的关闭条件在 [待办](todo.md)。证书仍在入口的反向代理上终止，清单里没有写证书。
 
-下面这张表是同一条发布在三种环境里怎么接上。环境文件写副本数、索引台数、API 台数和 zone。生产用第 1 节的数量，`deploy/envs/local.env` 是 1 份。
+下面这张表是同一条发布在三种环境里怎么接上。环境文件写副本数、索引台数和 zone。生产用第 1 节的数量，`deploy/envs/local.env` 是 1 份。每台存储机跑一份 API。
 
 | 步骤 | 现在有的 | 还要连上 |
 | --- | --- | --- |
-| 打包 | `release/s3dfs-<版本>-<系统>-<架构>.tar.gz`。里面是接口、block、巡检、控制台、引擎和依赖 | 在目标机器解压到 `/opt/s3dfs`。压缩包按本机系统命名，Linux 机器用 linux 那一个 |
+| 打包 | `release/s3dfs-<版本>-<系统>-<架构>.tar.gz`。里面是接口、巡检、控制台、引擎和依赖 | 在目标机器解压到 `/opt/s3dfs`。压缩包按本机系统命名，Linux 机器用 linux 那一个 |
 | 自动测试 | 发版命令和 GitHub 都会跑 `packages/control/test`、`apps/api/test`、`scripts/deploy.test.mjs` | 失败就不打包，也不打标签 |
 | 发版本 | `bun scripts/release.mjs <版本> --tag` 推送标签，并把 tar.gz 挂到该标签的 GitHub Release | 标签页上能下载到和 `dist/VERSION` 相同版本的压缩包 |
 | 发到环境 | `deploy.mjs render` 按 `deploy/envs/*.env` 写出该环境的 systemd、Compose 和 Kubernetes 文件 | 在准备接流量的机器上执行安装，并确认健康检查 |
-| 副本和角色 | 环境文件里的 `replicas`、`indexes`、`apis`、`zones` 和三组机器地址 | 生产用 `deploy/envs/prod.env`，本机用 `deploy/envs/local.env` |
+| 副本和角色 | 环境文件里的 `replicas`、`indexes`、`zones`、存储机地址和索引地址 | 生产用 `deploy/envs/prod.env`，本机用 `deploy/envs/local.env`。存储机上的 API 同时打开本机磁盘 |
 | 运行环境 | systemd 单元、`deploy/docker/Dockerfile`、`deploy/docker/index.Dockerfile`、Kubernetes 清单都由同一次 render 写出 | 索引和 block 使用 `/var/lib/s3dfs` 下的固定目录或卷。换版本不删这些目录。API 前面是 Kubernetes Service（LoadBalancer）。Helm 不是前提 |
 
 目标机器使用 Release 上的 tar.gz，解压到 `/opt/s3dfs`。Docker 镜像用解压后的目录构建：`docker build -f deploy/docker/runtime.Dockerfile -t s3dfs /opt/s3dfs`。索引镜像的上下文仍是旁边的 dleveldb：`docker build -f deploy/docker/index.Dockerfile -t dleveldb ../dleveldb`。`bun` 要在 `/usr/bin/bun`。密钥从 `secret.env.example` 复制出来再填，不写进仓库。安装脚本不删除 `/var/lib/s3dfs`。
@@ -114,16 +114,9 @@ sudo mkdir -p /opt/s3dfs /var/lib/s3dfs/block/block1
 sudo tar -C /opt/s3dfs -xzf s3dfs-0.1.1-linux-x64.tar.gz
 cd /opt/s3dfs
 export S3DFS_INDEX_URLS=http://127.0.0.1:9800 S3DFS_DATA_REPLICAS=1 S3DFS_STRICT_LAYOUT=0
-S3DFS_BLOCK_NODE_ID=block1 S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1 S3DFS_ADVERTISE_ADDR=127.0.0.1:9100 bun block/main.js
-```
-
-接口在另一个终端：
-
-```bash
-cd /opt/s3dfs
-export S3DFS_INDEX_URLS=http://127.0.0.1:9800
 export S3DFS_BLOCK_NODES=block1=127.0.0.1:9100
-export S3DFS_DATA_REPLICAS=1 S3DFS_STRICT_LAYOUT=0
+export S3DFS_BLOCK_NODE_ID=block1 S3DFS_BLOCK_PORT=9100 S3DFS_BLOCK_ADVERTISE=127.0.0.1:9100
+export S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1
 bun api/main.js
 curl -fsS http://127.0.0.1:9000/_s3dfs/health
 ```

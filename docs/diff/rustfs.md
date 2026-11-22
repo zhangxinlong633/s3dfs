@@ -67,11 +67,11 @@ Reed-Solomon、CRC、HTTP 和序列化，Rust 都有库，RustFS 也接上了。
 
 | 部分 | RustFS 行 | 为什么是这些行 | s3dfs 行 | 为什么是这些行 |
 | --- | --- | --- | --- | --- |
-| 纠删与盘 | 515332 | 对象要切成数据片和校验片，每片落到哪块盘、怎么读回来、小片何时内联进 `xl.meta`，都在 `crates/ecstore` 里算。`pools.rs` 43162 行，`local.rs` 41897 行，`set_disk/ops/object.rs` 30339 行，`store/init.rs` 30283 行。编解码目录只有 23572 行，其余是围绕纠删集的磁盘和放置 | 4685 | 正文是整份记录追加进 `.blk`，`packages/engine` 4338 行管记录、墓碑和 compact。`apps/block` 347 行把本机记录收成 HTTP。位置不写在盘上的元数据文件里，所以没有 `xl.meta` 这一层 |
+| 纠删与盘 | 515332 | 对象要切成数据片和校验片，每片落到哪块盘、怎么读回来、小片何时内联进 `xl.meta`，都在 `crates/ecstore` 里算。`pools.rs` 43162 行，`local.rs` 41897 行，`set_disk/ops/object.rs` 30339 行，`store/init.rs` 30283 行。编解码目录只有 23572 行，其余是围绕纠删集的磁盘和放置 | 4685 | 正文是整份记录追加进 `.blk`。`packages/engine` 管记录、墓碑和 compact，由 API 进程调用。位置不写在盘上的元数据文件里，所以没有 `xl.meta` 这一层 |
 | S3 请求 | 146810 | `rustfs/src/app`、`storage`、`server` 把 Put、分片、拷贝、版本、条件和错误码写在一起，并接到加密、复制和配额。`app/object/get.rs` 12419 行，`server/http.rs` 10188 行。分片在 `set_disk/ops/multipart.rs`，那部分算在「纠删与盘」 | 7688 | `apps/api` 做调用方会碰到的动作：上传、读取、分片、拷贝、版本、过期、标签、对象锁。身份账本、按块封存和换密钥也写在这里，所以下面「身份」「加密」不另计行。带服务端加密的分片完成仍拼成一段，`aws-chunked` 仍整段缓冲 |
 | 管理、诊断与控制台 | 172526 | `rustfs/src/admin` 约 12.2 万行，管用户、修复、池、再平衡和配置。`admin/handlers/site_replication.rs` 16611 行是管理入口，复制状态本身在「复制」那一行。`rustfs/src/connect` 约 3.8 万行是诊断、许可和心跳。`crates/madmin` 约 1.2 万行是管理客户端的类型 | 730 | 管理动作是 flush、compact、repair、scrub、按一个节点 rebalance，写在 `apps/api` 里，没有另算行。控制台 `apps/web` 342 行只摆这几个按钮。巡检 `apps/patrol` 388 行把模块数字写成中文结论，不决定修不修 |
 | 修复、扫描、退役 | 118256 | 缺的是片，不是整份对象，所以要用剩下的片重算。`crates/scanner` 把没人读过的盘走一遍，并做用量、生命周期和复制的排队。`crates/heal` 写回缺片。测试文件已经从这行去掉，实现仍有 11.8 万行 | 3906 | `packages/control` 整包就是这些行，里面还有放置、配额和变更日志。`repair` 再写一整份对象。`scrub` 按数据位置核对 CRC。`drain` 把指定节点上的整份副本写到别的活节点。`bucketUsage` 按页把这个桶的逻辑字节加完。不重编码，也不做盘上的用量缓存 |
-| 节点互调 | 77497 | 纠删集上的节点要互相调读片、写片和修复。`crates/ecstore/src/cluster` 是远程盘，`remote_disk.rs` 13671 行。`rustfs/src/storage/rpc/node_service.rs` 13184 行。协议生成代码已经从这行去掉 | 347 | 字节只在 API 和 block 之间走。`apps/block` 提供本机记录的读和写，block 之间不互相调用 |
+| 节点互调 | 77497 | 纠删集上的节点要互相调读片、写片和修复。`crates/ecstore/src/cluster` 是远程盘，`remote_disk.rs` 13671 行。`rustfs/src/storage/rpc/node_service.rs` 13184 行。协议生成代码已经从这行去掉 | 347 | 本机副本在 API 进程里直接追加。其他节点经同一进程的数据端口写入，存储机之间不互相调用 |
 | 加密与密钥 | 60949 | 同一对象要能走 SSE-S3、SSE-KMS、SSE-C，密钥接到本地、Vault KV2 或 Vault Transit，并且能轮换。`crates/kms` 是这层对接，对象上的封存在 `rustfs/src/storage/sse.rs`，9840 行 | 没有 KMS | 桶默认加密和请求上的 AES256 共用 `S3DFS_SSE_KEY`。超过 1 MiB 按约 1 MiB 一块封存。封存头带密钥代号，`S3DFS_SSE_KEY_PREVIOUS` 留着上一把时旧对象仍能打开。SSE-C 用调用方给的 32 字节。封存用 `node:crypto`，所以没有密钥管理包 |
 | 身份 | 54596 | 用户、组、服务账号、策略、临时凭证、LDAP、Keystone 要存、要校验、要过期。`crates/iam`、`crates/policy`、`crates/keystone`、`crates/signer` 是这份账本 | 没有单独目录 | 索引里有用户、组、策略、服务账号和 `assumeRole`。`S3DFS_ACCOUNTS` 仍可用。没有 LDAP、OpenID 和 Keystone |
 | 可观测、指标与审计 | 58269 | `crates/obs`、`crates/io-metrics`、`crates/audit` 把请求、磁盘和审计做成可拉取的记录。接到值班系统仍要人配 | 没有单独目录 | `GET /_s3dfs/metrics` 只计本进程状态码。访问是每个响应一行 JSON。配置了 `S3DFS_ALERT_URL` 才把 `lost` 和布局不 ok 送出去 |
@@ -90,7 +90,7 @@ Reed-Solomon、CRC、HTTP 和序列化，Rust 都有库，RustFS 也接上了。
 
 上面 20 行相加是 1667868。RustFS 长在自己写的盘格式、管理接口、扫描修复、密钥和复制状态上。s3dfs 短在三份整对象、索引另放，以及 HTTP、CRC、AES 用 Node 自带的实现。
 
-还有两块 s3dfs 有、这份 RustFS 树里没有对应目录。`apps/s3-gateway` 6222 行是用 C 再做一套 S3 入口。`apps/fuse` 3526 行把桶挂成目录。RustFS 的对象位置写在 `xl.meta` 里，已经算进「纠删与盘」和「盘上元数据」，所以它没有单独的索引进程。
+s3dfs 另有 `apps/fuse`，把桶挂成目录。对象正文由 API 进程里的 C 引擎追加，S3 解析留在 TypeScript。RustFS 的对象位置写在 `xl.meta` 里，已经算进「纠删与盘」和「盘上元数据」，所以它没有单独的索引进程。
 
 ## 修复与运维
 

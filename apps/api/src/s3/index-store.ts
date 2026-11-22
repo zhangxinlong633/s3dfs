@@ -87,7 +87,6 @@ export class IndexUploadStore implements UploadStore {
       const meta = JSON.parse(raw.value.toString('utf8')) as { bucket: string; parts: Record<string, unknown> };
       for (const num of Object.keys(meta.parts)) {
         await this.objects.delete(meta.bucket, partKey(id, Number(num)));
-        await this.kv.delete(`$upload/${id}/b/${num}`);
       }
     }
     await this.kv.delete(`$upload/${id}`);
@@ -229,11 +228,6 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async save(bucket: string, key: string, meta: Record<string, string>): Promise<void> {
     if (Object.keys(meta).length === 0) {
-      try {
-        await this.kv.delete(this.key(bucket, key));
-      } catch {
-        // Clearing metadata that was never stored must not fail the object put.
-      }
       return;
     }
     await this.kv.put(this.key(bucket, key), Buffer.from(JSON.stringify(meta)));
@@ -248,7 +242,7 @@ export class IndexObjectMeta implements ObjectUserMeta {
   }
 
   async remove(bucket: string, key: string): Promise<void> {
-    await this.kv.delete(this.key(bucket, key));
+    await this.drop(this.key(bucket, key));
     await this.removeTags(bucket, key);
     await this.saveRetention(bucket, key, null);
     await this.saveLegalHold(bucket, key, 'OFF');
@@ -260,7 +254,6 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async saveTags(bucket: string, key: string, tags: Record<string, string>): Promise<void> {
     if (Object.keys(tags).length === 0) {
-      await this.removeTags(bucket, key);
       return;
     }
     await this.kv.put(this.tagKey(bucket, key), Buffer.from(JSON.stringify(tags)));
@@ -275,7 +268,7 @@ export class IndexObjectMeta implements ObjectUserMeta {
   }
 
   async removeTags(bucket: string, key: string): Promise<void> {
-    await this.kv.delete(this.tagKey(bucket, key));
+    await this.drop(this.tagKey(bucket, key));
   }
 
   private lockKey(bucket: string, objectKey: string): string {
@@ -284,7 +277,7 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async saveRetention(bucket: string, key: string, retention: { mode: 'GOVERNANCE' | 'COMPLIANCE'; untilMs: number } | null): Promise<void> {
     if (!retention) {
-      await this.kv.delete(this.lockKey(bucket, key));
+      await this.drop(this.lockKey(bucket, key));
       return;
     }
     await this.kv.put(this.lockKey(bucket, key), Buffer.from(JSON.stringify(retention)));
@@ -304,10 +297,16 @@ export class IndexObjectMeta implements ObjectUserMeta {
 
   async saveLegalHold(bucket: string, key: string, status: 'ON' | 'OFF'): Promise<void> {
     if (status === 'OFF') {
-      await this.kv.delete(this.holdKey(bucket, key));
+      await this.drop(this.holdKey(bucket, key));
       return;
     }
     await this.kv.put(this.holdKey(bucket, key), Buffer.from(status));
+  }
+
+  private async drop(key: string): Promise<void> {
+    if (await this.kv.head(key)) {
+      await this.kv.delete(key);
+    }
   }
 
   async loadLegalHold(bucket: string, key: string): Promise<'ON' | 'OFF' | null> {

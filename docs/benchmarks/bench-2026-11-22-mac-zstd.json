@@ -1,0 +1,60 @@
+{
+  "at": "2026-11-22T13:00:34.437Z",
+  "payload": "random",
+  "compress": "zstd",
+  "note": "Mac localhost. One API process with the disk inside it, plus two peer disk processes. Object replicas 3, write quorum 1. Index write quorum 1. Random bytes. RECID_v1 page, 20480 u32 slots. Not the three-VM cluster.",
+  "results": [
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 200,
+      "opsPerSec": 979.6729093463802,
+      "p50Us": 914.2499999999814,
+      "p99Us": 2435.790999999881,
+      "elapsedSec": 2.041497709
+    },
+    {
+      "name": "get 1KiB",
+      "ops": 2000,
+      "warmup": 200,
+      "opsPerSec": 747.395303823224,
+      "p50Us": 947.8329999997186,
+      "p99Us": 5485.916999999972,
+      "elapsedSec": 2.6759600839999997
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "opsPerSec": 110.15374259746547,
+      "p50Us": 9495.208999999704,
+      "p99Us": 13108.250000000226,
+      "elapsedSec": 0.36312883299999976
+    },
+    {
+      "name": "get 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "opsPerSec": 272.20274052086063,
+      "p50Us": 3580.167000000074,
+      "p99Us": 6367.4590000000535,
+      "elapsedSec": 0.14694929199999934
+    },
+    {
+      "name": "put 1KiB x32",
+      "ops": 2000,
+      "warmup": 64,
+      "inflight": 32,
+      "opsPerSec": 2502.933253181402,
+      "elapsedSec": 0.7990624589999997
+    },
+    {
+      "name": "get 1KiB x32",
+      "ops": 2000,
+      "warmup": 64,
+      "inflight": 32,
+      "opsPerSec": 5635.896433358167,
+      "elapsedSec": 0.354868125
+    }
+  ]
+}

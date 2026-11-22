@@ -25,6 +25,7 @@ export interface NativeOptions {
   blockSize?: number;
   bufferSize?: number;
   fsyncOnFlush?: boolean;
+  writeThreads?: number;
 }
 
 export type CompressType = 'none' | 'zstd' | 'gzip';
@@ -83,6 +84,7 @@ export interface StoreStats {
 
 interface NativeStore {
   put(key: string, value: Buffer, meta?: PutMeta): ExtentLocator;
+  putAsync(key: string, value: Buffer | Buffer[], meta?: PutMeta): Promise<ExtentLocator>;
   putBatch(items: { key: string; value: Buffer }[]): ExtentLocator[];
   get(key: string, locator: ExtentLocator): ObjectValue | null;
   getSpan(key: string, locator: ExtentLocator, start: number, len: number): Buffer;
@@ -96,8 +98,10 @@ interface NativeStore {
   scan(): ScanEntry[];
   audit(): { records: number; bad: number; bytes: number };
   flush(): void;
+  sync(): void;
   compact(): StoreStats;
   stats(): StoreStats;
+  serve(host: string, port: number, onRequest: (req: { method: string; url: string; headers: Record<string, string>; body: Buffer }) => { status: number; body?: string | Buffer; headers?: Record<string, string> }): number;
   close(): void;
 }
 
@@ -121,6 +125,10 @@ export class Store {
 
   put(key: string, value: Buffer, meta?: PutMeta): ExtentLocator {
     return this.inner.put(key, value, meta);
+  }
+
+  putAsync(key: string, value: Buffer | Buffer[], meta?: PutMeta): Promise<ExtentLocator> {
+    return this.inner.putAsync(key, value, meta);
   }
 
   putBatch(items: { key: string; value: Buffer }[]): ExtentLocator[] {
@@ -175,12 +183,28 @@ export class Store {
     this.inner.flush();
   }
 
+  sync(): void {
+    this.inner.sync();
+  }
+
   compact(): StoreStats {
     return this.inner.compact();
   }
 
   stats(): StoreStats {
     return this.inner.stats();
+  }
+
+  serve(
+    host: string,
+    port: number,
+    onRequest: (req: { method: string; url: string; headers: Record<string, string>; body: Buffer }) => {
+      status: number;
+      body?: string | Buffer;
+      headers?: Record<string, string>;
+    },
+  ): number {
+    return this.inner.serve(host, port, onRequest);
   }
 
   close(): void {

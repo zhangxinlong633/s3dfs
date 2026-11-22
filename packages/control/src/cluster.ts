@@ -1,11 +1,11 @@
 import { createHash } from 'node:crypto';
-import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockScan, blockTombstone, blockWriteBegin } from './block-client.js';
+import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockScan, blockTombstone, blockWriteBegin, type BlockPutMeta } from './block-client.js';
 import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
 import { BACK_PREFIX, CHANGE_PREFIX, GC_PREFIX, LOST_PREFIX, MAINT_PREFIX, MAINTENANCE_MS, isVisibleObjectKey, locatorKey, lostKey, maintKey, usageKey } from './keys.js';
 import type { KvIndex } from './kv-client.js';
 import type { NodeRegistry } from './registry.js';
-import type { BlockHealth, ObjectLocator, ObjectValue } from './types.js';
+import type { BlockHealth, BlockStats, ExtentLocator, ObjectLocator, ObjectValue } from './types.js';
 import { ControlError } from './types.js';
 
 /** Majority of the copies selected for this write. S3DFS_WRITE_QUORUM overrides it, clamped to that copy count. */
@@ -147,6 +147,21 @@ export interface ClusterStats {
   indexOk: boolean;
   blockNodes: BlockHealth[];
   compressType: CompressType;
+  /** Times for this API process. Microseconds, since the process started. */
+  write: {
+    puts: number;
+    blockSamples: number;
+    blockUs: number;
+    blockMaxUs: number;
+    blockOver100ms: number;
+    blockOver1s: number;
+    indexSamples: number;
+    indexUs: number;
+    indexMaxUs: number;
+    followSamples: number;
+    followUs: number;
+    followMaxUs: number;
+  };
 }
 
 function parseLocator(value: Buffer): ObjectLocator | null {
@@ -161,13 +176,105 @@ function parseLocator(value: Buffer): ObjectLocator | null {
   }
 }
 
+/** This process's packed-block engine. Same-address replicas skip the data port. */
+export interface LocalDisk {
+  address: string;
+  put(key: string, value: Buffer, meta?: BlockPutMeta): ExtentLocator | Promise<ExtentLocator>;
+  get(key: string, loc: ExtentLocator, range?: { start: number; end: number }): ObjectValue | null | Promise<ObjectValue | null>;
+  head(key: string, loc: ExtentLocator): { size: number; crc: number; mtimeMs: number } | null | Promise<{ size: number; crc: number; mtimeMs: number } | null>;
+  tombstone(key: string): void | Promise<void>;
+  beginWrite(key: string): {
+    write(chunk: Buffer): void | Promise<void>;
+    finish(meta?: BlockPutMeta): ExtentLocator | Promise<ExtentLocator>;
+    abort(): void | Promise<void>;
+  };
+  flush(): void | Promise<void>;
+  compact(): BlockStats | Promise<BlockStats>;
+  scan(): { key: string; locator: ExtentLocator }[] | Promise<{ key: string; locator: ExtentLocator }[]>;
+}
+
+function endpoint(address: string): string {
+  const raw = address.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  return raw;
+}
+
 export class ObjectCluster {
+  private readonly compressType: CompressType;
+
   constructor(
     private readonly kv: KvIndex,
     private readonly registry: NodeRegistry,
     private readonly dataReplicas: number,
-    private readonly compressType: CompressType = parseCompressType(process.env.S3DFS_COMPRESS),
-  ) {}
+    compressType?: CompressType,
+    private readonly local?: LocalDisk,
+  ) {
+    this.compressType = compressType ?? parseCompressType(process.env.S3DFS_COMPRESS);
+  }
+
+  private owns(address: string): boolean {
+    return Boolean(this.local) && endpoint(address) === endpoint(this.local!.address);
+  }
+
+  private putBytes(address: string, key: string, value: Buffer, meta?: BlockPutMeta): Promise<ExtentLocator> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.put(key, value, meta));
+    }
+    return blockPut(address, key, value, meta);
+  }
+
+  private readBytes(address: string, key: string, loc: ExtentLocator, range?: { start: number; end: number }): Promise<ObjectValue | null> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.get(key, loc, range));
+    }
+    return blockGet(address, key, loc, range);
+  }
+
+  private headBytes(address: string, key: string, loc: ExtentLocator): Promise<{ size: number; crc: number; mtimeMs: number } | null> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.head(key, loc));
+    }
+    return blockHead(address, key, loc);
+  }
+
+  private dropBytes(address: string, key: string): Promise<void> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.tombstone(key));
+    }
+    return blockTombstone(address, key);
+  }
+
+  private openWrite(address: string, key: string): ReturnType<typeof blockWriteBegin> {
+    if (this.owns(address)) {
+      const writer = this.local!.beginWrite(key);
+      return Promise.resolve({
+        write: (chunk: Buffer) => Promise.resolve(writer.write(chunk)),
+        finish: (meta: BlockPutMeta) => Promise.resolve(writer.finish(meta)),
+        abort: () => Promise.resolve(writer.abort()),
+      });
+    }
+    return blockWriteBegin(address, key);
+  }
+
+  private flushOne(address: string): Promise<void> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.flush());
+    }
+    return blockFlush(address);
+  }
+
+  private compactOne(address: string): Promise<BlockStats> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.compact());
+    }
+    return blockCompact(address);
+  }
+
+  private scanOne(address: string): Promise<{ key: string; locator: ExtentLocator }[]> {
+    if (this.owns(address)) {
+      return Promise.resolve(this.local!.scan());
+    }
+    return blockScan(address);
+  }
 
   private lostTotal = 0;
   /** Copies started after the local write has already been published. */
@@ -181,6 +288,51 @@ export class ObjectCluster {
   private replSent = 0;
   private readonly limitsCache = new Map<string, { at: number; limits: BucketLimits }>();
   private readonly usageMem = new Map<string, number>();
+  private readonly writeTimes = {
+    puts: 0,
+    blockSamples: 0,
+    blockUs: 0,
+    blockMaxUs: 0,
+    blockOver100ms: 0,
+    blockOver1s: 0,
+    indexSamples: 0,
+    indexUs: 0,
+    indexMaxUs: 0,
+    followSamples: 0,
+    followUs: 0,
+    followMaxUs: 0,
+  };
+
+  private noteWrite(kind: 'block' | 'index' | 'follow', us: number): void {
+    const n = us > 0 ? us : 0;
+    if (kind === 'block') {
+      this.writeTimes.blockSamples += 1;
+      this.writeTimes.blockUs += n;
+      if (n > this.writeTimes.blockMaxUs) {
+        this.writeTimes.blockMaxUs = n;
+      }
+      if (n >= 100_000) {
+        this.writeTimes.blockOver100ms += 1;
+      }
+      if (n >= 1_000_000) {
+        this.writeTimes.blockOver1s += 1;
+      }
+      return;
+    }
+    if (kind === 'index') {
+      this.writeTimes.indexSamples += 1;
+      this.writeTimes.indexUs += n;
+      if (n > this.writeTimes.indexMaxUs) {
+        this.writeTimes.indexMaxUs = n;
+      }
+      return;
+    }
+    this.writeTimes.followSamples += 1;
+    this.writeTimes.followUs += n;
+    if (n > this.writeTimes.followMaxUs) {
+      this.writeTimes.followMaxUs = n;
+    }
+  }
 
   lostCount(): number {
     return this.lostTotal;
@@ -284,6 +436,7 @@ export class ObjectCluster {
     const targets = this.registry.pick(objectKey, this.dataReplicas);
     const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
     const need = writeQuorum(targets.length);
+    this.writeTimes.puts += 1;
     const placed: {
       nodeId: string;
       address: string;
@@ -301,7 +454,9 @@ export class ObjectCluster {
         continue;
       }
       try {
-        const ev = await blockPut(node.address, blockKey, packed.stored, meta);
+        const started = process.hrtime.bigint();
+        const ev = await this.putBytes(node.address, blockKey, packed.stored, meta);
+        this.noteWrite('block', Number(process.hrtime.bigint() - started) / 1000);
         placed.push({
           nodeId: node.nodeId,
           address: node.address,
@@ -325,7 +480,9 @@ export class ObjectCluster {
     while (placed.length < 1 + needMore && pending.length > 0) {
       const node = pending.shift()!;
       try {
-        const ev = await blockPut(node.address, blockKey, packed.stored, meta);
+        const started = process.hrtime.bigint();
+        const ev = await this.putBytes(node.address, blockKey, packed.stored, meta);
+        this.noteWrite('block', Number(process.hrtime.bigint() - started) / 1000);
         placed.push({
           nodeId: node.nodeId,
           address: node.address,
@@ -356,18 +513,21 @@ export class ObjectCluster {
       segmentBytes: SEGMENT_BYTES,
       ...(blockKey === objectKey ? {} : { dataKey: blockKey }),
     };
-    const locatorKeys = placed.map((_, i) => locatorKey(objectKey, i));
+    const written: string[] = [];
+    const indexStarted = process.hrtime.bigint();
     try {
       for (let i = 0; i < placed.length; i++) {
         const ev = placed[i]!;
+        const indexKey = locatorKey(objectKey, i);
         await this.kv.put(
-          locatorKeys[i]!,
+          indexKey,
           Buffer.from(JSON.stringify({ ...body, ...ev, replica: i, replicaCount: placed.length })),
         );
+        written.push(indexKey);
       }
-      await this.noteChange('put', bucket, key);
+      this.noteWrite('index', Number(process.hrtime.bigint() - indexStarted) / 1000);
     } catch (err) {
-      await Promise.all(locatorKeys.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
+      await Promise.all(written.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
       throw err;
     }
     if (previous && blockKey !== objectKey) {
@@ -376,10 +536,13 @@ export class ObjectCluster {
     await this.addUsage(bucket, value.length - (previous?.[0]?.size ?? 0), limits);
     const known = new Set(placed.map((ev) => ev.address));
     const follow = (async () => {
+      await this.noteChange('put', bucket, key).catch(() => undefined);
       let count = placed.length;
       for (const node of pending) {
         try {
-          const ev = await blockPut(node.address, blockKey, packed.stored, meta);
+          const started = process.hrtime.bigint();
+          const ev = await this.putBytes(node.address, blockKey, packed.stored, meta);
+          this.noteWrite('follow', Number(process.hrtime.bigint() - started) / 1000);
           if (known.has(node.address)) {
             continue;
           }
@@ -436,7 +599,7 @@ export class ObjectCluster {
       const objectKey = this.objectKey(bucket, one);
       const targets = this.registry.pick(objectKey, this.dataReplicas);
       for (const node of targets) {
-        opened.push({ objectKey, nodeId: node.nodeId, address: node.address, writer: await blockWriteBegin(node.address, objectKey) });
+        opened.push({ objectKey, nodeId: node.nodeId, address: node.address, writer: await this.openWrite(node.address, objectKey) });
       }
     }
     const relayed = await relayChunks(chunks, opened.map((item) => item.writer));
@@ -542,7 +705,7 @@ export class ObjectCluster {
     let last: unknown;
     for (const loc of locs) {
       try {
-        const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc);
+        const got = await this.readBytes(loc.address, loc.dataKey ?? objectKey, loc);
         if (!got) {
           continue;
         }
@@ -598,7 +761,7 @@ export class ObjectCluster {
     let last: unknown;
     for (const loc of locs) {
       try {
-        const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc, { start, end });
+        const got = await this.readBytes(loc.address, loc.dataKey ?? objectKey, loc, { start, end });
         if (!got) {
           continue;
         }
@@ -797,11 +960,11 @@ export class ObjectCluster {
   }
 
   async flush(): Promise<void> {
-    await Promise.all(this.registry.live().map((n) => blockFlush(n.address)));
+    await Promise.all(this.registry.live().map((n) => this.flushOne(n.address)));
   }
 
   async compact(): Promise<void> {
-    await Promise.all(this.registry.live().map((n) => blockCompact(n.address)));
+    await Promise.all(this.registry.live().map((n) => this.compactOne(n.address)));
   }
 
   async stats(): Promise<ClusterStats> {
@@ -825,6 +988,7 @@ export class ObjectCluster {
       indexOk,
       blockNodes,
       compressType: this.compressType,
+      write: { ...this.writeTimes },
     };
     try {
       let startAfter: string | undefined;
@@ -969,7 +1133,7 @@ export class ObjectCluster {
       const digest = got ? got.crc || crc32(got.value) : source.crc;
       for (const node of accepted.length > 0 ? [] : targets) {
         try {
-          const ev = await blockPut(node.address, source.dataKey ?? objectKey, packed!.stored, {
+          const ev = await this.putBytes(node.address, source.dataKey ?? objectKey, packed!.stored, {
             compressType: packed!.compressType,
             origSize: got!.value.length,
             origCrc: digest,
@@ -1025,11 +1189,11 @@ export class ObjectCluster {
     source: ObjectLocator,
     node: { nodeId: string; address: string },
   ): Promise<ObjectLocator> {
-    const writer = await blockWriteBegin(node.address, source.dataKey ?? objectKey);
+    const writer = await this.openWrite(node.address, source.dataKey ?? objectKey);
     const chunk = 1_048_576;
     for (let start = 0; start < source.size; start += chunk) {
       const end = Math.min(source.size, start + chunk) - 1;
-      const part = await blockGet(source.address, source.dataKey ?? objectKey, source, { start, end });
+      const part = await this.readBytes(source.address, source.dataKey ?? objectKey, source, { start, end });
       if (!part) {
         await writer.abort();
         throw new ControlError('BLOCK_UNAVAILABLE', `missing range ${start} of ${objectKey}`);
@@ -1085,7 +1249,7 @@ export class ObjectCluster {
         }
         const otherExpect = other.segments?.[i] ?? expect;
         try {
-          const got = await blockGet(other.address, other.dataKey ?? objectKey, other, { start, end: sliceEnd - 1 });
+          const got = await this.readBytes(other.address, other.dataKey ?? objectKey, other, { start, end: sliceEnd - 1 });
           if (got && crc32(got.value) === otherExpect) {
             fixed = got.value;
             break;
@@ -1121,13 +1285,13 @@ export class ObjectCluster {
     const storage = this.refStorageKey(loc);
     const raw = await this.kv.get(storage);
     if (!raw) {
-      await blockTombstone(loc.address, loc.dataKey ?? objectKey);
+      await this.dropBytes(loc.address, loc.dataKey ?? objectKey);
       return;
     }
     const next = Number(raw.value.toString('utf8')) - 1;
     if (next <= 0) {
       await this.kv.delete(storage);
-      await blockTombstone(loc.address, loc.dataKey ?? objectKey);
+      await this.dropBytes(loc.address, loc.dataKey ?? objectKey);
     } else {
       await this.kv.put(storage, Buffer.from(String(next)));
     }
@@ -1213,7 +1377,7 @@ export class ObjectCluster {
     for (const notice of notices) {
       let records: { key: string; locator: { recId?: number } }[];
       try {
-        records = await blockScan(notice.address);
+        records = await this.scanOne(notice.address);
         if (!Array.isArray(records)) {
           continue;
         }
@@ -1244,7 +1408,7 @@ export class ObjectCluster {
         }
         if (referenced.has(`${notice.nodeId}/${recId}`)) {
           kept++;
-          await this.kv.delete(`${GC_PREFIX}${notice.nodeId}/${recId}`);
+          await this.dropIndex(`${GC_PREFIX}${notice.nodeId}/${recId}`);
           continue;
         }
         if (!this.canTombstone(notice.nodeId)) {
@@ -1271,9 +1435,9 @@ export class ObjectCluster {
           continue;
         }
         try {
-          await blockTombstone(notice.address, record.key);
+          await this.dropBytes(notice.address, record.key);
           removed++;
-          await this.kv.delete(`${GC_PREFIX}${notice.nodeId}/${recId}`);
+          await this.dropIndex(`${GC_PREFIX}${notice.nodeId}/${recId}`);
         } catch {
           // Leave any ticket in place and try on the next announce.
         }
@@ -1377,11 +1541,11 @@ export class ObjectCluster {
       const blockKey = this.freshDataKey();
       const moved: ObjectLocator[] = [];
       for (const loc of locs) {
-        const got = await blockGet(loc.address, loc.dataKey ?? srcObject, loc);
+        const got = await this.readBytes(loc.address, loc.dataKey ?? srcObject, loc);
         if (!got) {
           return false;
         }
-        const ev = await blockPut(loc.address, blockKey, got.value, {
+        const ev = await this.putBytes(loc.address, blockKey, got.value, {
           compressType: loc.compressType,
           origSize: loc.size,
           origCrc: loc.crc,
@@ -1391,7 +1555,7 @@ export class ObjectCluster {
       for (const loc of moved) {
         await this.kv.put(locatorKey(srcObject, loc.replica), Buffer.from(JSON.stringify(loc)));
       }
-      await Promise.all(locs.map((loc) => blockTombstone(loc.address, loc.dataKey ?? srcObject)));
+      await Promise.all(locs.map((loc) => this.dropBytes(loc.address, loc.dataKey ?? srcObject)));
       sharedLocs = moved;
     }
     for (const loc of sharedLocs) {
@@ -1462,7 +1626,7 @@ export class ObjectCluster {
     const bad: ObjectLocator[] = [];
     for (const loc of locs) {
       try {
-        const got = await blockGet(loc.address, loc.dataKey ?? objectKey, loc);
+        const got = await this.readBytes(loc.address, loc.dataKey ?? objectKey, loc);
         if (!got) {
           bad.push(loc);
           continue;
@@ -1484,7 +1648,7 @@ export class ObjectCluster {
       return 'lost';
     }
     for (const loc of bad) {
-      const ev = await blockPut(loc.address, loc.dataKey ?? objectKey, good, {
+      const ev = await this.putBytes(loc.address, loc.dataKey ?? objectKey, good, {
         compressType: loc.compressType,
         origSize: good.length,
         origCrc: loc.crc,
@@ -1525,11 +1689,11 @@ export class ObjectCluster {
         if (!source) {
           continue;
         }
-        const got = await blockGet(source.address, source.dataKey ?? obj.key, source);
+        const got = await this.readBytes(source.address, source.dataKey ?? obj.key, source);
         if (!got) {
           continue;
         }
-        const ev = await blockPut(node.address, source.dataKey ?? obj.key, got.value, {
+        const ev = await this.putBytes(node.address, source.dataKey ?? obj.key, got.value, {
           compressType: source.compressType,
           origSize: got.value.length,
           origCrc: source.crc,
@@ -1734,11 +1898,11 @@ export class ObjectCluster {
           if (!source || !dest) {
             continue;
           }
-          const got = await blockGet(source.address, source.dataKey ?? obj.key, source);
+          const got = await this.readBytes(source.address, source.dataKey ?? obj.key, source);
           if (!got) {
             continue;
           }
-          const ev = await blockPut(dest.address, source.dataKey ?? obj.key, got.value, {
+          const ev = await this.putBytes(dest.address, source.dataKey ?? obj.key, got.value, {
             compressType: source.compressType,
             origSize: got.value.length,
             origCrc: source.crc,
@@ -1788,8 +1952,14 @@ export class ObjectCluster {
     await this.kv.put(lostKey(objectKey), Buffer.from(JSON.stringify({ v: 1, mtimeMs: Date.now() })));
   }
 
+  private async dropIndex(key: string): Promise<void> {
+    if (await this.kv.head(key)) {
+      await this.kv.delete(key);
+    }
+  }
+
   private async clearLost(objectKey: string): Promise<void> {
-    await this.kv.delete(lostKey(objectKey));
+    await this.dropIndex(lostKey(objectKey));
   }
 
   private freshDataKey(): string {

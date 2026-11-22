@@ -6,7 +6,7 @@
 
 S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js），落盘引擎是 C。对象索引和对象正文分开扩容，面向大量小对象。仓库目录、命令和 `/_s3dfs/` 路径仍用小写。
 
-索引放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群上，通常 3 到 5 台就够。正文放在只跑 packed-block 引擎的 block 机器上，机器按容量增加。默认保存 3 份副本，达到多数就对客户端成功，没写上的一份由修复补齐。日常入口是 S3 API。把一个桶挂成本地目录只是兼容层，挂载速度不代表存储性能。
+索引放在 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 上，通常 3 到 5 台就够，设置 `DLEVELDB_DATA_DIR` 时也可以跑在 API 进程里。每台存储机跑一个 API 进程，用 C 引擎追加正文，并在数据端口上给其他节点写。机器按容量增加。默认保存 3 份副本，达到多数就对客户端成功，没写上的一份由修复补齐。日常入口是 S3 API。把一个桶挂成本地目录只是兼容层，挂载速度不代表存储性能。
 
 对象打进约 1 GiB 的 `.blk`，在内存里攒批后再 `write` + `fsync`。inode 和 IOPS 跟数据文件数走，不跟对象数走。定位信息是 dleveldb 里的 locator。写入前默认用 zstd；压不小则按原文落盘，并把 `compressType` 记成 `none`。
 
@@ -44,6 +44,7 @@ S3DFS 是 S3 兼容的对象存储。控制面是 TypeScript（Nest.js / Next.js
 | [规模说明](docs/scale.md) | 评估容量和排机器的人 | 100 EB 业务容量如何换成 block 与索引，以及 50 PB 磁盘的案例 |
 | [故障与恢复](docs/design-recovery.md) | 评估故障影响的人 | 哪些请求还能继续 |
 | [索引与 block](docs/design-replication.md) | 区分两套副本的人 | 放置、健康检查、法定人数 |
+| [recId 页](docs/design-recid-page.md) | 要看偏移放在哪的人 | 80 KiB 的一页怎么记下 20480 个槽，读对象时多读几次盘 |
 | [基准](docs/benchmarks.md) | 引用数字的人 | 按日期分篇，放在 `docs/benchmarks/` |
 | [待办](docs/todo.md) | 排期的人 | 尚未关闭的事项 |
 | [第一次巡检](docs/milestones/2026-11-20-first-patrol.md) | 想看系统第一次自己跑通的人 | 2026-11-20 从自启到本机模型结论 |
@@ -67,9 +68,8 @@ flowchart LR
 安装和编译用 pnpm 9+、Node.js 26+。节点进程跑在 Bun 1.4+ 上。Nest API 先用 `tsc` 编译，再用 bun 启动。
 
 ```text
-apps/api         Nest.js 12，S3 API，默认 :9000
+apps/api         Nest.js 12，S3 API、本机 packed-block 引擎、可选的内嵌索引，默认 :9000
 apps/web         Next.js 16 控制台，默认 :9001
-apps/block       packed-block 节点，默认 :9100
 apps/patrol      巡检进程，TypeScript 的 Deep Agents
 packages/engine  C 引擎与 N-API 绑定
 packages/control 索引客户端、放置、健康检查
@@ -90,7 +90,6 @@ pnpm install
 pnpm build:engine
 pnpm build:control
 pnpm dev:index    # http://127.0.0.1:9800
-pnpm dev:block    # http://127.0.0.1:9100
 pnpm dev:api      # http://127.0.0.1:9000
 pnpm dev:web      # http://127.0.0.1:9001
 S3DFS_PATROL_TOKEN=本机凭证 S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
@@ -111,17 +110,11 @@ cd /opt/s3dfs
 export S3DFS_INDEX_URLS=http://127.0.0.1:9800
 export S3DFS_DATA_REPLICAS=1
 export S3DFS_STRICT_LAYOUT=0
-S3DFS_BLOCK_NODE_ID=block1 S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1 S3DFS_ADVERTISE_ADDR=127.0.0.1:9100 bun block/main.js
-```
-
-另一个终端启动接口，然后看健康检查：
-
-```bash
-cd /opt/s3dfs
-export S3DFS_INDEX_URLS=http://127.0.0.1:9800
 export S3DFS_BLOCK_NODES=block1=127.0.0.1:9100
-export S3DFS_DATA_REPLICAS=1
-export S3DFS_STRICT_LAYOUT=0
+export S3DFS_BLOCK_NODE_ID=block1
+export S3DFS_BLOCK_PORT=9100
+export S3DFS_BLOCK_ADVERTISE=127.0.0.1:9100
+export S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1
 bun api/main.js
 curl -fsS http://127.0.0.1:9000/_s3dfs/health
 ```

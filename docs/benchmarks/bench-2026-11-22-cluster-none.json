@@ -1,0 +1,144 @@
+{
+  "at": "2026-11-22T13:14:09.702Z",
+  "payload": "random",
+  "compress": "none",
+  "note": "Three-node test cluster. Two API processes each include their disk. The third host runs a disk process and the index. Object replicas 3, write quorum 1. Index write quorum 1. Random bytes, compression off. RECID_v1 page. Client on the 16-core host, hitting its local API. Not the Mac localhost numbers.",
+  "results": [
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 200,
+      "inflight": 1,
+      "opsPerSec": 105.0062817627047,
+      "p50Us": 9225.894999999582,
+      "p99Us": 15930.151000000478,
+      "elapsedSec": 19.046479567000002
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 40,
+      "inflight": 1,
+      "opsPerSec": 104.64871136117078,
+      "p50Us": 9227.117000002181,
+      "p99Us": 14867.342000001372,
+      "elapsedSec": 3.822311759
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 1,
+      "opsPerSec": 82.54088827208516,
+      "p50Us": 11667.59699999966,
+      "p99Us": 30531.79099999761,
+      "elapsedSec": 0.9692166109999998
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 1,
+      "opsPerSec": 29.123658570839105,
+      "p50Us": 29753.765999997995,
+      "p99Us": 79933.75000000015,
+      "elapsedSec": 1.3734538159999974
+    },
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 6,
+      "inflight": 3,
+      "opsPerSec": 253.02933030485633,
+      "elapsedSec": 7.904222002999999
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 6,
+      "inflight": 3,
+      "opsPerSec": 254.3829191231089,
+      "elapsedSec": 1.572432620000007
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 6,
+      "inflight": 3,
+      "opsPerSec": 179.35961117096173,
+      "elapsedSec": 0.4460312970000014
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 3,
+      "opsPerSec": 50.65011210636216,
+      "elapsedSec": 0.7897317170000024
+    },
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 20,
+      "inflight": 10,
+      "opsPerSec": 431.6172896314683,
+      "elapsedSec": 4.633734671999998
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 20,
+      "inflight": 10,
+      "opsPerSec": 390.67166504366213,
+      "elapsedSec": 1.0238776849999995
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 10,
+      "opsPerSec": 274.21580116522046,
+      "elapsedSec": 0.29174102899999704
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 10,
+      "opsPerSec": 60.2222907732555,
+      "elapsedSec": 0.6642058860000034
+    },
+    {
+      "name": "put 1KiB",
+      "ops": 2000,
+      "warmup": 60,
+      "inflight": 30,
+      "opsPerSec": 311.42272694090406,
+      "elapsedSec": 6.422138871000003
+    },
+    {
+      "name": "put 10KiB",
+      "ops": 400,
+      "warmup": 40,
+      "inflight": 30,
+      "opsPerSec": 470.1273064432432,
+      "elapsedSec": 0.850833369
+    },
+    {
+      "name": "put 100KiB",
+      "ops": 80,
+      "warmup": 8,
+      "inflight": 30,
+      "opsPerSec": 124.6876146638995,
+      "elapsedSec": 0.6416034199999995
+    },
+    {
+      "name": "put 1MiB",
+      "ops": 40,
+      "warmup": 4,
+      "inflight": 30,
+      "opsPerSec": 61.66882697192706,
+      "elapsedSec": 0.6486259260000006
+    }
+  ]
+}

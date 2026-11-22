@@ -6,8 +6,8 @@
 | 本文回答 | 两套集群各自负责什么，一次读写经过哪些进程 |
 
 - **对象索引**放在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 里。这是一个标准的分布式 LevelDB（Get / Put / Delete / 前缀扫描），**不包含** packed-block 引擎。索引集群通常只需 **3–5 台**：数据位置很小，不必和存储容量一起扩。dleveldb 自己的 KV 副本（默认 3，写法定人数 W）由那套产品负责，和对象正文副本不是一回事。
-- **对象正文**放在大量 **block 节点**上（`apps/block`）。每台机器只跑 C 引擎，把对象打进默认 1GB 的追加式 block 文件。block 机器可以很多，按容量加机器即可。
-- **S3 API**（`apps/api`）和管控台不加入 dleveldb 的环，也不在本进程打开 store。它们是索引集群和 block 集群的 HTTP 客户端。
+- **对象正文**放在每台存储机自己的 C 引擎里。这台机器的 API 进程打开数据目录，本机副本直接追加，其他节点经同一进程的 :9100 写入。按容量加机器即可。
+- **S3 API**（`apps/api`）是这台机器对外的接口。设置 `DLEVELDB_DATA_DIR` 时索引也在这个进程里。管控台不加入 dleveldb 的环，也不打开 store。
 
 仓库里曾经内嵌的 `@s3dfs/dleveldb` 已从 workspace 拿掉，源码目录只作历史对照，请改用独立产品。
 
@@ -92,12 +92,11 @@ API 侧仍可用 `S3DFS_BLOCK_NODES=b1=10.0.0.1:9100@rack-a,b2=10.0.0.2:9100@rac
 
 ```bash
 pnpm dev:index    # dleveldb，:9800
-pnpm dev:block    # block，:9100
-pnpm dev:api      # S3 API，:9000
+pnpm dev:api      # S3 API，:9000。设置 S3DFS_DATA_DIR 时同时打开本机磁盘
 pnpm dev:web      # 控制台，:9001
 ```
 
-多机时，索引集群按 dleveldb 自己的文档组成 3–5 个节点；block 机器各自启动 `apps/block`，用不同的 `S3DFS_BLOCK_NODE_ID`、`S3DFS_ADVERTISE_ADDR` 和数据目录。S3 API 可以有多份，它们都指向同一组 `S3DFS_INDEX_URLS`。
+多机时，索引集群按 dleveldb 自己的文档组成 3–5 个节点。每台存储机跑一份 API，用不同的 `S3DFS_BLOCK_NODE_ID`、`S3DFS_BLOCK_ADVERTISE` 和 `S3DFS_DATA_DIR`。它们都指向同一组 `S3DFS_INDEX_URLS`。
 
 ## dleveldb 本身还没做的
 

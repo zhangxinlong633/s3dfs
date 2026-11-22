@@ -49,14 +49,13 @@
 | 重启 | 优先读 `recmap.s3m`，再补扫新数据。快照不可用则扫描全部 `.blk` |
 | 空间回收 | 删除先出票。空闲或手动 compact 回收空洞，保留原 `recId`，不必改索引 |
 | 挂载 | `s3dfs-fuse` 把一个桶挂成本地目录。关闭时整文件上传。Linux 走 `/dev/fuse`；没有 FUSE 的 macOS 再经本机 WebDAV。说明见 [FUSE](design-fuse.md) |
-| C 网关 | 可选入口，不是默认上线入口。内存分片在重启后丢失，不校验分块签名。说明见 [S3 网关](design-s3-gateway.md) |
+| 本机入盘 | API 进程打开 `S3DFS_DATA_DIR`，本机副本直接追加。其他节点走同一进程的 :9100 |
 
 ## 4. 尚未提供
 
 | 事项 | 现状 |
 | --- | --- |
 | 单次 Put | 不超过 1 MiB 的正文在 API 里压缩后一次写入。更大的原始 Put 按最多 1 MiB 一块进入 block，不在 API 里保留整段。`aws-chunked` 仍先收齐再解码 |
-| C 网关签名 | 不校验 aws-chunked 分块签名，也不接受只有 `Date`、没有 `x-amz-date` 的请求 |
 | 多机吞吐 | 尚无准备上线的机器和网络上的测量 |
 | 产品面以外 | 纠删码、站点复制、远程分层、Object Lock、配额、审计日志、Helm、Swift / SFTP、多用户 IAM、KMS |
 

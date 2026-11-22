@@ -964,7 +964,12 @@ async function handleObject(
       return xml(200, tagsXml(await options.meta.loadTags(bucket, key)));
     }
     if (method === 'PUT') {
-      await options.meta.saveTags(bucket, key, parseTags(req.body.toString('utf8')));
+      const tags = parseTags(req.body.toString('utf8'));
+      if (Object.keys(tags).length === 0) {
+        await options.meta.removeTags(bucket, key);
+      } else {
+        await options.meta.saveTags(bucket, key, tags);
+      }
       return empty(200);
     }
     if (method === 'DELETE') {

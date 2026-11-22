@@ -6,7 +6,7 @@
 
 S3DFS is S3-compatible object storage. The control plane is TypeScript (Nest.js / Next.js). The on-disk engine is C. The index and the object body scale separately. The layout is aimed at large numbers of small objects. The repository path, commands, and `/_s3dfs/` URLs stay lowercase.
 
-The index is a standalone [dleveldb](https://github.com/zhangxinlong633/dleveldb) cluster, usually 3–5 machines. Object bytes live on block machines that only run the packed-block engine, and those machines are added as capacity grows. The default is 3 copies. A majority is enough to acknowledge the write, and repair fills the copy that did not land. The everyday entry is the S3 API. Mounting a bucket as a directory is a compatibility layer, and mount speed is not storage performance.
+The index is a [dleveldb](https://github.com/zhangxinlong633/dleveldb) cluster, usually 3–5 machines, and can run inside the API when `DLEVELDB_DATA_DIR` is set. Each storage machine runs one API process. That process appends object bytes with the C engine and answers other nodes on its data port. Add machines as capacity grows. The default is 3 copies. A majority is enough to acknowledge the write, and repair fills the copy that did not land. The everyday entry is the S3 API. Mounting a bucket as a directory is a compatibility layer, and mount speed is not storage performance.
 
 Objects are packed into ~1 GiB `.blk` files, batched in memory, then written with a group `write` + `fsync`. Inode and IOPS cost follow the number of data files. Placement lives in dleveldb locators. The control plane compresses with zstd by default and stores the original bytes, with `compressType=none`, when compression does not shrink the value.
 
@@ -45,6 +45,7 @@ Design documents are in Chinese.
 | [Launch criteria](docs/diff/production.md) | Someone deciding whether a cluster may hold the only copy | Acceptance tests and the on-cluster drill |
 | [Scale](docs/scale.md) | Someone sizing capacity | How 100 EB of business data becomes block and index machines, plus a 50 PB disk case |
 | [Recovery](docs/design-recovery.md) | Someone judging failure impact | Which requests continue |
+| [recId page](docs/design-recid-page.md) | Someone looking up where an offset lives | How an 80 KiB page holds 20480 slots, and how many extra disk reads a get adds |
 | [Benchmarks](docs/benchmarks.md) | Someone citing numbers | One file per date under `docs/benchmarks/` |
 | [Todo](docs/todo.md) | Someone scheduling work | Items that are still open |
 | [First patrol](docs/milestones/2026-11-20-first-patrol.md) | Someone looking for the first end-to-end run | 2026-11-20, from process start to the local model's conclusion |
@@ -68,9 +69,8 @@ flowchart LR
 Install and compile with pnpm 9+ and Node.js 26+. Node processes run on Bun 1.4+. The Nest API is compiled with `tsc`, then started with bun.
 
 ```text
-apps/api         Nest.js 12 S3 API, default :9000
+apps/api         Nest.js 12 S3 API, local packed-block engine, optional embedded index, default :9000
 apps/web         Next.js 16 console, default :9001
-apps/block       packed-block node, default :9100
 apps/patrol      patrol process, Deep Agents in TypeScript
 packages/engine  C engine and N-API binding
 packages/control index client, placement, health checks
@@ -91,7 +91,6 @@ pnpm install
 pnpm build:engine
 pnpm build:control
 pnpm dev:index
-pnpm dev:block
 pnpm dev:api
 pnpm dev:web
 S3DFS_PATROL_TOKEN=local-token S3DFS_PATROL_INTERVAL_MS=0 pnpm patrol
@@ -112,17 +111,11 @@ cd /opt/s3dfs
 export S3DFS_INDEX_URLS=http://127.0.0.1:9800
 export S3DFS_DATA_REPLICAS=1
 export S3DFS_STRICT_LAYOUT=0
-S3DFS_BLOCK_NODE_ID=block1 S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1 S3DFS_ADVERTISE_ADDR=127.0.0.1:9100 bun block/main.js
-```
-
-In another terminal, start the API and check health:
-
-```bash
-cd /opt/s3dfs
-export S3DFS_INDEX_URLS=http://127.0.0.1:9800
 export S3DFS_BLOCK_NODES=block1=127.0.0.1:9100
-export S3DFS_DATA_REPLICAS=1
-export S3DFS_STRICT_LAYOUT=0
+export S3DFS_BLOCK_NODE_ID=block1
+export S3DFS_BLOCK_PORT=9100
+export S3DFS_BLOCK_ADVERTISE=127.0.0.1:9100
+export S3DFS_DATA_DIR=/var/lib/s3dfs/block/block1
 bun api/main.js
 curl -fsS http://127.0.0.1:9000/_s3dfs/health
 ```

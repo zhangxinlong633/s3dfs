@@ -26,7 +26,6 @@ function runtimeDeps(pkgPath) {
 const deps = {
   ...runtimeDeps(path.join(root, 'apps/api/package.json')),
   ...runtimeDeps(path.join(root, 'apps/web/package.json')),
-  ...runtimeDeps(path.join(root, 'apps/block/package.json')),
   ...runtimeDeps(path.join(root, 'apps/patrol/package.json')),
 };
 delete deps['@s3dfs/control'];
@@ -54,7 +53,6 @@ copyTree(path.join(root, 'apps/web/.next'), path.join(dist, 'web/.next'));
 cpSync(path.join(root, 'apps/web/next.config.mjs'), path.join(dist, 'web/next.config.mjs'));
 
 for (const [name, entry] of [
-  ['block', 'apps/block/src/block.ts'],
   ['patrol', 'apps/patrol/src/patrol.ts'],
 ]) {
   const built = spawnSync('bun', ['build', path.join(root, entry), '--outdir', path.join(dist, name), '--target', 'bun', '--packages', 'external'], {
@@ -66,7 +64,7 @@ for (const [name, entry] of [
   }
 }
 
-for (const bin of ['apps/fuse/s3dfs-fuse', 'apps/s3-gateway/s3dfs-s3-gateway']) {
+for (const bin of ['apps/fuse/s3dfs-fuse']) {
   const from = path.join(root, bin);
   if (!existsSync(from)) {
     continue;
@@ -115,7 +113,6 @@ writeFileSync(
       description: 'Release tree. Compiled programs live next to one node_modules.',
       scripts: {
         'start:api': 'bun api/main.js',
-        'start:block': 'bun block/main.js',
         'start:patrol': 'bun patrol/main.js',
         'start:web': 'cd web && ../node_modules/.bin/next start --port 9001 --hostname 0.0.0.0',
       },

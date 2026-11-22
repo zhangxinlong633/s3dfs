@@ -7,22 +7,22 @@
 
 S3DFS 是 S3 兼容的对象存储。控制面用 TypeScript，数据通路的核心在 C 引擎里，通过 N-API 暴露给 Node。对象索引和对象正文分开扩容：
 
-- **索引**落在独立的 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 集群里，一般 **3–5 台**就够。S3 API 只是这个集群的客户端，自己不加入 dleveldb 的环。
-- **正文**落在大量只跑 packed-block 引擎的 **block 机器**上，机器数可以远多于索引节点。block 进程不再维护本地 LevelDB。
+- **索引**落在 [dleveldb](https://github.com/zhangxinlong633/dleveldb) 上，一般 **3–5 台**就够。设置 `DLEVELDB_DATA_DIR` 时，索引跑在对应的 API 进程里，并仍对外提供索引端口。没设时，API 用 HTTP 访问单独的索引进程。没有 API 的机器跑单独的索引进程。
+- **正文**落在每台存储机的 API 进程里。这个进程用 C 引擎把对象打进 `.blk`，并在 :9100 上给其他节点写。机器数可以远多于索引节点。本进程不再维护本地 LevelDB。
 - 默认 3 份对象数据副本（受当前存活的 block 节点数限制），在索引里记成 `bucket/key`、`bucket/key:1`、`bucket/key:2`。这条记录叫做数据位置：值里是 block 节点和稳定的 `recId`，以及 `compressType` 等信息，不记盘上偏移。
 
-细节见 [索引与 block 集群](design-replication.md)。
+一次写入经过哪些进程，见 [写入路径](write-path.html)。索引和副本的细节见 [索引与 block 集群](design-replication.md)。
 
 ## 语言
 
-产品代码只有 TypeScript 和 C。控制台、S3 API、block 进程、控制库和巡检进程用 TypeScript。落盘引擎、可选的 S3 网关和 `s3dfs-fuse` 用 C。不把 Python、Go 或其他语言加进产品进程。编译 `packages/engine` 时 node-gyp 可能调用本机 Python，那只属于编译工具链。
+产品代码只有 TypeScript 和 C。控制台、S3 API、控制库和巡检进程用 TypeScript。落盘引擎和 `s3dfs-fuse` 用 C。入盘在 API 进程里调用这份引擎。不把 Python、Go 或其他语言加进产品进程。编译 `packages/engine` 时 node-gyp 可能调用本机 Python，那只属于编译工具链。
 
 ## 分层
 
 - **控制台**（`apps/web`，Next.js，默认 :9001）：看统计、桶、block 节点状态，触发 flush。空间回收走管理接口或 block 上的 compact，见下方。
-- **S3 API**（`apps/api`，Nest.js，默认 :9000）：Put / Get / Head / Delete / List（含 `delimiter`）和少量管理接口，GET 支持单个 `Range`。它通过 HTTP 访问 dleveldb 和 block 节点，本进程不再打开本地 store。本机目录挂载由独立的 `apps/fuse`（`s3dfs-fuse`）完成，不进入这条控制面进程。
-- **索引集群**（独立的 dleveldb 进程，默认 :9800）：只存很小的数据位置 JSON 和 `$node/{nodeId}` 注册信息，不存对象正文。
-- **block 节点**（`apps/block`，默认 :9100 起）：每台机器跑 C 引擎，对象打进追加式 1GB block 文件。进程按 `recId` 查本地内存表，再读到文件里的物理位置。
+- **S3 API**（`apps/api`，Nest.js，默认 :9000）：一台机器上的那个进程，也是唯一对外的接口。Put / Get / Head / Delete / List（含 `delimiter`）和少量管理接口，GET 支持单个 `Range`。设置 `S3DFS_DATA_DIR` 时，这个进程打开本机的 C 引擎，本机副本直接追加，并在 :9100 上给其他节点写这份磁盘。设置 `DLEVELDB_DATA_DIR` 时，索引也跑在这个进程里。本机目录挂载由独立的 `apps/fuse`（`s3dfs-fuse`）完成，关闭文件时整文件交给这台 API。
+- **索引**（默认 :9800）：只存很小的数据位置 JSON 和 `$node/{nodeId}` 注册信息，不存对象正文。可以嵌在 API 进程里，没有这份目录时再单独起索引进程。
+- **本机磁盘**（同一 API 进程里的 C 引擎，数据端口 :9100）：对象打进追加式 1GB block 文件。按 `recId` 在文件开头的页里读一格，得到偏移后再读对象。见 [recId 页](design-recid-page.md)。
 - **存储引擎**（`packages/engine`）：C 实现追加式 block 文件。记录是带校验的 TLV 帧，方便以后加字段；也可以扫描全部 `.blk` 重建索引。
 - **巡检 AI**（`apps/patrol`，TypeScript，随仓库提供）：不在写入路径上。规则根据模块快照执行修复、compact、flush 或扩容。Deep Agents 把发现和已执行的动作写成中文结论，不读对象正文，不删除、不重启、不缩容。说明见 [能力](capabilities.md#9-模块巡检)。
 
@@ -42,13 +42,13 @@ magic u32 | rec_len u32 | tags… | crc32 u32 | rec_len u32 | magic u32
 
 `kind` 区分普通对象、跨块中间段、跨块最后一段，以及删除墓碑。删除会在对应的 block 上追加一条墓碑，这样以后扫文件重建索引时不会把已删对象救回来。墓碑不会立刻回收空间；节点会记下待清理的票，等空闲或手动 compact 再合并文件。
 
-写路径先进入约 1MB 的内存缓冲，再批量 `write`；flush 时默认 `fsync`。小对象很多时，inode 和 IOPS 跟 block 文件数走，而不是跟对象数走。
+写路径先进入约 1MB 的内存缓冲，再批量 `write`。缓冲大约每秒写出一次。fsync 默认约每 30 秒一次，执行时和追加共用一把锁。小对象很多时，inode 和 IOPS 跟 block 文件数走，而不是跟对象数走。
 
 ## 定位
 
-对象在哪台机器、对应哪条稳定的 `recId`，全部记在 dleveldb 的数据位置里（`v: 3`），同时带上压缩类型。文件里的 `(blockId, offset, recLen)` 只留在该 block 节点的内存表中，可由扫描 `.blk` 重建。block 进程不再维护 `index/` 目录。
+对象在哪台机器、对应哪条稳定的 `recId`，全部记在 dleveldb 的数据位置里（`v: 3`），同时带上压缩类型。盘上偏移写在 `.blk` 的 `recId` 页里：每页 80 KiB、20480 格，每格是本文件内的偏移。下一页的位置在页头。内存里只留每页的起点。空着的格留在本文件，不进入下一个 `.blk`。见 [recId 页](design-recid-page.md)。API 进程不再维护 `index/` 目录。
 
-打开 block 存储时，扫描各 `.blk` 找到最后一条完整记录的结尾，接着往后追加，并重建 `recId` 映射。重建时先读节点本地的 `recmap.s3m` 快照，再只扫快照之后的新数据；快照不可用则扫描全部 `.blk`。不需要回放一份本地 LevelDB。如果 dleveldb 里的定位信息丢了，可以对每台 block 调用扫描接口，按记录顺序折叠墓碑，重建数据位置（重建结果里仍是 `recId`，不是文件偏移）。
+引擎当前打开目录时，仍扫描 `.blk` 重建整张 `recId` 内存表。页结构落地后，打开只读页头和每页最后一格。如果 dleveldb 里的定位信息丢了，可以对每台存储机调用扫描接口，按记录顺序折叠墓碑，重建数据位置（重建结果里仍是 `recId`，不是文件偏移）。
 
 ## 压缩
 
@@ -76,9 +76,9 @@ S3 层把对象记成字面量 `bucket/key`。Put 时按 key 的哈希从存活�
 
 普通本地文件系统往往一个文件一个 inode，目录里有千万文件时，inode 表和目录项会先成为问题。s3dfs 把对象正文打进少量大的 `.blk` 文件，inode 和磁盘文件数跟 block 文件走，不跟对象数走。一千万个对象，在存储侧主要是 dleveldb 里一千万条数据位置（有副本时再加上 `key:1`、`key:2` 等），以及若干 1GB 的 `.blk`。对分布式 KV 来说，这个量级是常规负担，一亿条 key 也还在可预期范围里；这不是已经实测过的数字。
 
-对象按 key 哈希分散到存活的 block 节点，不是整棵目录树绑在一台机器上。每台 block 只扛自己那一份 `.blk` 和对应的 `recId` 内存表；索引仍由单独那一小摊机器（通常 3–5 台）保存数据位置。落点还受副本数影响：默认会在多台 block 上各写一份，所以是按哈希打散后再按副本数重复存放，不是严格的一人一份均分。
+对象按 key 哈希分散到存活的 block 节点，不是整棵目录树绑在一台机器上。每台存储机扛自己的 `.blk`。`recId` 页的起点留在内存里，每一条对象的偏移留在页上。索引仍由通常 3–5 台机器保存数据位置。落点还受副本数影响：默认会在多台 block 上各写一份，所以是按哈希打散后再按副本数重复存放，不是严格的一人一份均分。
 
-这不是完全没有上限。某一台机器用 FUSE 把整个桶挂成本地目录时，内核仍可能按目录项 / inode 来看这份树，列举和元数据缓存也会随文件数变重；block 节点还要在内存里维持 `recId` 映射。对象存储和索引这一层不会像普通本地文件系统那样先被 inode 撑爆，真正把含千万文件的树挂到一台客户端上时，瓶颈更可能出现在挂载进程，而不是 `.blk` 的文件个数。
+这不是完全没有上限。某一台机器用 FUSE 把整个桶挂成本地目录时，内核仍可能按目录项 / inode 来看这份树，列举和元数据缓存也会随文件数变重；存储机在内存里留的是每页起点，不是每一条 `recId`。对象存储和索引这一层不会像普通本地文件系统那样先被 inode 撑爆，真正把含千万文件的树挂到一台客户端上时，瓶颈更可能出现在挂载进程，而不是 `.blk` 的文件个数。
 
 ## 目录挂载（FUSE）
 

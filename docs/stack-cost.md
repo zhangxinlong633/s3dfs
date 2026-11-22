@@ -21,7 +21,7 @@ TypeScript 负责协议、控制和拼装，热路径和打包块用 C。现成�
 
 按「正式源码」比，s3dfs 加 dleveldb 大约是 MinIO 的五分之一到六分之一，是 RustFS 的五十分之一量级。行数少，首先是因为模型窄，其次是现成库多，再就是 TypeScript 写控制面本身更短。若把现在的 API、索引客户端和控制逻辑换成 Go 或 Rust，同样的行为通常要写得更长；若整段改用 C，会再长一截。
 
-s3dfs 当时工作树里，较大的几块是：`apps/api` 约 0.7 万行 TypeScript，`apps/s3-gateway` 约 0.6 万行 C，`packages/engine` 约 0.6 万行（C 引擎与绑定），`packages/control` 约 0.4 万行 TypeScript，`apps/fuse` 约 0.4 万行 C。控制台和文档也占一部分，但不在写入热路径上。
+s3dfs 当时工作树里，较大的几块是：`apps/api` 约 0.7 万行 TypeScript，`packages/engine` 约 0.6 万行（C 引擎与绑定），`packages/control` 约 0.4 万行 TypeScript，`apps/fuse` 约 0.4 万行 C。控制台和文档也占一部分，但不在写入热路径上。入盘在 API 进程里调用这份 C 引擎。
 
 ## 功能面不一样，不能只比行数
 

@@ -29,19 +29,14 @@ function portFor(hosts, index, base) {
 export function planDeploy(input) {
   const replicas = Number(input.replicas);
   const indexes = Number(input.indexes);
-  const apis = Number(input.apis);
   const zones = list(input.zones, 'zones');
   const blockHosts = list(input.blockHosts, 'blockHosts');
   const indexHosts = list(input.indexHosts, 'indexHosts');
-  const apiHosts = list(input.apiHosts, 'apiHosts');
   if (blockHosts.length !== replicas) {
     throw new Error(`block 机器数要等于副本数 ${replicas}`);
   }
   if (indexHosts.length !== indexes) {
     throw new Error(`索引机器数要等于 ${indexes}`);
-  }
-  if (apiHosts.length !== apis) {
-    throw new Error(`API 机器数要等于 ${apis}`);
   }
   if (replicas > 1 && zones.length < replicas) {
     throw new Error(`zone 只有 ${zones.length} 个，放不下 ${replicas} 份副本`);
@@ -63,10 +58,10 @@ export function planDeploy(input) {
     port: portFor(indexHosts, index, indexPort),
     dataDir: `${dataRoot}/index/index${index + 1}`,
   }));
-  const apiNodes = apiHosts.map((host, index) => ({
-    id: `api${index + 1}`,
-    host,
-    port: portFor(apiHosts, index, apiPort),
+  const apiNodes = blocks.map((node) => ({
+    id: node.id,
+    host: node.host,
+    port: apiPort,
   }));
   const strict = input.strictLayout ?? (replicas > 1 ? '1' : '0');
   const blockNodes = blocks.map((node) => `${node.id}=${node.host}:${node.port}@${node.zone}`).join(',');
@@ -156,13 +151,27 @@ spec:
     - port: 9000
       targetPort: 9000
 ---
-apiVersion: apps/v1
-kind: Deployment
+apiVersion: v1
+kind: Service
 metadata:
-  name: s3dfs-api
+  name: s3dfs-block
   namespace: s3dfs
 spec:
-  replicas: ${plan.apis.length}
+  clusterIP: None
+  selector:
+    app: s3dfs-api
+  ports:
+    - port: 9100
+    - port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: s3dfs-block
+  namespace: s3dfs
+spec:
+  serviceName: s3dfs-block
+  replicas: ${plan.blocks.length}
   selector:
     matchLabels:
       app: s3dfs-api
@@ -175,50 +184,14 @@ spec:
         - name: api
           image: s3dfs
           workingDir: /opt/s3dfs
-          command: ["bun", "api/main.js"]
+          command: ["sh", "-c", "n=$((\${HOSTNAME##*-}+1)); export S3DFS_API_PORT=9000 S3DFS_BLOCK_NODE_ID=block$n S3DFS_BLOCK_PORT=9100 S3DFS_BLOCK_ADVERTISE=s3dfs-block-\${HOSTNAME##*-}.s3dfs-block.s3dfs.svc:9100 S3DFS_DATA_DIR=/var/lib/s3dfs/block; exec bun api/main.js"]
           ports:
             - containerPort: 9000
+            - containerPort: 9100
           envFrom:
             - configMapRef:
                 name: s3dfs
             - secretRef:
-                name: s3dfs
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: s3dfs-block
-  namespace: s3dfs
-spec:
-  clusterIP: None
-  selector:
-    app: s3dfs-block
-  ports:
-    - port: 9100
----
-apiVersion: apps/v1
-kind: StatefulSet
-metadata:
-  name: s3dfs-block
-  namespace: s3dfs
-spec:
-  serviceName: s3dfs-block
-  replicas: ${plan.blocks.length}
-  selector:
-    matchLabels:
-      app: s3dfs-block
-  template:
-    metadata:
-      labels:
-        app: s3dfs-block
-    spec:
-      containers:
-        - name: block
-          image: s3dfs
-          workingDir: /opt/s3dfs
-          command: ["sh", "-c", "n=$((\${HOSTNAME##*-}+1)); export S3DFS_BLOCK_NODE_ID=block$n S3DFS_BLOCK_PORT=9100 S3DFS_ADVERTISE_ADDR=s3dfs-block-\${HOSTNAME##*-}.s3dfs-block.s3dfs.svc:9100 S3DFS_DATA_DIR=/var/lib/s3dfs/block; exec bun block/main.js"]
-          envFrom:
-            - configMapRef:
                 name: s3dfs
           volumeMounts:
             - name: data
@@ -330,51 +303,27 @@ function compose(plan) {
       - s3dfs-index-${node.id}:/var/lib/s3dfs/index
 `);
   }
-  for (const node of plan.blocks) {
+  for (const [index, node] of plan.blocks.entries()) {
+    const published = index === 0 ? '\n    ports:\n      - "9000:9000"' : '';
     services.push(`  ${node.id}:
     image: s3dfs
     working_dir: /opt/s3dfs
-    command: ["bun", "block/main.js"]
+    command: ["bun", "api/main.js"]${published}
     environment:
+      S3DFS_API_PORT: "9000"
       S3DFS_BLOCK_NODE_ID: ${node.id}
       S3DFS_BLOCK_PORT: "9100"
-      S3DFS_ADVERTISE_ADDR: ${node.id}:9100
+      S3DFS_BLOCK_ADVERTISE: ${node.id}:9100
       S3DFS_DATA_DIR: /var/lib/s3dfs/block
       S3DFS_DATA_REPLICAS: "${plan.env.S3DFS_DATA_REPLICAS}"
-      S3DFS_INDEX_URLS: ${indexUrls}
-      S3DFS_BLOCK_NODES: ${blockNodes}
-    volumes:
-      - s3dfs-block-${node.id}:/var/lib/s3dfs/block
-`);
-  }
-  services.push(`  api:
-    image: s3dfs
-    working_dir: /opt/s3dfs
-    command: ["bun", "api/main.js"]
-    ports:
-      - "9000:9000"
-    environment:
-      S3DFS_DATA_REPLICAS: "${plan.env.S3DFS_DATA_REPLICAS}"
       S3DFS_STRICT_LAYOUT: "${plan.env.S3DFS_STRICT_LAYOUT}"
-      S3DFS_BLOCK_NODES: ${blockNodes}
       S3DFS_INDEX_URLS: ${indexUrls}
+      S3DFS_BLOCK_NODES: ${blockNodes}
       S3DFS_COMPRESS: ${plan.env.S3DFS_COMPRESS}
     env_file:
       - secret.env
-`);
-  if (plan.apis.length > 1) {
-    services.push(`  api-2:
-    image: s3dfs
-    working_dir: /opt/s3dfs
-    command: ["bun", "api/main.js"]
-    environment:
-      S3DFS_API_PORT: "9000"
-      S3DFS_DATA_REPLICAS: "${plan.env.S3DFS_DATA_REPLICAS}"
-      S3DFS_STRICT_LAYOUT: "${plan.env.S3DFS_STRICT_LAYOUT}"
-      S3DFS_BLOCK_NODES: ${blockNodes}
-      S3DFS_INDEX_URLS: ${indexUrls}
-    env_file:
-      - secret.env
+    volumes:
+      - s3dfs-block-${node.id}:/var/lib/s3dfs/block
 `);
   }
   services.push(`  patrol:
@@ -382,7 +331,7 @@ function compose(plan) {
     working_dir: /opt/s3dfs
     command: ["bun", "patrol/main.js"]
     environment:
-      S3DFS_PATROL_API_URL: http://api:9000
+      S3DFS_PATROL_API_URL: http://block1:9000
       S3DFS_PATROL_MODEL: "off"
     env_file:
       - secret.env
@@ -398,13 +347,6 @@ ${volumes}
 export function renderDeploy(input) {
   const plan = planDeploy(input);
   const files = {};
-  files['systemd/s3dfs-block@.service'] = unit(
-    's3dfs block %i',
-    '/usr/bin/bun block/main.js',
-    `WorkingDirectory=${plan.installRoot}
-EnvironmentFile=/etc/s3dfs/block-%i.env
-EnvironmentFile=-/etc/s3dfs/secret.env`,
-  ).replace('数据在 /var/lib/s3dfs 下', '数据在 /var/lib/s3dfs/block 下');
   files['systemd/s3dfs-index@.service'] = unit(
     's3dfs index %i',
     '/usr/bin/bun packages/dleveldb/src/dleveldb.ts',
@@ -431,12 +373,13 @@ EnvironmentFile=-/etc/s3dfs/secret.env`,
     S3DFS_PATROL_MODEL: 'off',
   };
   for (const node of plan.blocks) {
-    files[`systemd/nodes/block-${node.id}.env`] = envFile({
+    files[`systemd/nodes/api-${node.id}.env`] = envFile({
+      S3DFS_API_PORT: '9000',
       S3DFS_BLOCK_NODE_ID: node.id,
       S3DFS_BLOCK_PORT: String(node.port),
-      S3DFS_ADVERTISE_ADDR: `${node.host}:${node.port}`,
+      S3DFS_BLOCK_ADVERTISE: `${node.host}:${node.port}`,
       S3DFS_DATA_DIR: node.dataDir,
-      S3DFS_INDEX_URLS: plan.env.S3DFS_INDEX_URLS,
+      ...plan.env,
     });
   }
   for (const node of plan.indexes) {
@@ -451,12 +394,6 @@ EnvironmentFile=-/etc/s3dfs/secret.env`,
       DLEVELDB_DATA_DIR: node.dataDir,
       DLEVELDB_PEERS: peers,
       DLEVELDB_REPLICAS: String(plan.indexes.length),
-    });
-  }
-  for (const node of plan.apis) {
-    files[`systemd/nodes/api-${node.id}.env`] = envFile({
-      S3DFS_API_PORT: String(node.port),
-      ...plan.env,
     });
   }
   files['systemd/nodes/patrol.env'] = envFile(shared);
@@ -477,7 +414,7 @@ if [ ! -f /etc/s3dfs/secret.env ]; then
   echo "填好 /etc/s3dfs/secret.env 里的密钥后再启动 API" >&2
 fi
 systemctl daemon-reload
-echo "启用示例: systemctl enable --now s3dfs-index@index1 s3dfs-block@block1 s3dfs-api@api1 s3dfs-patrol"
+echo "启用示例: systemctl enable --now s3dfs-index@index1 s3dfs-api@block1 s3dfs-patrol"
 `;
   files['docker/compose.yaml'] = compose(plan);
   files['docker/secret.env.example'] = files['systemd/secret.env.example'];

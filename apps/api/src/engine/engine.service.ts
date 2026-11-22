@@ -18,6 +18,7 @@ import {
 import { IndexConfigStore, IndexUploadStore } from '../s3/index-store';
 import { MultipartUploads } from '../s3/multipart';
 import { applyLifecycle } from '../s3/product';
+import { startDisk, type RunningDisk } from './disk';
 import { alertBodies, postAlerts } from '../s3/alerts';
 import { deliverCare, emptyCareState, markCareDelivered, reviewCare, type CareIncident, type CareState } from '../s3/care';
 import { compactSnapshot, executePatrol, reviewPatrol, type PatrolReport, type PatrolSnapshot } from '../s3/patrol';
@@ -48,6 +49,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
   private indexDb: { close(): Promise<void> } | undefined;
   private registry!: NodeRegistry;
   private cluster!: ObjectCluster;
+  private disk: RunningDisk | undefined;
   private timer: ReturnType<typeof setInterval> | undefined;
   private repairTimer: ReturnType<typeof setInterval> | undefined;
   private scaleTimer: ReturnType<typeof setInterval> | undefined;
@@ -94,7 +96,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
       this.kv = new IndexClient(urls);
     }
     this.registry = new NodeRegistry(this.kv, seeds);
-    this.cluster = new ObjectCluster(this.kv, this.registry, dataReplicas);
+    if (process.env.S3DFS_DATA_DIR) {
+      this.disk = startDisk(this.kv);
+    }
+    this.cluster = new ObjectCluster(this.kv, this.registry, dataReplicas, undefined, this.disk?.local);
     await this.registry.checkAll();
     const interval = Number(process.env.S3DFS_HEALTH_INTERVAL_MS ?? 5000);
     this.timer = setInterval(() => {
@@ -149,6 +154,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     if (this.scaleTimer) {
       clearInterval(this.scaleTimer);
     }
+    this.disk?.stop();
     if (this.indexHttp) {
       await new Promise<void>((resolve) => this.indexHttp?.close(() => resolve()));
     }

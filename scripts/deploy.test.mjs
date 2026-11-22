@@ -35,23 +35,28 @@ test('production plan keeps data dirs and three zones', () => {
   expect(plan.env.S3DFS_DATA_REPLICAS).toBe('3');
   expect(plan.env.S3DFS_STRICT_LAYOUT).toBe('1');
   expect(plan.env.S3DFS_BLOCK_NODES).toContain('10.0.0.1:9100@rack-a');
-  expect(plan.apis).toHaveLength(2);
+  expect(plan.apis.map((node) => node.host)).toEqual(['10.0.0.1', '10.0.0.2', '10.0.0.3']);
+  expect(plan.apis.every((node) => node.port === 9000)).toBe(true);
   expect(plan.volumeNames.join(' ')).not.toContain('0.1.0');
 });
 
 test('render writes systemd, compose, and kubernetes without wiping data', () => {
   const files = renderDeploy(prod);
-  const blockUnit = files['systemd/s3dfs-block@.service'];
+  const apiEnv = files['systemd/nodes/api-block1.env'];
   const indexUnit = files['systemd/s3dfs-index@.service'];
   const compose = files['docker/compose.yaml'];
   const k8s = files['k8s/s3dfs.yaml'];
-  expect(blockUnit).toContain('/var/lib/s3dfs/block');
+  expect(apiEnv).toContain('/var/lib/s3dfs/block');
+  expect(apiEnv).toContain('S3DFS_DATA_DIR');
+  expect(files['systemd/s3dfs-block@.service']).toBeUndefined();
   expect(indexUnit).toContain('/opt/dleveldb');
-  expect(blockUnit).not.toContain('rm ');
   expect(compose).toContain('s3dfs-block-block1');
+  expect(compose).toContain('api/main.js');
+  expect(compose).not.toContain('block/main.js');
   expect(compose).not.toContain('0.1.0');
   expect(k8s).toContain('volumeClaimTemplates');
-  expect(k8s).toContain('replicas: 2');
+  expect(k8s).toContain('api/main.js');
+  expect(k8s).not.toContain('block/main.js');
   expect(k8s).not.toContain('emptyDir');
   expect(k8s).toContain('kind: Service');
   expect(files['systemd/install.sh']).toContain('daemon-reload');

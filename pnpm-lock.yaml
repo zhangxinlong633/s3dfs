@@ -26,6 +26,9 @@ importers:
       '@s3dfs/control':
         specifier: workspace:*
         version: link:../../packages/control
+      '@s3dfs/engine':
+        specifier: workspace:*
+        version: link:../../packages/engine
       dleveldb:
         specifier: file:../../../dleveldb/packages/dleveldb
         version: file:../dleveldb/packages/dleveldb
@@ -42,22 +45,6 @@ importers:
       '@types/express':
         specifier: ^5.0.3
         version: 5.0.6
-      '@types/node':
-        specifier: ^26.6.6
-        version: 26.6.6
-      typescript:
-        specifier: 7.0.2
-        version: 7.0.2
-
-  apps/block:
-    dependencies:
-      '@s3dfs/control':
-        specifier: workspace:*
-        version: link:../../packages/control
-      '@s3dfs/engine':
-        specifier: workspace:*
-        version: link:../../packages/engine
-    devDependencies:
       '@types/node':
         specifier: ^26.6.6
         version: 26.6.6

@@ -10,10 +10,9 @@
   },
   "packageManager": "pnpm@9.15.0",
   "scripts": {
-    "dev": "pnpm -r --parallel --filter @s3dfs/api --filter @s3dfs/web --filter @s3dfs/block dev",
+    "dev": "pnpm -r --parallel --filter @s3dfs/api --filter @s3dfs/web dev",
     "dev:api": "pnpm --filter @s3dfs/api dev",
     "dev:web": "pnpm --filter @s3dfs/web dev",
-    "dev:block": "pnpm --filter @s3dfs/block dev",
     "dev:index": "bash scripts/dev-index.sh",
     "patrol": "bun apps/patrol/src/patrol.ts",
     "build": "pnpm --filter @s3dfs/engine build && pnpm --filter @s3dfs/control build && pnpm --filter @s3dfs/api build && pnpm --filter @s3dfs/web build",

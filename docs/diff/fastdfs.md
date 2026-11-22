@@ -64,10 +64,10 @@ storage 和 tracker 加起来大约 5.5 万物理行。tracker 不记每个文�
 | --- | --- | --- | --- | --- |
 | 组和机器调度 | `tracker` | 1.9 万 | `packages/control`。放置和法定人数 | 0.37 万 |
 | 每个对象的位置 | 不存，编进文件 id | 0 | `packages/dleveldb` | 0.27 万 |
-| 存文件和同步 | `storage` 根目录。含 binlog 和组内推送 | 2.5 万 | `packages/engine` 0.43 万，`apps/block` 0.03 万。返回前写完副本，没有 binlog | 0.47 万 |
+| 存文件和同步 | `storage` 根目录。含 binlog 和组内推送 | 2.5 万 | `packages/engine`。API 进程追加 `.blk`，返回前写完副本，没有 binlog | 见 `packages/engine` |
 | 小文件合并 | `storage/trunk_mgr` | 0.7 万 | 打进 `.blk`，写在 engine 里 | 已含在上面 |
 | 客户端 SDK | `client`、`cpp_client`、`php_client` | 2.9 万 | 仓库里调用方用 AWS SDK | 0 |
-| 对外协议 | 专有协议，写在 tracker 和 storage 里 | 已含在上面 | `apps/api` 0.65 万，`apps/s3-gateway` 0.62 万 | 1.3 万 |
+| 对外协议 | 专有协议，写在 tracker 和 storage 里 | 已含在上面 | `apps/api`。S3 解析在这个进程里 | 见 `apps/api` |
 | 命令行工具 | `tools` | 3.3 万 | `scripts` | 0.21 万 |
 | 挂载 | 这 13.4 万里没有 | 0 | `apps/fuse` | 0.35 万 |
 

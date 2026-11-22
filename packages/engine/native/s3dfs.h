@@ -20,9 +20,10 @@ extern "C" {
  *   magic u32 | rec_len u32 | tags... | crc32 u32 | rec_len u32 | magic u32
  *
  * Each tag is: type u16 | length u32 | value[length].
- * Unknown tags are skipped, so new fields can be added without breaking
- * readers. A torn write is detected by magic / rec_len / crc mismatch.
- * Scanning every .blk file is enough to rebuild the object index.
+ * Unknown tags are skipped. A recId page is its own TLV, type RECID_v1,
+ * in front of 20480 u32 file offsets (80 KiB). The block is the file that
+ * holds the page. Record length is the TLV at that offset. Object bytes
+ * stay after the page.
  */
 
 typedef struct s3dfs_store s3dfs_store;
@@ -48,6 +49,19 @@ typedef struct s3dfs_stats {
     uint64_t dead_bytes;
     uint64_t tickets;
     uint64_t unflushed_bytes;
+    /* Microseconds. wait is time blocked before the append lock; hold is time owning it. */
+    uint64_t put_wait_us;
+    uint64_t put_hold_us;
+    uint64_t put_wait_max_us;
+    uint64_t put_hold_max_us;
+    uint64_t flush_wait_us;
+    uint64_t flush_hold_us;
+    uint64_t flush_hold_max_us;
+    uint64_t sync_wait_us;
+    uint64_t sync_hold_us;
+    uint64_t sync_hold_max_us;
+    uint64_t fsync_us;
+    uint64_t fsync_max_us;
 } s3dfs_stats;
 
 /* Optional attributes written as TLV tags so a later index rebuild can
@@ -123,6 +137,7 @@ typedef struct s3dfs_audit_report {
 /* Reread every stored record and check its frame checksum. */
 int s3dfs_audit(s3dfs_store *store, s3dfs_audit_report *out);
 int s3dfs_flush(s3dfs_store *store);
+int s3dfs_sync(s3dfs_store *store);
 int s3dfs_compact(s3dfs_store *store);
 void s3dfs_get_stats(s3dfs_store *store, s3dfs_stats *out);
 

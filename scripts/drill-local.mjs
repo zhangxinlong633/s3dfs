@@ -9,7 +9,7 @@ import { signRequest } from '../apps/api/src/s3/sigv4.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dleveldbCli = path.resolve(root, '../dleveldb/packages/dleveldb/src/dleveldb.ts');
-const blockMain = path.join(root, 'apps/block/src/block.ts');
+const blockMain = path.join(root, 'apps/api/src/engine/disk.ts');
 const apiMain = path.join(root, 'apps/api/src/main.ts');
 const bun = process.env.BUN_BIN ?? 'bun';
 const accessKey = 'drill';
@@ -119,7 +119,7 @@ function blockEnv(i) {
   return {
     S3DFS_BLOCK_NODE_ID: `block${i + 1}`,
     S3DFS_BLOCK_PORT: String(port),
-    S3DFS_ADVERTISE_ADDR: `127.0.0.1:${port}`,
+    S3DFS_BLOCK_ADVERTISE: `127.0.0.1:${port}`,
     S3DFS_DATA_DIR: path.join(work, `block${i + 1}`),
     S3DFS_INDEX_URLS: indexUrls,
     S3DFS_FLUSH_INTERVAL_MS: '20',
@@ -217,7 +217,7 @@ try {
   note('0 index ring', true, `physical nodes ${ring.join(',')}`);
   const blocks = [];
   for (let i = 0; i < 3; i++) {
-    blocks.push(run(bun, [blockMain], blockEnv(i), path.join(root, 'apps/block')));
+    blocks.push(run(bun, [blockMain], blockEnv(i), root));
     await waitPort(blockPorts[i]);
   }
   const apis = [];
@@ -258,7 +258,7 @@ try {
   );
   failed ||= !(putOk && repairOk && !pointsAtStopped);
 
-  blocks[2] = run(bun, [blockMain], blockEnv(2), path.join(root, 'apps/block'));
+  blocks[2] = run(bun, [blockMain], blockEnv(2), root);
   await waitPort(blockPorts[2]);
   await health(apiPorts[0]);
   const repairedBack = await repair(apiPorts[0]);
@@ -281,8 +281,8 @@ try {
   const shortOk = putShort.status >= 400 && hShort.status === 503 && reasons.includes('live block nodes');
   note('2 one block left', shortOk, `put ${putShort.status} health ${hShort.status} reasons ${reasons}`);
   failed ||= !shortOk;
-  blocks[1] = run(bun, [blockMain], blockEnv(1), path.join(root, 'apps/block'));
-  blocks[2] = run(bun, [blockMain], blockEnv(2), path.join(root, 'apps/block'));
+  blocks[1] = run(bun, [blockMain], blockEnv(1), root);
+  blocks[2] = run(bun, [blockMain], blockEnv(2), root);
   await waitPort(blockPorts[1]);
   await waitPort(blockPorts[2]);
   const hBack = await health(apiPorts[0]);
