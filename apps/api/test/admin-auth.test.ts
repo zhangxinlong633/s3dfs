@@ -46,4 +46,16 @@ describe('admin writes', () => {
     expect(adminWriteAllowed({ headers: signedFlush(env), env, path: '/_s3dfs/flush', now })).toBe(true);
     expect(adminWriteAllowed({ headers: {}, env, path: '/_s3dfs/flush', now })).toBe(false);
   });
+
+  test('read routes require the same identity once a token or key is set', () => {
+    const env = { S3DFS_ACCESS_KEY: 'AKID', S3DFS_SECRET_KEY: 'secret' };
+    expect(adminWriteAllowed({ headers: {}, env, path: '/_s3dfs/stats', method: 'GET', now })).toBe(false);
+    expect(adminWriteAllowed({ headers: {}, env: { S3DFS_PATROL_TOKEN: 'patrol' }, path: '/_s3dfs/metrics', method: 'GET' })).toBe(false);
+    expect(adminWriteAllowed({
+      headers: { 'x-s3dfs-patrol-token': 'patrol' },
+      env: { S3DFS_PATROL_TOKEN: 'patrol' },
+      path: '/_s3dfs/buckets',
+      method: 'GET',
+    })).toBe(true);
+  });
 });

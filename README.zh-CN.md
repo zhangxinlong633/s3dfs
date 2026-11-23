@@ -76,14 +76,13 @@ packages/control 索引客户端、放置、健康检查
 docs/            产品与设计文档
 ```
 
-本仓库的 `packages/dleveldb` 只作历史对照，不参与构建。索引请运行旁边的 dleveldb。
+索引源码在仓库根的 `dleveldb/`。`packages/dleveldb` 只留旧路径说明。
 
 ## 开始使用
 
-需要 Node 26、pnpm 9、Bun 1.4+、C/C++ 编译器，以及旁边的 dleveldb 仓库（默认 `../dleveldb`）。产品代码只有 TypeScript 和 C。编译引擎时 node-gyp 可能调用本机 Python，那不是产品语言。约束见 [架构](docs/architecture.md#语言)。
+需要 Node 26、pnpm 9、Bun 1.4+ 和 C/C++ 编译器。索引源码已经在仓库里的 `dleveldb/`。产品代码只有 TypeScript 和 C。编译引擎时 node-gyp 可能调用本机 Python，那不是产品语言。约束见 [架构](docs/architecture.md#语言)。
 
 ```bash
-git clone https://github.com/zhangxinlong633/dleveldb.git
 git clone https://github.com/zhangxinlong633/s3dfs.git
 cd s3dfs
 pnpm install

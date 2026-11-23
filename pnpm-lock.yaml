@@ -4,6 +4,11 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  classic-level@3.0.0:
+    hash: 4ylgglym2w3vrvjwi5ic7gcaeq
+    path: patches/classic-level@3.0.0.patch
+
 importers:
 
   .:
@@ -30,8 +35,8 @@ importers:
         specifier: workspace:*
         version: link:../../packages/engine
       dleveldb:
-        specifier: file:../../../dleveldb/packages/dleveldb
-        version: file:../dleveldb/packages/dleveldb
+        specifier: workspace:*
+        version: link:../../dleveldb/packages/dleveldb
       reflect-metadata:
         specifier: ^0.2.2
         version: 0.2.2
@@ -104,14 +109,27 @@ importers:
         specifier: 7.0.2
         version: 7.0.2
 
+  dleveldb/packages/dleveldb:
+    dependencies:
+      classic-level:
+        specifier: ^3.0.0
+        version: 3.0.0(patch_hash=4ylgglym2w3vrvjwi5ic7gcaeq)
+    devDependencies:
+      '@types/node':
+        specifier: ^26.6.6
+        version: 26.6.6
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
+
   packages/control:
     devDependencies:
       '@types/node':
         specifier: ^26.6.6
         version: 26.6.6
       dleveldb:
-        specifier: file:../../../dleveldb/packages/dleveldb
-        version: file:../dleveldb/packages/dleveldb
+        specifier: workspace:*
+        version: link:../../dleveldb/packages/dleveldb
       typescript:
         specifier: 7.0.2
         version: 7.0.2
@@ -1022,11 +1040,6 @@ packages:
   detect-libc@2.1.2:
     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
     engines: {node: '>=8'}
-
-  dleveldb@file:../dleveldb/packages/dleveldb:
-    resolution: {directory: ../dleveldb/packages/dleveldb, type: directory}
-    engines: {bun: '>=1.4.0', node: '>=26.0.0'}
-    hasBin: true
 
   dunder-proto@1.0.1:
     resolution: {integrity: sha512-KIN/nDJBQRcXw0MLVhZE9iQHmG68qAVIBg9CqmUYjmQIhgij9U5MFvrqkUL5FbtyyzZuOeOt0zdeRe4UY7ct+A==}
@@ -2499,7 +2512,7 @@ snapshots:
 
   chownr@3.0.0: {}
 
-  classic-level@3.0.0:
+  classic-level@3.0.0(patch_hash=4ylgglym2w3vrvjwi5ic7gcaeq):
     dependencies:
       abstract-level: 3.1.1
       module-error: 1.0.2
@@ -2567,10 +2580,6 @@ snapshots:
 
   detect-libc@2.1.2:
     optional: true
-
-  dleveldb@file:../dleveldb/packages/dleveldb:
-    dependencies:
-      classic-level: 3.0.0
 
   dunder-proto@1.0.1:
     dependencies:

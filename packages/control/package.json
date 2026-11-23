@@ -19,7 +19,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "dleveldb": "file:../../../dleveldb/packages/dleveldb",
+    "dleveldb": "workspace:*",
     "typescript": "7.0.2"
   }
 }

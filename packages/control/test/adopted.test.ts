@@ -100,7 +100,7 @@ describe('durable lost', () => {
 });
 
 describe('change journal', () => {
-  test('records put and delete without the object bytes', async () => {
+  test('records a delete without the object bytes', async () => {
     const previous = globalThis.fetch;
     globalThis.fetch = (async () =>
       new Response(JSON.stringify({ chained: false, crc: 1, mtimeMs: 1, size: 3, generation: 1, extentCount: 1, recId: 7 }), {
@@ -114,7 +114,7 @@ describe('change journal', () => {
       await c.put('logs', 'a.txt', Buffer.from(body));
       await c.delete('logs', 'a.txt');
       const changes = await c.listChanges();
-      expect(changes.map((item) => item.op)).toEqual(['put', 'delete']);
+      expect(changes.map((item) => item.op)).toEqual(['delete']);
       expect(JSON.stringify(changes)).not.toContain(body);
     } finally {
       globalThis.fetch = previous;
@@ -158,7 +158,7 @@ describe('bucket limits', () => {
       await c.put('logs', 'a.txt', Buffer.from('aa'));
       await c.put('logs', 'b.txt', Buffer.from('bb'));
       expect([...kv.map.keys()].some((key) => key.startsWith('$usage/'))).toBe(false);
-      expect((await c.listChanges()).map((item) => item.op)).toEqual(['put', 'put']);
+      expect((await c.listChanges()).map((item) => item.op)).toEqual([]);
     } finally {
       globalThis.fetch = previous;
     }

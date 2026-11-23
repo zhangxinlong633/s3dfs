@@ -10,6 +10,7 @@
 
 #include "http.h"
 #include "s3dfs.h"
+#include "stage.h"
 
 typedef struct byte_part {
     napi_ref ref;
@@ -1311,6 +1312,16 @@ static napi_value Stats(napi_env env, napi_callback_info info)
     set_num(env, o, "syncHoldMaxUs", (double)s.sync_hold_max_us);
     set_num(env, o, "fsyncUs", (double)s.fsync_us);
     set_num(env, o, "fsyncMaxUs", (double)s.fsync_max_us);
+    set_num(env, o, "laneWaitUs", (double)s.lane_wait_us);
+    set_num(env, o, "laneWaitMaxUs", (double)s.lane_wait_max_us);
+    set_num(env, o, "laneWaits", (double)s.lane_waits);
+    set_num(env, o, "laneDepthMax", (double)s.lane_depth_max);
+    set_num(env, o, "bodyUs", (double)s.body_us);
+    set_num(env, o, "bodyMaxUs", (double)s.body_max_us);
+    set_num(env, o, "bodyWrites", (double)s.body_writes);
+    set_num(env, o, "slotUs", (double)s.slot_us);
+    set_num(env, o, "slotMaxUs", (double)s.slot_max_us);
+    set_num(env, o, "slotWrites", (double)s.slot_writes);
     if (st->http) {
         s3dfs_http_stats hs;
         s3dfs_http_get_stats(st->http, &hs);
@@ -1691,7 +1702,7 @@ static napi_value StoreCtor(napi_env env, napi_callback_info info)
             if (named(env, args[1], "writeBlocks", &pt, &prop) && pt == napi_number) {
                 int32_t n = 0;
                 napi_get_value_int32(env, prop, &n);
-                if (n > 0 && n <= 16) {
+                if (n > 0 && n <= 32) {
                     opt.writers = n;
                 }
             }
@@ -1717,6 +1728,118 @@ static napi_value StoreCtor(napi_env env, napi_callback_info info)
     return jsthis;
 }
 
+static napi_threadsafe_function g_stage_fn;
+
+static void stage_post(stage_job *job)
+{
+    if (!g_stage_fn || napi_call_threadsafe_function(g_stage_fn, job, napi_tsfn_nonblocking) != napi_ok) {
+        stage_reply(job->id, 500);
+    }
+}
+
+static void stage_js(napi_env env, napi_value fn, void *context, void *data)
+{
+    stage_job *job = (stage_job *)data;
+    napi_value global;
+    napi_value argv;
+    napi_value body;
+    napi_value undef;
+    (void)context;
+    if (!env || !fn || !job) {
+        if (job) {
+            stage_reply(job->id, 500);
+        }
+        return;
+    }
+    napi_get_global(env, &global);
+    napi_create_object(env, &argv);
+    set_num(env, argv, "id", (double)job->id);
+    set_str(env, argv, "objectKey", job->object_key, NAPI_AUTO_LENGTH);
+    set_num(env, argv, "crc", job->crc);
+    set_num(env, argv, "size", job->body_len);
+    napi_create_buffer_copy(env, job->body_len ? job->body_len : 1, job->body_len ? job->body : (const uint8_t *)"", NULL, &body);
+    napi_set_named_property(env, argv, "body", body);
+    napi_set_named_property(env, argv, "locator", loc_to_js(env, &job->loc));
+    napi_get_undefined(env, &undef);
+    napi_call_function(env, global, fn, 1, &argv, &undef);
+}
+
+static napi_value StartStages(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2];
+    js_store *st = unwrap(env, info, &argc, args);
+    napi_value prop;
+    napi_valuetype pt;
+    int32_t port = 9000;
+    int32_t backend = 9010;
+    int32_t net_threads = 8;
+    int32_t blk_threads = 32;
+    char *access = NULL;
+    char *secret = NULL;
+    uint32_t alen = 0;
+    uint32_t slen = 0;
+    napi_value name;
+    napi_threadsafe_function tsfn;
+    if (!st || !st->store || argc < 2) {
+        return throw_type(env, "serveStages(options, onIndexed)");
+    }
+    if (named(env, args[0], "port", &pt, &prop) && pt == napi_number) {
+        napi_get_value_int32(env, prop, &port);
+    }
+    if (named(env, args[0], "backend", &pt, &prop) && pt == napi_number) {
+        napi_get_value_int32(env, prop, &backend);
+    }
+    if (named(env, args[0], "netThreads", &pt, &prop) && pt == napi_number) {
+        napi_get_value_int32(env, prop, &net_threads);
+    }
+    if (named(env, args[0], "blkThreads", &pt, &prop) && pt == napi_number) {
+        napi_get_value_int32(env, prop, &blk_threads);
+    }
+    if (!named(env, args[0], "accessKey", &pt, &prop) || pt != napi_string || !named(env, args[0], "secret", &pt, &prop) || pt != napi_string) {
+        return throw_type(env, "serveStages requires accessKey and secret");
+    }
+    named(env, args[0], "accessKey", &pt, &prop);
+    access = utf8_dup(env, prop, &alen);
+    named(env, args[0], "secret", &pt, &prop);
+    secret = utf8_dup(env, prop, &slen);
+    napi_create_string_utf8(env, "s3dfs-stage", NAPI_AUTO_LENGTH, &name);
+    if (napi_create_threadsafe_function(env, args[1], NULL, name, 0, 1, NULL, NULL, NULL, stage_js, &tsfn) != napi_ok) {
+        free(access);
+        free(secret);
+        napi_throw_error(env, NULL, "stage callback failed");
+        return NULL;
+    }
+    g_stage_fn = tsfn;
+    if (stage_start(st->store, "0.0.0.0", port, net_threads, blk_threads, backend, access, secret, stage_post) != 0) {
+        free(access);
+        free(secret);
+        napi_throw_error(env, NULL, "stage listen failed");
+        return NULL;
+    }
+    free(access);
+    free(secret);
+    return NULL;
+}
+
+static napi_value StageReply(napi_env env, napi_callback_info info)
+{
+    size_t argc = 2;
+    napi_value args[2];
+    int32_t status = 200;
+    double id = 0;
+    napi_get_cb_info(env, info, &argc, args, NULL, NULL);
+    if (argc < 1) {
+        return throw_type(env, "stageReply(id, status?)");
+    }
+    napi_get_value_double(env, args[0], &id);
+    if (argc > 1) {
+        napi_get_value_int32(env, args[1], &status);
+    }
+    stage_reply((uint64_t)id, status);
+    return NULL;
+}
+
 static napi_value Init(napi_env env, napi_value exports)
 {
     napi_property_descriptor props[] = {
@@ -1739,6 +1862,8 @@ static napi_value Init(napi_env env, napi_value exports)
         {"compact", NULL, Compact, NULL, NULL, NULL, napi_default, NULL},
         {"stats", NULL, Stats, NULL, NULL, NULL, napi_default, NULL},
         {"serve", NULL, Serve, NULL, NULL, NULL, napi_default, NULL},
+        {"serveStages", NULL, StartStages, NULL, NULL, NULL, napi_default, NULL},
+        {"stageReply", NULL, StageReply, NULL, NULL, NULL, napi_default, NULL},
         {"close", NULL, Close, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_value cls;

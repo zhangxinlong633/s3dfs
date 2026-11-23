@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { ObjectCluster } from '../src/cluster.ts';
+import { ObjectCluster, type LocalDisk } from '../src/cluster.ts';
 import { NodeRegistry, parseBlockNodes } from '../src/registry.ts';
 import type { IndexClient, ScanResult } from '../src/kv-client.ts';
+import type { ExtentLocator } from '../src/types.ts';
 
 class MemIndex {
   readonly endpoints = ['http://mem'];
@@ -124,7 +125,59 @@ describe('replica write', () => {
       release();
       await cluster.copiesSettled();
       const filled = JSON.parse(kv.map.get('logs/a.txt')!.toString('utf8')) as { replicaCount: number };
-      expect(filled.replicaCount).toBe(3);
+      expect(filled.replicaCount).toBe(1);
+      expect(kv.map.has('logs/a.txt:1')).toBe(true);
+      expect(kv.map.has('logs/a.txt:2')).toBe(true);
+    } finally {
+      globalThis.fetch = previous;
+      if (previousQuorum === undefined) {
+        delete process.env.S3DFS_WRITE_QUORUM;
+      } else {
+        process.env.S3DFS_WRITE_QUORUM = previousQuorum;
+      }
+    }
+  });
+
+  test('quorum 1 returns after the local disk without waiting for the other copies', async () => {
+    const previousQuorum = process.env.S3DFS_WRITE_QUORUM;
+    process.env.S3DFS_WRITE_QUORUM = '1';
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      await gate;
+      return new Response(
+        JSON.stringify({ chained: false, crc: 1, mtimeMs: 1, size: 3, generation: 1, extentCount: 1, recId: 9 }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }) as typeof fetch;
+    try {
+      const kv = new MemIndex();
+      const registry = new NodeRegistry(kv as unknown as IndexClient, [
+        { nodeId: 'a', address: '10.0.0.1:9100', zone: 'z1' },
+        { nodeId: 'b', address: '10.0.0.2:9100', zone: 'z2' },
+        { nodeId: 'c', address: '10.0.0.3:9100', zone: 'z3' },
+      ]);
+      const puts: string[] = [];
+      const cluster = new ObjectCluster(kv as unknown as IndexClient, registry, 3, 'none', localDisk('10.0.0.2:9100', puts));
+      const pending = cluster.put('logs', 'a.txt', Buffer.from('abc'));
+      const winner = await Promise.race([
+        pending.then(() => 'put'),
+        new Promise((resolve) => setTimeout(() => resolve('waited'), 50)),
+      ]);
+      expect(winner).toBe('put');
+      expect(puts).toEqual(['logs/a.txt']);
+      const primary = JSON.parse(kv.map.get('logs/a.txt')!.toString('utf8')) as { nodeId: string; replicaCount: number };
+      expect(primary.nodeId).toBe('b');
+      expect(primary.replicaCount).toBe(1);
+      expect(cluster.writeSnapshot().localSamples).toBe(1);
+      expect(cluster.writeSnapshot().remoteSamples).toBe(0);
+      release();
+      await cluster.copiesSettled();
+      const filled = JSON.parse(kv.map.get('logs/a.txt')!.toString('utf8')) as { replicaCount: number };
+      expect(filled.replicaCount).toBe(1);
       expect(kv.map.has('logs/a.txt:1')).toBe(true);
       expect(kv.map.has('logs/a.txt:2')).toBe(true);
     } finally {
@@ -137,6 +190,25 @@ describe('replica write', () => {
     }
   });
 });
+
+function localDisk(address: string, puts: string[]): LocalDisk {
+  return {
+    address,
+    put(key: string): ExtentLocator {
+      puts.push(key);
+      return { chained: false, crc: 1, mtimeMs: 1, size: 3, generation: 1, extentCount: 1, recId: 4 };
+    },
+    get: () => null,
+    head: () => null,
+    tombstone: () => undefined,
+    beginWrite: () => {
+      throw new Error('unused');
+    },
+    flush: () => undefined,
+    compact: () => ({ objects: 0, bytes: 0, blocks: 0, recId: 0 }),
+    scan: () => [],
+  };
+}
 
 describe('placement', () => {
   test('spreads a replica set across zones before filling a zone again', () => {

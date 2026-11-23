@@ -4,7 +4,15 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+
+static uint64_t mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
 
 __thread s3dfs_lane *s3dfs_tls_lane;
 __thread int s3dfs_hold_depth;
@@ -76,6 +84,8 @@ static void *lane_main(void *arg)
             lane->qtail = NULL;
         }
         pthread_mutex_unlock(&lane->qmu);
+        s3dfs_stat_add(&lane->store->stats.lane_wait_us, &lane->store->stats.lane_wait_max_us, &lane->store->stats.lane_waits,
+                       mono_us() - job->queued_us);
         job->fn(job->arg);
         pthread_mutex_lock(&lane->qmu);
         job->done = 1;
@@ -96,6 +106,7 @@ static void lane_call_one(s3dfs_lane *lane, void (*fn)(void *), void *arg)
     memset(&job, 0, sizeof(job));
     job.fn = fn;
     job.arg = arg;
+    job.queued_us = mono_us();
     pthread_cond_init(&job.cv, NULL);
     pthread_mutex_lock(&lane->qmu);
     if (lane->qtail) {
@@ -104,6 +115,11 @@ static void lane_call_one(s3dfs_lane *lane, void (*fn)(void *), void *arg)
         lane->qhead = &job;
     }
     lane->qtail = &job;
+    uint64_t depth = 0;
+    for (s3dfs_job *queued = lane->qhead; queued; queued = queued->next) {
+        depth++;
+    }
+    s3dfs_stat_max(&lane->store->stats.lane_depth_max, depth);
     pthread_cond_signal(&lane->qcv);
     while (!job.done) {
         pthread_cond_wait(&job.cv, &lane->qmu);
@@ -118,8 +134,8 @@ int s3dfs_lanes_init(s3dfs_store *s, uint32_t n)
     if (n < 1) {
         n = 1;
     }
-    if (n > 16) {
-        n = 16;
+    if (n > 32) {
+        n = 32;
     }
     s->lanes = (s3dfs_lane *)calloc(n, sizeof(s3dfs_lane));
     if (!s->lanes) {

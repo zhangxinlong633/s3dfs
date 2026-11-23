@@ -1,0 +1,71 @@
+{
+  "name": "dleveldb",
+  "version": "0.1.0",
+  "description": "Distributed LevelDB: sharded, Chord-routed KV with default 3 replicas",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "dleveldb": "./dist/dleveldb.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.js"
+    },
+    "./hash": {
+      "types": "./dist/hash.d.ts",
+      "import": "./dist/hash.js"
+    },
+    "./chord": {
+      "types": "./dist/chord.d.ts",
+      "import": "./dist/chord.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "start": "bun src/dleveldb.ts",
+    "test": "bun scripts/test-chord.mjs && bun scripts/test-shards.mjs && bun scripts/test-replicas.mjs && bun scripts/test-local-ack.mjs",
+    "test:chord": "bun scripts/test-chord.mjs",
+    "test:shards": "bun scripts/test-shards.mjs",
+    "test:replicas": "bun scripts/test-replicas.mjs",
+    "prepublishOnly": "npm run build",
+    "bench": "bun scripts/bench.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zhangxinlong633/dleveldb.git",
+    "directory": "packages/dleveldb"
+  },
+  "keywords": [
+    "leveldb",
+    "distributed",
+    "kv",
+    "chord",
+    "replication"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=26.0.0",
+    "bun": ">=1.4.0"
+  },
+  "dependencies": {
+    "classic-level": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "7.0.2"
+  }
+}

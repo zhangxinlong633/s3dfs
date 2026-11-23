@@ -99,13 +99,13 @@ C 网关使用同一对密钥和同一套法定人数、故障域规则。它认
 | 副本和角色 | 环境文件里的 `replicas`、`indexes`、`zones`、存储机地址和索引地址 | 生产用 `deploy/envs/prod.env`，本机用 `deploy/envs/local.env`。存储机上的 API 同时打开本机磁盘 |
 | 运行环境 | systemd 单元、`deploy/docker/Dockerfile`、`deploy/docker/index.Dockerfile`、Kubernetes 清单都由同一次 render 写出 | 索引和 block 使用 `/var/lib/s3dfs` 下的固定目录或卷。换版本不删这些目录。API 前面是 Kubernetes Service（LoadBalancer）。Helm 不是前提 |
 
-目标机器使用 Release 上的 tar.gz，解压到 `/opt/s3dfs`。Docker 镜像用解压后的目录构建：`docker build -f deploy/docker/runtime.Dockerfile -t s3dfs /opt/s3dfs`。索引镜像的上下文仍是旁边的 dleveldb：`docker build -f deploy/docker/index.Dockerfile -t dleveldb ../dleveldb`。`bun` 要在 `/usr/bin/bun`。密钥从 `secret.env.example` 复制出来再填，不写进仓库。安装脚本不删除 `/var/lib/s3dfs`。
+目标机器使用 Release 上的 tar.gz，解压到 `/opt/s3dfs`。Docker 镜像用解压后的目录构建：`docker build -f deploy/docker/runtime.Dockerfile -t s3dfs /opt/s3dfs`。索引镜像的上下文是仓库里的 `dleveldb/`：`docker build -f deploy/docker/index.Dockerfile -t dleveldb dleveldb`。`bun` 要在 `/usr/bin/bun`。密钥从 `secret.env.example` 复制出来再填，不写进仓库。安装脚本不删除 `/var/lib/s3dfs`。
 
 待办里的「生产部署」关闭时，准备接流量的那一种装完后，该环境的 `GET /_s3dfs/health` 为 200。只在本机打出 `dist/`、或只跑过测试，不算关闭。
 
 ## 8. 用压缩包
 
-值班从 GitHub Release 下载与机器一致的 `s3dfs-<版本>-<系统>-<架构>.tar.gz`。同一份用法写在包内的 `使用说明.md`，源码里的副本是 [deploy/使用说明.md](../deploy/使用说明.md)。程序解压到 `/opt/s3dfs`。索引仍是旁边的 dleveldb，不在这个包里。
+值班从 GitHub Release 下载与机器一致的 `s3dfs-<版本>-<系统>-<架构>.tar.gz`。同一份用法写在包内的 `使用说明.md`，源码里的副本是 [deploy/使用说明.md](../deploy/使用说明.md)。程序解压到 `/opt/s3dfs`。单独的索引进程用仓库里的 `dleveldb/`，这份源码不在接口压缩包里。
 
 一台机器、一份副本：
 
@@ -138,7 +138,7 @@ Docker 用解压后的目录做镜像，不用 git 源码重新编译 s3dfs。�
 
 ```bash
 docker build -f deploy/docker/runtime.Dockerfile -t s3dfs /opt/s3dfs
-docker build -f deploy/docker/index.Dockerfile -t dleveldb ../dleveldb
+docker build -f deploy/docker/index.Dockerfile -t dleveldb dleveldb
 cp deploy/out/prod/docker/secret.env.example deploy/out/prod/docker/secret.env
 docker compose -f deploy/out/prod/docker/compose.yaml up -d
 ```

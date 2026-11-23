@@ -724,6 +724,27 @@ static void note_us(uint64_t *sum, uint64_t *max_us, uint64_t us)
     }
 }
 
+void s3dfs_stat_add(uint64_t *sum, uint64_t *max_us, uint64_t *count, uint64_t value)
+{
+    if (sum) {
+        __atomic_fetch_add(sum, value, __ATOMIC_RELAXED);
+    }
+    if (count) {
+        __atomic_fetch_add(count, 1, __ATOMIC_RELAXED);
+    }
+    if (!max_us) {
+        return;
+    }
+    uint64_t cur = __atomic_load_n(max_us, __ATOMIC_RELAXED);
+    while (value > cur && !__atomic_compare_exchange_n(max_us, &cur, value, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
+}
+
+void s3dfs_stat_max(uint64_t *max_value, uint64_t value)
+{
+    s3dfs_stat_add(NULL, max_value, NULL, value);
+}
+
 static int mkdir_p(const char *path)
 {
     if (!path || !path[0]) {
@@ -827,9 +848,11 @@ static int flush_bytes_unlocked(s3dfs_store *s)
     if (lane_of(s)->fd < 0) {
         return S3DFS_ERR_IO;
     }
+    uint64_t body_t0 = mono_us();
     s3dfs_store_io_begin(s);
     int wrote = pwrite_fully(lane_of(s)->fd, lane_of(s)->buf, lane_of(s)->buf_used, (off_t)lane_of(s)->size);
     s3dfs_store_io_end(s);
+    s3dfs_stat_add(&s->stats.body_us, &s->stats.body_max_us, &s->stats.body_writes, mono_us() - body_t0);
     if (wrote != 0) {
         return S3DFS_ERR_IO;
     }
@@ -931,14 +954,13 @@ static int page_prefix(const uint8_t *p, uint32_t n)
     return n >= S3DFS_PAGE_TLV && rd_u16(p) == S3DFS_TAG_RECID_V1 && rd_u32(p + 2) == S3DFS_PAGE_LEN;
 }
 
-static void page_fill_header(uint8_t *h, uint64_t first, uint64_t next_off, uint32_t value_crc)
+static void page_fill_header(uint8_t *h, uint64_t first, uint64_t next_off)
 {
     memset(h, 0, S3DFS_PAGE_HEADER);
     wr_u16(h, S3DFS_TAG_RECID_V1);
     wr_u32(h + 2, S3DFS_PAGE_LEN);
     wr_u64(h + 6, first);
     wr_u32(h + 14, (uint32_t)next_off);
-    wr_u32(h + 18, value_crc);
 }
 
 static int page_header_ok(const uint8_t *h, uint64_t *first_out)
@@ -976,8 +998,7 @@ static int page_flush_dirty(s3dfs_store *s)
     }
     s3dfs_page_ent *page = &s->pages[lane_of(s)->page_cached];
     uint8_t header[S3DFS_PAGE_HEADER];
-    uint32_t value_crc = crc32_update(0, lane_of(s)->page_slots, S3DFS_PAGE_VALUE);
-    page_fill_header(header, page->first_rec_id, page->next_off, value_crc);
+    page_fill_header(header, page->first_rec_id, page->next_off);
     int rc = page_pwrite(s, page->block_id, page->file_off, header, S3DFS_PAGE_HEADER);
     if (rc != S3DFS_OK) {
         return rc;
@@ -1079,7 +1100,7 @@ static int page_write_new(s3dfs_store *s, uint64_t first, uint64_t at)
     if (!image) {
         return S3DFS_ERR_NOMEM;
     }
-    page_fill_header(image, first, 0, crc32_update(0, image + S3DFS_PAGE_HEADER, S3DFS_PAGE_VALUE));
+    page_fill_header(image, first, 0);
     int rc = page_pwrite(s, lane_of(s)->block_id, at, image, S3DFS_PAGE_ON_DISK);
     if (rc != S3DFS_OK) {
         free(image);
@@ -1193,13 +1214,9 @@ static int page_store_slot(s3dfs_store *s, uint32_t index, uint32_t slot)
     uint8_t raw[4];
     memcpy(raw, lane_of(s)->page_slots + (size_t)slot * S3DFS_PAGE_SLOT, 4);
     uint64_t at = page->file_off + S3DFS_PAGE_HEADER + (uint64_t)slot * S3DFS_PAGE_SLOT;
+    uint64_t slot_t0 = mono_us();
     int rc = page_pwrite(s, page->block_id, at, raw, 4);
-    if (rc != S3DFS_OK) {
-        return rc;
-    }
-    uint32_t value_crc = crc32_update(0, lane_of(s)->page_slots, S3DFS_PAGE_VALUE);
-    wr_u32(raw, value_crc);
-    rc = page_pwrite(s, page->block_id, page->file_off + 18, raw, 4);
+    s3dfs_stat_add(&s->stats.slot_us, &s->stats.slot_max_us, &s->stats.slot_writes, mono_us() - slot_t0);
     if (rc != S3DFS_OK) {
         return rc;
     }
@@ -1344,8 +1361,7 @@ static int pages_load(s3dfs_store *s)
                 free(ids);
                 return S3DFS_ERR_NOMEM;
             }
-            if (pread(fd, slots, S3DFS_PAGE_VALUE, (off_t)(off + S3DFS_PAGE_HEADER)) != (ssize_t)S3DFS_PAGE_VALUE ||
-                crc32_update(0, slots, S3DFS_PAGE_VALUE) != rd_u32(header + 18)) {
+            if (pread(fd, slots, S3DFS_PAGE_VALUE, (off_t)(off + S3DFS_PAGE_HEADER)) != (ssize_t)S3DFS_PAGE_VALUE) {
                 free(slots);
                 break;
             }
@@ -1415,9 +1431,11 @@ static int append_raw_unlocked(s3dfs_store *s, const uint8_t *rec, uint32_t tota
             memcpy(lane_of(s)->buf + lane_of(s)->buf_used, rec, total);
             lane_of(s)->buf_used += total;
         } else {
+            uint64_t body_t0 = mono_us();
             s3dfs_store_io_begin(s);
             int wrote = (lane_of(s)->fd < 0) ? -1 : pwrite_fully(lane_of(s)->fd, rec, total, (off_t)lane_of(s)->size);
             s3dfs_store_io_end(s);
+            s3dfs_stat_add(&s->stats.body_us, &s->stats.body_max_us, &s->stats.body_writes, mono_us() - body_t0);
             if (wrote != 0) {
                 return S3DFS_ERR_IO;
             }
@@ -1486,9 +1504,11 @@ static int append_record(s3dfs_store *s, const char *key, uint32_t key_len, cons
             free(tmp);
             return S3DFS_ERR;
         }
+        uint64_t body_t0 = mono_us();
         s3dfs_store_io_begin(s);
         int wrote = (lane_of(s)->fd < 0) ? -1 : pwrite_fully(lane_of(s)->fd, tmp, total, (off_t)lane_of(s)->size);
         s3dfs_store_io_end(s);
+        s3dfs_stat_add(&s->stats.body_us, &s->stats.body_max_us, &s->stats.body_writes, mono_us() - body_t0);
         if (wrote != 0) {
             free(tmp);
             return S3DFS_ERR_IO;
@@ -3084,13 +3104,12 @@ static int compact_unlocked(s3dfs_store *s)
             free(old_ids);
             return S3DFS_ERR_NOMEM;
         }
-        uint32_t zero_crc = crc32_update(0, zeros, S3DFS_PAGE_VALUE);
         uint64_t cursor = 0;
         for (uint32_t pi = 0; pi < s->page_n; pi++) {
             uint64_t next = (pi + 1 < s->page_n) ? cursor + S3DFS_PAGE_ON_DISK : 0;
             uint64_t old_block = s->pages[pi].block_id;
             uint8_t header[S3DFS_PAGE_HEADER];
-            page_fill_header(header, s->pages[pi].first_rec_id, next, zero_crc);
+            page_fill_header(header, s->pages[pi].first_rec_id, next);
             if (page_pwrite(s, lane_of(s)->block_id, cursor, header, S3DFS_PAGE_HEADER) != S3DFS_OK ||
                 page_pwrite(s, lane_of(s)->block_id, cursor + S3DFS_PAGE_HEADER, zeros, S3DFS_PAGE_VALUE) != S3DFS_OK) {
                 rc = S3DFS_ERR_IO;
@@ -3441,5 +3460,15 @@ void s3dfs_get_stats(s3dfs_store *s, s3dfs_stats *out)
         s->stats.unflushed_bytes += s->lanes[i].buf_used;
     }
     *out = s->stats;
+    out->lane_wait_us = __atomic_load_n(&s->stats.lane_wait_us, __ATOMIC_RELAXED);
+    out->lane_wait_max_us = __atomic_load_n(&s->stats.lane_wait_max_us, __ATOMIC_RELAXED);
+    out->lane_waits = __atomic_load_n(&s->stats.lane_waits, __ATOMIC_RELAXED);
+    out->lane_depth_max = __atomic_load_n(&s->stats.lane_depth_max, __ATOMIC_RELAXED);
+    out->body_us = __atomic_load_n(&s->stats.body_us, __ATOMIC_RELAXED);
+    out->body_max_us = __atomic_load_n(&s->stats.body_max_us, __ATOMIC_RELAXED);
+    out->body_writes = __atomic_load_n(&s->stats.body_writes, __ATOMIC_RELAXED);
+    out->slot_us = __atomic_load_n(&s->stats.slot_us, __ATOMIC_RELAXED);
+    out->slot_max_us = __atomic_load_n(&s->stats.slot_max_us, __ATOMIC_RELAXED);
+    out->slot_writes = __atomic_load_n(&s->stats.slot_writes, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&s->mu);
 }

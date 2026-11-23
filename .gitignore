@@ -23,7 +23,7 @@ coverage/
 data/
 apps/api/dist/
 
-# in-tree dleveldb is retired; keep only the pointer README
+# old pointer only; the live copy is /dleveldb
 packages/dleveldb/**
 !packages/dleveldb/README.md
 

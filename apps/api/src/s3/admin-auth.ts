@@ -5,6 +5,7 @@ export function adminWriteAllowed(input: {
   headers: Record<string, string | string[] | undefined>;
   env: NodeJS.ProcessEnv;
   path: string;
+  method?: string;
   now?: number;
 }): boolean {
   const header = (name: string): string | undefined => {
@@ -23,7 +24,7 @@ export function adminWriteAllowed(input: {
   try {
     verifySigV4(
       {
-        method: 'POST',
+        method: input.method ?? 'POST',
         path: input.path,
         query: new URLSearchParams(),
         headers: input.headers,

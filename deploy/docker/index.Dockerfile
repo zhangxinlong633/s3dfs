@@ -1,5 +1,5 @@
-# 构建上下文是旁边的 dleveldb 仓库，不是本仓库。
-# docker build -f deploy/docker/index.Dockerfile -t dleveldb ../dleveldb
+# 构建上下文是本仓库里的 dleveldb 目录。
+# docker build -f deploy/docker/index.Dockerfile -t dleveldb dleveldb
 FROM oven/bun:1.4
 WORKDIR /opt/dleveldb
 COPY . .

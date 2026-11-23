@@ -1,0 +1,393 @@
+diff --git a/deps/leveldb/leveldb-1.20/db/dbformat.h b/deps/leveldb/leveldb-1.20/db/dbformat.h
+--- a/deps/leveldb/leveldb-1.20/db/dbformat.h
+
++++ b/deps/leveldb/leveldb-1.20/db/dbformat.h
+
+@@ -24,8 +24,9 @@
+ // Level-0 compaction is started when we hit this many files.
+ static const int kL0_CompactionTrigger = 4;
+ 
+-// Soft limit on number of level-0 files.  We slow down writes at this point.
+-static const int kL0_SlowdownWritesTrigger = 8;
++// Soft limit used to delay each write by 1ms. Disabled: a full L0 must not
++// stall the caller for a fixed sleep. The hard stop below still applies.
++static const int kL0_SlowdownWritesTrigger = 1 << 30;
+ 
+ // Maximum number of level-0 files.  We stop writes at this point.
+ static const int kL0_StopWritesTrigger = 12;
+diff --git a/binding.cc b/binding.cc
+--- a/binding.cc
+
++++ b/binding.cc
+
+@@ -13,8 +13,26 @@
+ #include <vector>
+ #include <mutex>
+ #include <atomic>
++#include <chrono>
++#include <cstdio>
+ #include <optional>
+ 
++extern "C" void leveldb_put_stages(uint64_t* out);
++
++static uint64_t SteadyUs() {
++  return std::chrono::duration_cast<std::chrono::microseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++struct WorkerStages {
++  std::atomic<uint64_t> calls{0};
++  std::atomic<uint64_t> queue_us{0};
++  std::atomic<uint64_t> exec_us{0};
++};
++
++static WorkerStages g_worker_stages;
++
+ /**
+  * Forward declarations.
+  */
+@@ -1341,7 +1359,7 @@
+              leveldb::Slice value,
+              bool sync)
+     : PriorityWorker(env, database, deferred, "classic_level.db.put"),
+-      key_(key), value_(value) {
++      key_(key), value_(value), queuedAt_(SteadyUs()) {
+     options_.sync = sync;
+   }
+ 
+@@ -1351,12 +1369,17 @@
+   }
+ 
+   void DoExecute () override {
++    const uint64_t start = SteadyUs();
++    g_worker_stages.queue_us.fetch_add(start - queuedAt_, std::memory_order_relaxed);
+     SetStatus(database_->Put(options_, key_, value_));
++    g_worker_stages.exec_us.fetch_add(SteadyUs() - start, std::memory_order_relaxed);
++    g_worker_stages.calls.fetch_add(1, std::memory_order_relaxed);
+   }
+ 
+   leveldb::WriteOptions options_;
+   leveldb::Slice key_;
+   leveldb::Slice value_;
++  uint64_t queuedAt_;
+ };
+ 
+ /**
+@@ -1378,6 +1401,27 @@
+ }
+ 
+ /**
++ * Put a key and a value on the calling thread. No thread-pool callback.
++ */
++NAPI_METHOD(db_put_sync) {
++  NAPI_ARGV(4);
++  NAPI_DB_CONTEXT();
++
++  leveldb::Slice key = ToSlice(env, argv[1]);
++  leveldb::Slice value = ToSlice(env, argv[2]);
++  bool sync = BooleanProperty(env, argv[3], "sync", false);
++  leveldb::WriteOptions options;
++  options.sync = sync;
++  leveldb::Status status = database->Put(options, key, value);
++  DisposeSliceBuffer(key);
++  DisposeSliceBuffer(value);
++  if (!status.ok()) {
++    ThrowError(env, status);
++  }
++  NAPI_RETURN_UNDEFINED();
++}
++
++/**
+  * Worker class for getting a value from a database.
+  */
+ struct GetWorker final : public PriorityWorker {
+@@ -2417,6 +2461,56 @@
+ }
+ 
+ /**
++ * Write a batch on the calling thread. No thread-pool callback.
++ */
++NAPI_METHOD(batch_do_sync) {
++  NAPI_ARGV(3);
++  NAPI_DB_CONTEXT();
++
++  napi_value array = argv[1];
++  const bool sync = BooleanProperty(env, argv[2], "sync", false);
++  uint32_t length;
++  napi_get_array_length(env, array, &length);
++
++  leveldb::WriteBatch batch;
++  bool hasData = false;
++
++  for (uint32_t i = 0; i < length; i++) {
++    napi_value element;
++    napi_get_element(env, array, i, &element);
++    if (!IsObject(env, element)) continue;
++
++    std::string type = StringProperty(env, element, "type");
++    if (type == "del") {
++      if (!HasProperty(env, element, "key")) continue;
++      leveldb::Slice key = ToSlice(env, GetProperty(env, element, "key"));
++      batch.Delete(key);
++      hasData = true;
++      DisposeSliceBuffer(key);
++    } else if (type == "put") {
++      if (!HasProperty(env, element, "key")) continue;
++      if (!HasProperty(env, element, "value")) continue;
++      leveldb::Slice key = ToSlice(env, GetProperty(env, element, "key"));
++      leveldb::Slice value = ToSlice(env, GetProperty(env, element, "value"));
++      batch.Put(key, value);
++      hasData = true;
++      DisposeSliceBuffer(key);
++      DisposeSliceBuffer(value);
++    }
++  }
++
++  if (hasData) {
++    leveldb::WriteOptions options;
++    options.sync = sync;
++    leveldb::Status status = database->WriteBatch(options, &batch);
++    if (!status.ok()) {
++      ThrowError(env, status);
++    }
++  }
++  NAPI_RETURN_UNDEFINED();
++}
++
++/**
+  * Owns a WriteBatch.
+  */
+ struct Batch {
+@@ -2614,12 +2708,34 @@
+ /**
+  * All exported functions.
+  */
++NAPI_METHOD(db_put_profile) {
++  uint64_t stage[9];
++  leveldb_put_stages(stage);
++  char buf[640];
++  std::snprintf(
++      buf, sizeof(buf),
++      "calls=%llu leaders=%llu queue_us=%llu room_us=%llu slow_us=%llu slow_n=%llu log_us=%llu mem_us=%llu sync_us=%llu worker_calls=%llu worker_queue_us=%llu worker_exec_us=%llu",
++      (unsigned long long)stage[0], (unsigned long long)stage[1],
++      (unsigned long long)stage[2], (unsigned long long)stage[3],
++      (unsigned long long)stage[4], (unsigned long long)stage[5],
++      (unsigned long long)stage[6], (unsigned long long)stage[7],
++      (unsigned long long)stage[8],
++      (unsigned long long)g_worker_stages.calls.load(std::memory_order_relaxed),
++      (unsigned long long)g_worker_stages.queue_us.load(std::memory_order_relaxed),
++      (unsigned long long)g_worker_stages.exec_us.load(std::memory_order_relaxed));
++  napi_value result;
++  napi_create_string_utf8(env, buf, NAPI_AUTO_LENGTH, &result);
++  return result;
++}
++
+ NAPI_INIT() {
+   NAPI_EXPORT_FUNCTION(db_init);
++  NAPI_EXPORT_FUNCTION(db_put_profile);
+   NAPI_EXPORT_FUNCTION(db_set_shared_buffer)
+   NAPI_EXPORT_FUNCTION(db_open);
+   NAPI_EXPORT_FUNCTION(db_close);
+   NAPI_EXPORT_FUNCTION(db_put);
++  NAPI_EXPORT_FUNCTION(db_put_sync);
+   NAPI_EXPORT_FUNCTION(db_get);
+   NAPI_EXPORT_FUNCTION(db_get_sync);
+   NAPI_EXPORT_FUNCTION(db_get_many);
+@@ -2641,6 +2757,7 @@
+   NAPI_EXPORT_FUNCTION(iterator_abort);
+ 
+   NAPI_EXPORT_FUNCTION(batch_do);
++  NAPI_EXPORT_FUNCTION(batch_do_sync);
+   NAPI_EXPORT_FUNCTION(batch_init);
+   NAPI_EXPORT_FUNCTION(batch_put);
+   NAPI_EXPORT_FUNCTION(batch_del);
+diff --git a/index.js b/index.js
+--- a/index.js
+
++++ b/index.js
+
+@@ -60,6 +60,48 @@
+ 
+   async _put (key, value, options) {
+     return binding.db_put(this[kContext], key, value, options)
++  }
++
++  putSync (key, value, options) {
++    if (this.status !== 'open') {
++      throw new ModuleError('Database is not open', { code: 'LEVEL_DATABASE_NOT_OPEN' })
++    }
++
++    this._assertValidKey(key)
++    this._assertValidValue(value)
++
++    const keyEncoding = this.keyEncoding(options && options.keyEncoding)
++    const valueEncoding = this.valueEncoding(options && options.valueEncoding)
++    const encodedKey = keyEncoding.encode(key)
++    const prefixedKey = this.prefixKey(encodedKey, keyEncoding.format, true)
++    const encodedValue = valueEncoding.encode(value)
++
++    binding.db_put_sync(this[kContext], prefixedKey, encodedValue, { sync: !!(options && options.sync) })
++  }
++
++  batchSync (operations, options) {
++    if (this.status !== 'open') {
++      throw new ModuleError('Database is not open', { code: 'LEVEL_DATABASE_NOT_OPEN' })
++    }
++    const keyEncoding = this.keyEncoding(options && options.keyEncoding)
++    const valueEncoding = this.valueEncoding(options && options.valueEncoding)
++    const encoded = []
++    for (const op of operations) {
++      if (!op || op.type === 'del') {
++        const key = keyEncoding.encode(op.key)
++        encoded.push({ type: 'del', key: this.prefixKey(key, keyEncoding.format, true) })
++        continue
++      }
++      this._assertValidKey(op.key)
++      this._assertValidValue(op.value)
++      const key = keyEncoding.encode(op.key)
++      encoded.push({
++        type: 'put',
++        key: this.prefixKey(key, keyEncoding.format, true),
++        value: valueEncoding.encode(op.value)
++      })
++    }
++    binding.batch_do_sync(this[kContext], encoded, { sync: !!(options && options.sync) })
+   }
+ 
+   async _get (key, options) {
+diff --git a/deps/leveldb/leveldb-1.20/db/db_impl.cc b/deps/leveldb/leveldb-1.20/db/db_impl.cc
+--- a/deps/leveldb/leveldb-1.20/db/db_impl.cc
+
++++ b/deps/leveldb/leveldb-1.20/db/db_impl.cc
+
+@@ -5,6 +5,7 @@
+ #include "db/db_impl.h"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <set>
+ #include <string>
+ #include <stdint.h>
+@@ -32,7 +33,38 @@
+ #include "util/coding.h"
+ #include "util/logging.h"
+ #include "util/mutexlock.h"
++
++namespace {
++
++struct PutStages {
++  std::atomic<uint64_t> calls{0};
++  std::atomic<uint64_t> leaders{0};
++  std::atomic<uint64_t> queue_us{0};
++  std::atomic<uint64_t> room_us{0};
++  std::atomic<uint64_t> slow_us{0};
++  std::atomic<uint64_t> slow_n{0};
++  std::atomic<uint64_t> log_us{0};
++  std::atomic<uint64_t> mem_us{0};
++  std::atomic<uint64_t> sync_us{0};
++};
++
++PutStages g_put_stages;
++thread_local int g_in_put = 0;
+ 
++}  // namespace
++
++extern "C" void leveldb_put_stages(uint64_t* out) {
++  out[0] = g_put_stages.calls.load(std::memory_order_relaxed);
++  out[1] = g_put_stages.leaders.load(std::memory_order_relaxed);
++  out[2] = g_put_stages.queue_us.load(std::memory_order_relaxed);
++  out[3] = g_put_stages.room_us.load(std::memory_order_relaxed);
++  out[4] = g_put_stages.slow_us.load(std::memory_order_relaxed);
++  out[5] = g_put_stages.slow_n.load(std::memory_order_relaxed);
++  out[6] = g_put_stages.log_us.load(std::memory_order_relaxed);
++  out[7] = g_put_stages.mem_us.load(std::memory_order_relaxed);
++  out[8] = g_put_stages.sync_us.load(std::memory_order_relaxed);
++}
++
+ namespace leveldb {
+ 
+ const int kNumNonTableCacheFiles = 10;
+@@ -1197,17 +1229,28 @@
+   w.sync = options.sync;
+   w.done = false;
+ 
++  const bool track = g_in_put > 0;
++  const uint64_t t_enter = track ? env_->NowMicros() : 0;
+   MutexLock l(&mutex_);
+   writers_.push_back(&w);
+   while (!w.done && &w != writers_.front()) {
+     w.cv.Wait();
+   }
++  if (track) {
++    g_put_stages.queue_us.fetch_add(env_->NowMicros() - t_enter, std::memory_order_relaxed);
++    g_put_stages.calls.fetch_add(1, std::memory_order_relaxed);
++  }
+   if (w.done) {
+     return w.status;
+   }
+ 
+   // May temporarily unlock and wait.
++  const uint64_t t_room = track ? env_->NowMicros() : 0;
+   Status status = MakeRoomForWrite(my_batch == NULL);
++  if (track) {
++    g_put_stages.room_us.fetch_add(env_->NowMicros() - t_room, std::memory_order_relaxed);
++    g_put_stages.leaders.fetch_add(1, std::memory_order_relaxed);
++  }
+   uint64_t last_sequence = versions_->LastSequence();
+   Writer* last_writer = &w;
+   if (status.ok() && my_batch != NULL) {  // NULL batch is for compactions
+@@ -1221,16 +1264,28 @@
+     // into mem_.
+     {
+       mutex_.Unlock();
++      const uint64_t t_log = track ? env_->NowMicros() : 0;
+       status = log_->AddRecord(WriteBatchInternal::Contents(updates));
++      if (track) {
++        g_put_stages.log_us.fetch_add(env_->NowMicros() - t_log, std::memory_order_relaxed);
++      }
+       bool sync_error = false;
+       if (status.ok() && options.sync) {
++        const uint64_t t_sync = track ? env_->NowMicros() : 0;
+         status = logfile_->Sync();
++        if (track) {
++          g_put_stages.sync_us.fetch_add(env_->NowMicros() - t_sync, std::memory_order_relaxed);
++        }
+         if (!status.ok()) {
+           sync_error = true;
+         }
+       }
+       if (status.ok()) {
++        const uint64_t t_mem = track ? env_->NowMicros() : 0;
+         status = WriteBatchInternal::InsertInto(updates, mem_);
++        if (track) {
++          g_put_stages.mem_us.fetch_add(env_->NowMicros() - t_mem, std::memory_order_relaxed);
++        }
+       }
+       mutex_.Lock();
+       if (sync_error) {
+@@ -1335,7 +1390,12 @@
+       // this delay hands over some CPU to the compaction thread in
+       // case it is sharing the same core as the writer.
+       mutex_.Unlock();
++      const uint64_t t_slow = g_in_put > 0 ? env_->NowMicros() : 0;
+       env_->SleepForMicroseconds(1000);
++      if (g_in_put > 0) {
++        g_put_stages.slow_us.fetch_add(env_->NowMicros() - t_slow, std::memory_order_relaxed);
++        g_put_stages.slow_n.fetch_add(1, std::memory_order_relaxed);
++      }
+       allow_delay = false;  // Do not delay a single write more than once
+       mutex_.Lock();
+     } else if (!force &&
+@@ -1476,7 +1536,10 @@
+ Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
+   WriteBatch batch;
+   batch.Put(key, value);
+-  return Write(opt, &batch);
++  g_in_put++;
++  Status status = Write(opt, &batch);
++  g_in_put--;
++  return status;
+ }
+ 
+ Status DB::Delete(const WriteOptions& opt, const Slice& key) {

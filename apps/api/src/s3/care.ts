@@ -29,6 +29,27 @@ export function emptyCareState(): CareState {
   return { open: {}, drainingSince: {} };
 }
 
+export const CARE_STATE_KEY = '$care/state';
+
+export function encodeCareState(state: CareState): Buffer {
+  return Buffer.from(JSON.stringify({ open: state.open, drainingSince: state.drainingSince }));
+}
+
+export function decodeCareState(raw: Buffer | null | undefined): CareState {
+  if (!raw || raw.length === 0) {
+    return emptyCareState();
+  }
+  try {
+    const parsed = JSON.parse(raw.toString('utf8')) as Partial<CareState>;
+    if (!parsed.open || !parsed.drainingSince) {
+      return emptyCareState();
+    }
+    return { open: parsed.open, drainingSince: parsed.drainingSince };
+  } catch {
+    return emptyCareState();
+  }
+}
+
 export interface CareInput {
   now: number;
   indexOk: boolean;

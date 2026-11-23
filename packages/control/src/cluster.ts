@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { putSpan, type PutSpan } from 'dleveldb';
 import { blockCompact, blockFlush, blockGet, blockHead, blockPut, blockScan, blockTombstone, blockWriteBegin, type BlockPutMeta } from './block-client.js';
 import { relayChunks } from './stream.js';
 import { compressValue, crc32, decompressValue, parseCompressType, type CompressType } from './compress.js';
@@ -158,9 +159,28 @@ export interface ClusterStats {
     indexSamples: number;
     indexUs: number;
     indexMaxUs: number;
+    /** 确认路径上 kv.put 里，读旧值的墙钟时间。 */
+    indexGetUs: number;
+    indexGetMaxUs: number;
+    /** 确认路径上 kv.put 里，LevelDB 写入的墙钟时间。 */
+    indexWriteUs: number;
+    indexWriteMaxUs: number;
+    /** 确认路径上，总时间减去读取和写入之后剩下的部分。 */
+    indexOtherUs: number;
+    indexOtherMaxUs: number;
+    /** 确认路径上，主副本在本进程的次数。 */
+    indexLocal: number;
+    /** 确认路径上，主副本在别的索引、需要转发的次数。 */
+    indexProxy: number;
     followSamples: number;
     followUs: number;
     followMaxUs: number;
+    localSamples: number;
+    localUs: number;
+    localMaxUs: number;
+    remoteSamples: number;
+    remoteUs: number;
+    remoteMaxUs: number;
   };
 }
 
@@ -213,6 +233,21 @@ export class ObjectCluster {
 
   private owns(address: string): boolean {
     return Boolean(this.local) && endpoint(address) === endpoint(this.local!.address);
+  }
+
+  /** Quorum 1 waits for this process's disk. Majority still follows the key hash. */
+  private ackOrder<T extends { address: string }>(targets: T[], need: number): T[] {
+    if (need !== 1 || !this.local) {
+      return targets;
+    }
+    const index = targets.findIndex((node) => this.owns(node.address));
+    if (index <= 0) {
+      return targets;
+    }
+    const next = targets.slice();
+    const [local] = next.splice(index, 1);
+    next.unshift(local!);
+    return next;
   }
 
   private putBytes(address: string, key: string, value: Buffer, meta?: BlockPutMeta): Promise<ExtentLocator> {
@@ -298,14 +333,33 @@ export class ObjectCluster {
     indexSamples: 0,
     indexUs: 0,
     indexMaxUs: 0,
+    indexGetUs: 0,
+    indexGetMaxUs: 0,
+    indexWriteUs: 0,
+    indexWriteMaxUs: 0,
+    indexOtherUs: 0,
+    indexOtherMaxUs: 0,
+    indexLocal: 0,
+    indexProxy: 0,
     followSamples: 0,
     followUs: 0,
     followMaxUs: 0,
+    localSamples: 0,
+    localUs: 0,
+    localMaxUs: 0,
+    remoteSamples: 0,
+    remoteUs: 0,
+    remoteMaxUs: 0,
   };
 
-  private noteWrite(kind: 'block' | 'index' | 'follow', us: number): void {
+  /** Cumulative write timings for this process. Does not scan the index. */
+  writeSnapshot(): ClusterStats['write'] {
+    return { ...this.writeTimes };
+  }
+
+  private noteWrite(kind: 'local' | 'remote' | 'index' | 'follow', us: number): void {
     const n = us > 0 ? us : 0;
-    if (kind === 'block') {
+    if (kind === 'local' || kind === 'remote') {
       this.writeTimes.blockSamples += 1;
       this.writeTimes.blockUs += n;
       if (n > this.writeTimes.blockMaxUs) {
@@ -316,6 +370,19 @@ export class ObjectCluster {
       }
       if (n >= 1_000_000) {
         this.writeTimes.blockOver1s += 1;
+      }
+      if (kind === 'local') {
+        this.writeTimes.localSamples += 1;
+        this.writeTimes.localUs += n;
+        if (n > this.writeTimes.localMaxUs) {
+          this.writeTimes.localMaxUs = n;
+        }
+      } else {
+        this.writeTimes.remoteSamples += 1;
+        this.writeTimes.remoteUs += n;
+        if (n > this.writeTimes.remoteMaxUs) {
+          this.writeTimes.remoteMaxUs = n;
+        }
       }
       return;
     }
@@ -332,6 +399,27 @@ export class ObjectCluster {
     if (n > this.writeTimes.followMaxUs) {
       this.writeTimes.followMaxUs = n;
     }
+  }
+
+  /** 把确认路径上这一次 kv.put 拆成读取、写入，以及这两段以外的时间。 */
+  private noteIndexSplit(span: PutSpan, wallUs: number): void {
+    const getUs = span.getUs > 0 ? span.getUs : 0;
+    const writeUs = span.writeUs > 0 ? span.writeUs : 0;
+    const otherUs = Math.max(0, wallUs - getUs - writeUs);
+    this.writeTimes.indexGetUs += getUs;
+    this.writeTimes.indexWriteUs += writeUs;
+    this.writeTimes.indexOtherUs += otherUs;
+    if (getUs > this.writeTimes.indexGetMaxUs) {
+      this.writeTimes.indexGetMaxUs = getUs;
+    }
+    if (writeUs > this.writeTimes.indexWriteMaxUs) {
+      this.writeTimes.indexWriteMaxUs = writeUs;
+    }
+    if (otherUs > this.writeTimes.indexOtherMaxUs) {
+      this.writeTimes.indexOtherMaxUs = otherUs;
+    }
+    this.writeTimes.indexLocal += span.local;
+    this.writeTimes.indexProxy += span.proxy;
   }
 
   lostCount(): number {
@@ -422,7 +510,11 @@ export class ObjectCluster {
       throw new ControlError('BLOCK_UNAVAILABLE', layout.reasons.join('; '));
     }
     const objectKey = this.objectKey(bucket, key);
-    const limits = await this.limitsFor(bucket);
+    const cachedLimits = this.limitsCache.get(bucket);
+    const limits =
+      cachedLimits && Date.now() - cachedLimits.at < LIMITS_TTL_MS
+        ? cachedLimits.limits
+        : await this.limitsFor(bucket);
     let previous: ObjectLocator[] | undefined;
     if (typeof limits.quotaBytes === 'number' || limits.shared) {
       previous = await this.locators(objectKey);
@@ -433,9 +525,10 @@ export class ObjectCluster {
     const blockKey = previous && (await this.heldByOthers(previous)) ? this.freshDataKey() : objectKey;
     const packed = compressValue(value, limits.compress === false ? 'none' : this.compressType);
     const digest = crc32(value);
-    const targets = this.registry.pick(objectKey, this.dataReplicas);
     const meta = { compressType: packed.compressType, origSize: value.length, origCrc: digest };
-    const need = writeQuorum(targets.length);
+    const picked = this.registry.pick(objectKey, this.dataReplicas);
+    const need = writeQuorum(picked.length);
+    const targets = this.ackOrder(picked, need);
     this.writeTimes.puts += 1;
     const placed: {
       nodeId: string;
@@ -456,7 +549,7 @@ export class ObjectCluster {
       try {
         const started = process.hrtime.bigint();
         const ev = await this.putBytes(node.address, blockKey, packed.stored, meta);
-        this.noteWrite('block', Number(process.hrtime.bigint() - started) / 1000);
+        this.noteWrite(this.owns(node.address) ? 'local' : 'remote', Number(process.hrtime.bigint() - started) / 1000);
         placed.push({
           nodeId: node.nodeId,
           address: node.address,
@@ -482,7 +575,7 @@ export class ObjectCluster {
       try {
         const started = process.hrtime.bigint();
         const ev = await this.putBytes(node.address, blockKey, packed.stored, meta);
-        this.noteWrite('block', Number(process.hrtime.bigint() - started) / 1000);
+        this.noteWrite(this.owns(node.address) ? 'local' : 'remote', Number(process.hrtime.bigint() - started) / 1000);
         placed.push({
           nodeId: node.nodeId,
           address: node.address,
@@ -514,18 +607,39 @@ export class ObjectCluster {
       ...(blockKey === objectKey ? {} : { dataKey: blockKey }),
     };
     const written: string[] = [];
+    const span: PutSpan = { getUs: 0, writeUs: 0, local: 0, proxy: 0 };
     const indexStarted = process.hrtime.bigint();
+    const direct = this.kv as { putNow?(key: string, value: Buffer): void };
     try {
-      for (let i = 0; i < placed.length; i++) {
-        const ev = placed[i]!;
-        const indexKey = locatorKey(objectKey, i);
-        await this.kv.put(
-          indexKey,
-          Buffer.from(JSON.stringify({ ...body, ...ev, replica: i, replicaCount: placed.length })),
-        );
-        written.push(indexKey);
+      if (direct.putNow) {
+        const writeIndex = direct.putNow.bind(direct);
+        putSpan.run(span, () => {
+          for (let i = 0; i < placed.length; i++) {
+            const ev = placed[i]!;
+            const indexKey = locatorKey(objectKey, i);
+            writeIndex(
+              indexKey,
+              Buffer.from(JSON.stringify({ ...body, ...ev, replica: i, replicaCount: placed.length })),
+            );
+            written.push(indexKey);
+          }
+        });
+      } else {
+        await putSpan.run(span, async () => {
+          for (let i = 0; i < placed.length; i++) {
+            const ev = placed[i]!;
+            const indexKey = locatorKey(objectKey, i);
+            await this.kv.put(
+              indexKey,
+              Buffer.from(JSON.stringify({ ...body, ...ev, replica: i, replicaCount: placed.length })),
+            );
+            written.push(indexKey);
+          }
+        });
       }
-      this.noteWrite('index', Number(process.hrtime.bigint() - indexStarted) / 1000);
+      const indexUs = Number(process.hrtime.bigint() - indexStarted) / 1000;
+      this.noteWrite('index', indexUs);
+      this.noteIndexSplit(span, indexUs);
     } catch (err) {
       await Promise.all(written.map((indexKey) => this.kv.delete(indexKey).catch(() => false)));
       throw err;
@@ -533,10 +647,11 @@ export class ObjectCluster {
     if (previous && blockKey !== objectKey) {
       await Promise.all(previous.map((item) => this.releaseLocator(item, objectKey)));
     }
-    await this.addUsage(bucket, value.length - (previous?.[0]?.size ?? 0), limits);
+    if (typeof limits.quotaBytes === 'number') {
+      await this.addUsage(bucket, value.length - (previous?.[0]?.size ?? 0), limits);
+    }
     const known = new Set(placed.map((ev) => ev.address));
     const follow = (async () => {
-      await this.noteChange('put', bucket, key).catch(() => undefined);
       let count = placed.length;
       for (const node of pending) {
         try {
@@ -547,30 +662,27 @@ export class ObjectCluster {
             continue;
           }
           known.add(node.address);
-          await this.kv.put(
-            locatorKey(objectKey, count),
-            Buffer.from(
-              JSON.stringify({
-                ...body,
-                nodeId: node.nodeId,
-                address: node.address,
-                recId: ev.recId,
-                chained: ev.chained,
-                generation: ev.generation,
-                extentCount: ev.extentCount,
-                storedSize: ev.size,
-                mtimeMs: ev.mtimeMs,
-                replica: count,
-                replicaCount: count + 1,
-              }),
-            ),
+          const followValue = Buffer.from(
+            JSON.stringify({
+              ...body,
+              nodeId: node.nodeId,
+              address: node.address,
+              recId: ev.recId,
+              chained: ev.chained,
+              generation: ev.generation,
+              extentCount: ev.extentCount,
+              storedSize: ev.size,
+              mtimeMs: ev.mtimeMs,
+              replica: count,
+              replicaCount: count + 1,
+            }),
           );
+          if (direct.putNow) {
+            direct.putNow(locatorKey(objectKey, count), followValue);
+          } else {
+            await this.kv.put(locatorKey(objectKey, count), followValue);
+          }
           count += 1;
-          const primary = placed[0]!;
-          await this.kv.put(
-            locatorKey(objectKey, 0),
-            Buffer.from(JSON.stringify({ ...body, ...primary, replica: 0, replicaCount: count })),
-          );
         } catch {
           // 本机这份已经返回。这一份失败留给后面的修补。
         }
@@ -667,15 +779,15 @@ export class ObjectCluster {
       return [];
     }
     const primary = parseLocator(primaryRaw.value);
-    const count = Math.max(primary?.replicaCount ?? 3, 1);
+    const cap = Math.max(this.dataReplicas, primary?.replicaCount ?? 0, 1);
     const out: ObjectLocator[] = [];
     if (primary) {
       out.push(primary);
     }
-    for (let i = 1; i < count; i++) {
+    for (let i = 1; i < cap; i++) {
       const raw = await this.kv.get(locatorKey(objectKey, i));
       if (!raw) {
-        continue;
+        break;
       }
       const parsed = parseLocator(raw.value);
       if (parsed) {
@@ -789,6 +901,11 @@ export class ObjectCluster {
     const objectKey = this.objectKey(bucket, key);
     const locs = await this.locators(objectKey);
     if (locs.length === 0) {
+      // 列表能扫到写在非主分片上的残留。get 看不到它们，所以这里仍然把 key 从各份索引删掉。
+      await this.kv.delete(objectKey).catch(() => false);
+      for (let replica = 1; replica < this.dataReplicas; replica += 1) {
+        await this.kv.delete(locatorKey(objectKey, replica)).catch(() => false);
+      }
       return false;
     }
     await Promise.allSettled(locs.map((loc) => this.releaseLocator(loc, objectKey)));
@@ -1065,6 +1182,7 @@ export class ObjectCluster {
         report.scanned++;
         const result = await this.repairObject(obj.key, paused);
         report[result]++;
+        await new Promise((resolve) => setImmediate(resolve));
         if (report.scanned >= maxObjects) {
           break;
         }

@@ -61,6 +61,26 @@ class MemBackend implements S3Backend {
   }
 }
 
+class StreamBackend extends MemBackend {
+  putCalls = 0;
+
+  override async put(bucket: string, key: string, value: Buffer): Promise<void> {
+    this.putCalls += 1;
+    await super.put(bucket, key, value);
+  }
+
+  async putStream(bucket: string, key: string, chunks: AsyncIterable<Buffer>): Promise<{ size: number; crc: number }> {
+    const parts: Buffer[] = [];
+    for await (const chunk of chunks) {
+      parts.push(Buffer.from(chunk));
+    }
+    const body = Buffer.concat(parts);
+    await this.createBucket(bucket);
+    this.objects.set(`${bucket}/${key}`, { body, mtimeMs: 1_000 });
+    return { size: body.length, crc: crc32(body) };
+  }
+}
+
 function call(backend: MemBackend, init: Partial<S3Request> & { method: string; path: string }, options = {}) {
   const url = new URL(init.path, 'http://127.0.0.1:9000');
   const uploads = (options as { uploads?: MultipartUploads }).uploads ?? new MultipartUploads();
@@ -534,6 +554,27 @@ describe('s3 surface that was still open', () => {
     expect(done.status).toBe(200);
     const got = await call(backend, { method: 'GET', path: '/logs/part.bin' });
     expect(got.body.toString()).toBe('bcde');
+  });
+
+  test('encrypted multipart complete seals each part without one plaintext buffer', async () => {
+    const backend = new StreamBackend();
+    const uploads = new MultipartUploads();
+    const options = { uploads, sseSecret: 'test-secret' };
+    const created = await call(backend, { method: 'POST', path: '/logs/sealed.bin?uploads' }, options);
+    const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(created.body.toString())?.[1] ?? '';
+    const part1 = await call(backend, { method: 'PUT', path: `/logs/sealed.bin?partNumber=1&uploadId=${uploadId}`, body: Buffer.from('aaaa') }, options);
+    const part2 = await call(backend, { method: 'PUT', path: `/logs/sealed.bin?partNumber=2&uploadId=${uploadId}`, body: Buffer.from('bbbbbb') }, options);
+    const etag = (res: { headers: Record<string, string> }) => res.headers.ETag ?? res.headers.etag ?? '';
+    const xml = `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>${etag(part1)}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>${etag(part2)}</ETag></Part></CompleteMultipartUpload>`;
+    const done = await call(
+      backend,
+      { method: 'POST', path: `/logs/sealed.bin?uploadId=${uploadId}`, body: Buffer.from(xml), headers: { 'x-amz-server-side-encryption': 'AES256' } },
+      options,
+    );
+    expect(done.status).toBe(200);
+    expect(backend.putCalls).toBe(0);
+    const got = await call(backend, { method: 'GET', path: '/logs/sealed.bin' }, options);
+    expect(got.body.toString()).toBe('aaaabbbbbb');
   });
 
   test('copy refuses a source that fails if-match or if-unmodified-since', async () => {

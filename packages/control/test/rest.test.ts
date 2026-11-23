@@ -262,7 +262,7 @@ describe('remaining designs', () => {
     }
   });
 
-  test('a change sent to another cluster stays after the source delete', async () => {
+  test('a put does not enter the change journal', async () => {
     const box = open();
     try {
       await box.cluster.put('logs', 'a.txt', Buffer.from('keep'));
@@ -272,10 +272,9 @@ describe('remaining designs', () => {
           target.set(`${bucket}/${key}`, Buffer.from(value));
         },
       });
-      expect(sent.sent).toBe(1);
-      await box.cluster.delete('logs', 'a.txt');
-      expect(target.get('logs/a.txt')?.toString('utf8')).toBe('keep');
-      expect(await box.cluster.get('logs', 'a.txt')).toBeNull();
+      expect(sent.sent).toBe(0);
+      expect(target.size).toBe(0);
+      expect(await box.cluster.get('logs', 'a.txt')).not.toBeNull();
     } finally {
       box.restore();
     }
@@ -325,9 +324,9 @@ describe('remaining designs', () => {
       await box.cluster.put('logs', 'a.txt', Buffer.from('keep'));
       expect(await box.cluster.replicationProgress()).toEqual({ sent: 0, pending: 0 });
       await box.cluster.sendChanges({ put: async () => {} });
-      expect(await box.cluster.replicationProgress()).toEqual({ sent: 1, pending: 0 });
-      await box.cluster.put('logs', 'b.txt', Buffer.from('next'));
-      expect(await box.cluster.replicationProgress()).toEqual({ sent: 1, pending: 1 });
+      expect(await box.cluster.replicationProgress()).toEqual({ sent: 0, pending: 0 });
+      await box.cluster.delete('logs', 'a.txt');
+      expect(await box.cluster.replicationProgress()).toEqual({ sent: 0, pending: 1 });
     } finally {
       box.restore();
     }

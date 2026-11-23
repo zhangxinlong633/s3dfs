@@ -1,0 +1,56 @@
+:root {
+  color-scheme: dark;
+  --bg: #0f1419;
+  --panel: #1a222b;
+  --text: #e8eef4;
+  --muted: #93a0ad;
+  --accent: #6ee7b7;
+  --line: #2a3541;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+main { max-width: 1080px; margin: 0 auto; padding: 40px 24px 64px; }
+h1 { font-size: 28px; font-weight: 600; margin: 0 0 8px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 12px; }
+p.lead { color: var(--muted); margin: 0 0 32px; line-height: 1.6; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 16px 18px;
+}
+.card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.card .value { font-size: 22px; margin-top: 6px; font-variant-numeric: tabular-nums; word-break: break-all; }
+section { margin-top: 28px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 14px; }
+th { color: var(--muted); font-weight: 500; }
+button, input, textarea {
+  font: inherit;
+}
+input, textarea {
+  background: #11171d;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  width: 100%;
+}
+textarea { min-height: 88px; resize: vertical; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+.row > input { flex: 1; min-width: 180px; }
+button {
+  background: transparent;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+button:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.err { color: #fca5a5; }
+.ok { color: var(--accent); }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }

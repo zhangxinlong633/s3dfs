@@ -77,14 +77,13 @@ packages/control index client, placement, health checks
 docs/            product and design documents
 ```
 
-The in-tree `packages/dleveldb` directory is historical and is not part of the build. Run the sibling dleveldb repository as the index.
+Index source lives in `dleveldb/` at the repository root. `packages/dleveldb` only keeps the old path note.
 
 ## Start
 
-Requires Node 26, pnpm 9, Bun 1.4+, a C/C++ compiler, and a dleveldb checkout at `../dleveldb`. Product code is TypeScript and C. node-gyp may call a local Python while compiling the engine; that Python is not a product language. The constraint is in [Architecture](docs/architecture.md).
+Requires Node 26, pnpm 9, Bun 1.4+, and a C/C++ compiler. Index source is already in `dleveldb/`. Product code is TypeScript and C. node-gyp may call a local Python while compiling the engine; that Python is not a product language. The constraint is in [Architecture](docs/architecture.md).
 
 ```bash
-git clone https://github.com/zhangxinlong633/dleveldb.git
 git clone https://github.com/zhangxinlong633/s3dfs.git
 cd s3dfs
 pnpm install

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const dleveldbCli = path.resolve(root, '../dleveldb/packages/dleveldb/src/dleveldb.ts');
+const dleveldbCli = path.resolve(root, 'dleveldb/packages/dleveldb/src/dleveldb.ts');
 const blockMain = path.join(root, 'apps/api/src/engine/disk.ts');
 const bun = process.env.BUN_BIN ?? 'bun';
 process.env.S3DFS_STRICT_LAYOUT ??= '0';

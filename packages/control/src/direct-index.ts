@@ -13,6 +13,10 @@ export class DirectIndex {
     await this.db.put(key, value);
   }
 
+  putNow(key: string, value: Buffer): void {
+    this.db.putNow(key, value);
+  }
+
   async get(key: string): Promise<KvValue | null> {
     const found = await this.db.get(key);
     if (!found) {

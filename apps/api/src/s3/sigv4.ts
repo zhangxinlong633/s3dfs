@@ -142,7 +142,7 @@ export function signRequest(secret: string, req: SignedRequest, amzDate: string,
   return hmac(signingKey(secret, date, region, service), stringToSign(req, amzDate, scope)).toString('hex');
 }
 
-function sameHex(a: string, b: string): boolean {
+export function sameHex(a: string, b: string): boolean {
   const left = Buffer.from(a.toLowerCase());
   const right = Buffer.from(b.toLowerCase());
   return left.length === right.length && timingSafeEqual(left, right);

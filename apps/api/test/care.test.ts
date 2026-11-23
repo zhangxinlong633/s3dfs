@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { deliverCare, emptyCareState, reviewCare, type CareInput } from '../src/s3/care';
+import { decodeCareState, deliverCare, emptyCareState, encodeCareState, reviewCare, type CareInput } from '../src/s3/care';
 
 function input(partial: Partial<CareInput> = {}): CareInput {
   return {
@@ -92,6 +92,14 @@ describe('care delivery', () => {
     });
     expect(first).toBe(false);
     const again = reviewCare(opened.state, input());
+    expect(again.pending[0]?.id).toBe(opened.pending[0]?.id);
+  });
+
+  test('an open incident survives a restart of the saved state', () => {
+    const opened = reviewCare(emptyCareState(), input());
+    const loaded = decodeCareState(encodeCareState(opened.state));
+    const again = reviewCare(loaded, input());
+    expect(Object.keys(loaded.open)).toEqual(Object.keys(opened.state.open));
     expect(again.pending[0]?.id).toBe(opened.pending[0]?.id);
   });
 });

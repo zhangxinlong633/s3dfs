@@ -29,5 +29,10 @@
   },
   "devDependencies": {
     "typescript": "7.0.2"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "classic-level@3.0.0": "patches/classic-level@3.0.0.patch"
+    }
   }
 }

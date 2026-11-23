@@ -4,7 +4,7 @@ import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import { assertProductionAuth } from './s3/auth-gate';
-import { openRequestBody, readAllBody } from './s3/body-stream';
+import { openRequestBody } from './s3/body-stream';
 import { errorXml } from './s3/s3.xml';
 
 type RawRequest = IncomingMessage & { rawBody?: Buffer; bodyStream?: AsyncIterable<Buffer>; originalUrl?: string };
@@ -30,10 +30,7 @@ async function bootstrap() {
       return;
     }
     const maxBytes = Number(process.env.S3DFS_MAX_OBJECT_BYTES ?? 1024 * 1024 * 1024);
-    const sha = String(req.headers['x-amz-content-sha256'] ?? '');
-    const encoding = String(req.headers['content-encoding'] ?? '');
-    const chunked = encoding.toLowerCase().includes('aws-chunked') || sha.startsWith('STREAMING-');
-    const pending = chunked ? readAllBody(req, maxBytes).then((body) => ({ body })) : openRequestBody(req, maxBytes);
+    const pending = openRequestBody(req, maxBytes);
     void pending
       .then((opened) => {
         if ('body' in opened) {
@@ -57,7 +54,8 @@ async function bootstrap() {
       });
   });
 
-  const port = Number(process.env.S3DFS_API_PORT ?? 9000);
+  const staged = process.env.S3DFS_STAGES === '1';
+  const port = Number(staged ? (process.env.S3DFS_STAGE_BACKEND ?? 9010) : (process.env.S3DFS_API_PORT ?? 9000));
   await app.listen(port, '0.0.0.0');
 }
 

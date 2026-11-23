@@ -144,7 +144,17 @@ export class S3Controller {
         res.status(status).json({ indexOk, lost, lostKeys, zones, ...layout, layout, ok });
         return;
       }
+      if (url.pathname === '/_s3dfs/timing' && req.method === 'GET') {
+        status = 200;
+        res.status(status).json(this.engine.timing());
+        return;
+      }
       if (url.pathname === '/_s3dfs/metrics' && req.method === 'GET') {
+        if (!adminWriteAllowed({ headers: req.headers, env: process.env, path: url.pathname, method: 'GET' })) {
+          status = 401;
+          res.status(status).end();
+          return;
+        }
         status = 200;
         res.status(status).json(this.metrics.snapshot());
         return;

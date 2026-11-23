@@ -56,9 +56,13 @@ struct s3dfs_job {
     void (*fn)(void *);
     void *arg;
     int done;
+    uint64_t queued_us;
     pthread_cond_t cv;
     s3dfs_job *next;
 };
+
+void s3dfs_stat_add(uint64_t *sum, uint64_t *max_us, uint64_t *count, uint64_t value);
+void s3dfs_stat_max(uint64_t *max_value, uint64_t value);
 
 struct s3dfs_store {
     char data_dir[4096];

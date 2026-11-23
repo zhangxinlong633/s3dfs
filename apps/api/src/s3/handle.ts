@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { crc32, parseByteRange, type ObjectValue } from '@s3dfs/control';
-import { AwsChunkError, objectBytes } from './aws-chunked';
+import { AwsChunkError, isAwsChunked, objectBytes, openAwsChunked } from './aws-chunked';
 import { MultipartUploads, S3HttpError, parseCompleteParts } from './multipart';
 import { grantAllows, type IamDirectory, type IamGrant } from './iam';
 import {
@@ -230,9 +230,13 @@ function accessKeyIdOf(req: S3Request): string | undefined {
 
 function verifyStreaming(req: S3Request, secret: string, signed: { scope: string; amzDate: string; signature: string }): void {
   const sha = header(req.headers, 'x-amz-content-sha256') ?? '';
-  if (sha.startsWith('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) {
-    verifyChunkSignatures(req.body, secret, signed.scope, signed.amzDate, signed.signature);
+  if (!sha.startsWith('STREAMING-AWS4-HMAC-SHA256-PAYLOAD')) {
+    return;
   }
+  if (req.body.length === 0 && req.bodyStream) {
+    return;
+  }
+  verifyChunkSignatures(req.body, secret, signed.scope, signed.amzDate, signed.signature);
 }
 
 async function authenticate(req: S3Request, options: S3Options): Promise<{ account?: AccessAccount; grant?: IamGrant }> {
@@ -1058,11 +1062,22 @@ async function handleObject(
   }
   if (uploadId && method === 'POST') {
     const declared = parseCompleteParts(payload(req).toString('utf8'));
-    if (backend.putStream && !header(req.headers, 'x-amz-server-side-encryption')) {
-      await backend.putStream(bucket, key, uploads.eachPart(bucket, key, uploadId, declared));
+    const bucketConfig = options.config ? await options.config.get(bucket) : {};
+    const sseHeader = (header(req.headers, 'x-amz-server-side-encryption') ?? '').toUpperCase();
+    const seal = sseHeader === 'AES256' || (!sseHeader && bucketConfig.encryption?.algorithm === 'AES256');
+    if (backend.putStream) {
+      if (seal && !options.sseSecret) {
+        return xml(400, errorXml('InvalidRequest', 'S3DFS_SSE_KEY is not configured'));
+      }
+      if (sseHeader && sseHeader !== 'AES256') {
+        return xml(400, errorXml('InvalidArgument', 'Only AES256 server-side encryption is supported'));
+      }
+      const parts = uploads.eachPart(bucket, key, uploadId, declared);
+      const stream = seal && options.sseSecret ? sealFrames(parts, options.sseSecret) : parts;
+      await backend.putStream(bucket, key, stream);
     } else {
       const body = await uploads.complete(bucket, key, uploadId, declared);
-      await backend.put(bucket, key, await maybeSeal(req, body, options, config.encryption));
+      await backend.put(bucket, key, await maybeSeal(req, body, options, bucketConfig.encryption));
     }
     await uploads.finish(uploadId);
     const meta = await backend.head(bucket, key);
@@ -1143,6 +1158,15 @@ async function handleObject(
       return xml(200, copyObjectXml(etag, new Date(meta?.mtimeMs ?? Date.now()).toISOString()), etagHeaders(meta?.crc ?? 0));
     }
     await backend.createBucket(bucket);
+    if (req.bodyStream && isAwsChunked({ encoding: header(req.headers, 'content-encoding'), contentSha: header(req.headers, 'x-amz-content-sha256') })) {
+      const auth = header(req.headers, 'authorization') ?? '';
+      const secret = options.credentials?.secretAccessKey;
+      const scope = /Credential=[^/]+\/([^,\s]+)/.exec(auth)?.[1] ?? '';
+      const seed = /Signature=([0-9a-fA-F]{64})/.exec(auth)?.[1] ?? '';
+      const amzDate = header(req.headers, 'x-amz-date') ?? '';
+      const verify = secret && scope && seed && amzDate ? { secret, scope, amzDate, seed } : undefined;
+      req = { ...req, bodyStream: openAwsChunked(req.bodyStream, verify).stream };
+    }
     const sse = (header(req.headers, 'x-amz-server-side-encryption') ?? '').toUpperCase();
     if (req.bodyStream && sse && sse !== 'AES256') {
       return xml(400, errorXml('InvalidArgument', 'Only AES256 server-side encryption is supported'));

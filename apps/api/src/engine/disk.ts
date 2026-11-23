@@ -1,11 +1,14 @@
 import { accessSync, constants, statfsSync } from 'node:fs';
 import path from 'node:path';
 import { BACK_PREFIX, IndexClient, nodeKey, parseIndexUrls, writeLayoutFile, type BlockNodeInfo, type BlockState, type DiskState, type ExtentLocator, type KvIndex, type LocalDisk, type ObjectValue } from '@s3dfs/control';
-import { Store, type PutMeta } from '@s3dfs/engine';
+import { Store, type PutMeta, type StageJob, type StoreStats } from '@s3dfs/engine';
 
 export interface RunningDisk {
   address: string;
   local: LocalDisk;
+  stats(): StoreStats;
+  serveStages(options: { port: number; backend: number; netThreads: number; blkThreads: number; accessKey: string; secret: string }, onIndexed: (job: StageJob) => void): void;
+  stageReply(id: number, status?: number): void;
   stop(): void;
 }
 
@@ -216,9 +219,18 @@ export function startDisk(kv?: KvIndex): RunningDisk {
     },
   };
 
+  const stats = () => store.stats();
+
   return {
     address: advertise,
     local,
+    stats,
+    serveStages(options, onIndexed) {
+      store.serveStages(options, onIndexed);
+    },
+    stageReply(id, status) {
+      store.stageReply(id, status);
+    },
     stop() {
       clearInterval(flushTimer);
       clearInterval(healthTimer);

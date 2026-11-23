@@ -32,7 +32,7 @@ typedef struct s3dfs_options {
     uint64_t block_size;  /* default 1 GiB */
     uint32_t buffer_size; /* default 1 MiB group-commit buffer */
     int fsync_on_flush;   /* default 1 */
-    int writers;          /* open block files, one write thread each; default 8, max 16 */
+    int writers;          /* open block files, one write thread each; default 8, max 32 */
 } s3dfs_options;
 
 typedef struct s3dfs_stats {
@@ -63,6 +63,18 @@ typedef struct s3dfs_stats {
     uint64_t sync_hold_max_us;
     uint64_t fsync_us;
     uint64_t fsync_max_us;
+    /* Lane queue: wait before a write thread runs the job, and the deepest queue seen. */
+    uint64_t lane_wait_us;
+    uint64_t lane_wait_max_us;
+    uint64_t lane_waits;
+    uint64_t lane_depth_max;
+    /* Object bytes pwrite, then the 4-byte recId slot pwrite. */
+    uint64_t body_us;
+    uint64_t body_max_us;
+    uint64_t body_writes;
+    uint64_t slot_us;
+    uint64_t slot_max_us;
+    uint64_t slot_writes;
 } s3dfs_stats;
 
 /* Optional attributes written as TLV tags so a later index rebuild can

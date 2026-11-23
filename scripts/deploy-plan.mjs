@@ -50,13 +50,13 @@ export function planDeploy(input) {
     host,
     port: portFor(blockHosts, index, blockPort),
     zone: zones[index % zones.length],
-    dataDir: `${dataRoot}/block/block${index + 1}`,
+    dataDir: input.blockDataDir ? `${dataRoot}/${input.blockDataDir}` : `${dataRoot}/block/block${index + 1}`,
   }));
   const indexNodes = indexHosts.map((host, index) => ({
     id: `index${index + 1}`,
     host,
     port: portFor(indexHosts, index, indexPort),
-    dataDir: `${dataRoot}/index/index${index + 1}`,
+    dataDir: input.indexDataDir ? `${dataRoot}/${input.indexDataDir}` : `${dataRoot}/index/index${index + 1}`,
   }));
   const apiNodes = blocks.map((node) => ({
     id: node.id,
@@ -453,6 +453,8 @@ export function configFromEnvText(text) {
     indexHosts: raw.indexHosts,
     apiHosts: raw.apiHosts,
     dataRoot: raw.dataRoot,
+    blockDataDir: raw.blockDataDir,
+    indexDataDir: raw.indexDataDir,
     installRoot: raw.installRoot,
     indexRoot: raw.indexRoot,
     strictLayout: raw.strictLayout,

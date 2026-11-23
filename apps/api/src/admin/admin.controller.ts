@@ -8,7 +8,8 @@ export class AdminController {
   constructor(private readonly engine: EngineService) {}
 
   @Get('stats')
-  async stats() {
+  async stats(@Req() req: Request) {
+    this.allow(req);
     const stats = await this.engine.stats();
     return {
       ...stats,
@@ -19,12 +20,14 @@ export class AdminController {
   }
 
   @Get('cluster')
-  async cluster() {
+  async cluster(@Req() req: Request) {
+    this.allow(req);
     return this.engine.stats();
   }
 
   @Get('buckets')
-  async buckets() {
+  async buckets(@Req() req: Request) {
+    this.allow(req);
     return { buckets: await this.engine.listBuckets() };
   }
 
@@ -147,7 +150,7 @@ export class AdminController {
 
   private allow(req: Request): void {
     const path = new URL(req.originalUrl || req.url, 'http://127.0.0.1').pathname;
-    if (!adminWriteAllowed({ headers: req.headers, env: process.env, path })) {
+    if (!adminWriteAllowed({ headers: req.headers, env: process.env, path, method: req.method })) {
       throw new UnauthorizedException();
     }
   }

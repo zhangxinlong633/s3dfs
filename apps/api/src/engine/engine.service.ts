@@ -5,9 +5,12 @@ import {
   DirectIndex,
   IndexClient,
   NodeRegistry,
-  ObjectCluster,
-  loadScaleConfig,
+  blockPut,
+  locatorKey,
   parseBlockNodes,
+  ObjectCluster,
+  assessLayout,
+  loadScaleConfig,
   parseIndexUrls,
   strictLayoutEnabled,
   type ClusterStats,
@@ -19,8 +22,10 @@ import { IndexConfigStore, IndexUploadStore } from '../s3/index-store';
 import { MultipartUploads } from '../s3/multipart';
 import { applyLifecycle } from '../s3/product';
 import { startDisk, type RunningDisk } from './disk';
+import { countLocators } from './locator-count';
+import type { StageJob } from '@s3dfs/engine';
 import { alertBodies, postAlerts } from '../s3/alerts';
-import { deliverCare, emptyCareState, markCareDelivered, reviewCare, type CareIncident, type CareState } from '../s3/care';
+import { CARE_STATE_KEY, deliverCare, decodeCareState, emptyCareState, encodeCareState, markCareDelivered, reviewCare, type CareIncident, type CareState } from '../s3/care';
 import { compactSnapshot, executePatrol, reviewPatrol, type PatrolReport, type PatrolSnapshot } from '../s3/patrol';
 import {
   acquireScaleLease,
@@ -100,6 +105,10 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
       this.disk = startDisk(this.kv);
     }
     this.cluster = new ObjectCluster(this.kv, this.registry, dataReplicas, undefined, this.disk?.local);
+    await this.loadCare();
+    if (process.env.S3DFS_STAGES === '1') {
+      this.startStages();
+    }
     await this.registry.checkAll();
     const interval = Number(process.env.S3DFS_HEALTH_INTERVAL_MS ?? 5000);
     this.timer = setInterval(() => {
@@ -142,6 +151,103 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
       }, scaleEvery);
       this.scaleTimer.unref();
     }
+  }
+
+  /** 网络线程收完就交给块线程。索引写完后，响应回到网络线程。另外两份副本在响应之后。 */
+  private startStages(): void {
+    const accessKey = process.env.S3DFS_ACCESS_KEY ?? '';
+    const secret = process.env.S3DFS_SECRET_KEY ?? '';
+    const port = Number(process.env.S3DFS_API_PORT ?? 9000);
+    const backend = Number(process.env.S3DFS_STAGE_BACKEND ?? 9010);
+    const netThreads = Math.max(1, Number(process.env.S3DFS_NET_THREADS ?? 8) || 8);
+    const blkThreads = Math.max(1, Number(process.env.S3DFS_BLOCK_WRITE_THREADS ?? 32) || 32);
+    if (!this.disk || !accessKey || !secret) {
+      throw new ControlError('BLOCK_UNAVAILABLE', 'staged replies need the local disk and access keys');
+    }
+    this.disk.serveStages({ port, backend, netThreads, blkThreads, accessKey, secret }, (job) => this.onStage(job));
+    console.log(`s3dfs stages listening on :${port}, nest on :${backend}, net ${netThreads}, blk ${blkThreads}`);
+  }
+
+  private onStage(job: StageJob): void {
+    const direct = this.kv as { putNow?(key: string, value: Buffer): void };
+    try {
+      const replicas = Math.max(1, Number(process.env.S3DFS_DATA_REPLICAS ?? 3) || 3);
+      const layout = assessLayout(this.registry.list(), replicas);
+      if (layout.strict && !layout.ok) {
+        this.disk?.stageReply(job.id, 503);
+        return;
+      }
+      if (!direct.putNow) {
+        this.disk?.stageReply(job.id, 500);
+        return;
+      }
+      const nodeId = process.env.S3DFS_BLOCK_NODE_ID ?? 'block1';
+      const address = process.env.S3DFS_BLOCK_ADVERTISE ?? '';
+      const loc = job.locator;
+      direct.putNow(
+        job.objectKey,
+        Buffer.from(
+          JSON.stringify({
+            v: 3,
+            size: job.size,
+            compressType: 'none',
+            crc: job.crc,
+            segments: [job.crc],
+            segmentBytes: 64 * 1024,
+            nodeId,
+            address,
+            recId: loc.recId,
+            chained: loc.chained,
+            generation: loc.generation,
+            extentCount: loc.extentCount,
+            storedSize: loc.size,
+            mtimeMs: loc.mtimeMs,
+            replica: 0,
+            replicaCount: 1,
+          }),
+        ),
+      );
+      this.disk?.stageReply(job.id, 200);
+      this.stageFollow(job);
+    } catch {
+      this.disk?.stageReply(job.id, 500);
+    }
+  }
+
+  private stageFollow(job: StageJob): void {
+    const local = process.env.S3DFS_BLOCK_ADVERTISE ?? '';
+    const direct = this.kv as { putNow?(key: string, value: Buffer): void };
+    const others = parseBlockNodes(process.env.S3DFS_BLOCK_NODES).filter((node) => node.address !== local);
+    others.forEach((node, index) => {
+      const replica = index + 1;
+      void blockPut(node.address, job.objectKey, job.body, { compressType: 'none', origSize: job.size, origCrc: job.crc })
+        .then((ev) => {
+          direct.putNow?.(
+            locatorKey(job.objectKey, replica),
+            Buffer.from(
+              JSON.stringify({
+                v: 3,
+                size: job.size,
+                compressType: 'none',
+                crc: job.crc,
+                segments: [job.crc],
+                segmentBytes: 64 * 1024,
+                nodeId: node.nodeId,
+                address: node.address,
+                recId: ev.recId,
+                chained: ev.chained,
+                generation: ev.generation,
+                extentCount: ev.extentCount,
+                storedSize: ev.size,
+                mtimeMs: ev.mtimeMs,
+                replica,
+                replicaCount: replica + 1,
+              }),
+            ),
+          );
+        })
+        .catch(() => undefined);
+    });
   }
 
   async onModuleDestroy(): Promise<void> {
@@ -310,6 +416,14 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     return this.cluster.stats();
   }
 
+  /** Write-path counters for this process and its local disk. No index scan. */
+  timing(): { write: ClusterStats['write']; disk: ReturnType<RunningDisk['stats']> | null } {
+    return {
+      write: this.cluster.writeSnapshot(),
+      disk: this.disk ? this.disk.stats() : null,
+    };
+  }
+
   async repair(): Promise<RepairReport> {
     const report = await this.cluster.repair();
     this.lastRepair = report;
@@ -365,7 +479,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
           zone: node.zone,
           bytesOnDisk: node.stats?.bytesOnDisk ?? 0,
           deadBytes: node.stats?.deadBytes ?? 0,
-          locators: counts === 'incomplete' ? 1 : (counts.get(node.nodeId) ?? 0),
+          locators: counts.get(node.nodeId) ?? 0,
           draining: Boolean(node.draining),
           unflushedBytes: node.stats?.unflushedBytes ?? 0,
           disk: node.disk,
@@ -487,7 +601,7 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
         nodeId: node.nodeId,
         address: node.address,
         zone: node.zone,
-        locators: counts === 'incomplete' ? 1 : (counts.get(node.nodeId) ?? 0),
+        locators: counts.get(node.nodeId) ?? 0,
       }));
       const quiet = { keys: 0, bytes: 0, inflight: 0, latencyP99Ms: 0, nodes: 1, streak: 0, lastActionMs: 0 };
       const memory = await readScaleMemory(this.kv);
@@ -535,39 +649,14 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async locatorCounts(): Promise<Map<string, number> | 'incomplete'> {
-    const counts = new Map<string, number>();
-    let startAfter: string | undefined;
-    let scanned = 0;
-    while (scanned < 20_000) {
-      const page = await this.kv.scan({ prefix: '', startAfter, maxKeys: 500 });
-      if (page.objects.length === 0) {
-        return counts;
-      }
-      for (const obj of page.objects) {
-        scanned += 1;
-        startAfter = obj.key;
-        if (obj.key.startsWith('$')) {
-          continue;
-        }
-        const raw = await this.kv.get(obj.key);
-        if (!raw) {
-          continue;
-        }
-        try {
-          const loc = JSON.parse(raw.value.toString('utf8')) as { v?: number; nodeId?: string };
-          if (loc.v === 3 && loc.nodeId) {
-            counts.set(loc.nodeId, (counts.get(loc.nodeId) ?? 0) + 1);
-          }
-        } catch {
-          // Not a locator.
-        }
-      }
-      if (!page.truncated) {
-        return counts;
-      }
-    }
-    return 'incomplete';
+  private locatorCounts(): Promise<Map<string, number>> {
+    return countLocators(
+      async (startAfter) => this.kv.scan({ prefix: '', startAfter, maxKeys: 500 }),
+      async (key) => {
+        const raw = await this.kv.get(key);
+        return raw ? raw.value : null;
+      },
+    );
   }
 
   private async reviewCare(repairLost: number): Promise<void> {
@@ -607,6 +696,16 @@ export class EngineService implements OnModuleInit, OnModuleDestroy {
       if (delivered && incident.severity === 'action_needed') {
         this.careState = markCareDelivered(this.careState, incident.id);
       }
+    }
+    await this.kv.put(CARE_STATE_KEY, encodeCareState(this.careState)).catch(() => false);
+  }
+
+  private async loadCare(): Promise<void> {
+    const saved = await this.kv.get(CARE_STATE_KEY).catch(() => null);
+    this.careState = decodeCareState(saved?.value);
+    this.incidents.clear();
+    for (const item of Object.values(this.careState.open)) {
+      this.incidents.set(item.incident.id, item.incident);
     }
   }
 

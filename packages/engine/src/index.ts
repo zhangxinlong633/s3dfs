@@ -81,6 +81,16 @@ export interface StoreStats {
   deadBytes: number;
   tickets: number;
   unflushedBytes: number;
+  laneWaitUs?: number;
+  laneWaitMaxUs?: number;
+  laneWaits?: number;
+  laneDepthMax?: number;
+  bodyUs?: number;
+  bodyMaxUs?: number;
+  bodyWrites?: number;
+  slotUs?: number;
+  slotMaxUs?: number;
+  slotWrites?: number;
 }
 
 interface NativeStore {
@@ -103,7 +113,18 @@ interface NativeStore {
   compact(): StoreStats;
   stats(): StoreStats;
   serve(host: string, port: number, onRequest: (req: { method: string; url: string; headers: Record<string, string>; body: Buffer }) => { status: number; body?: string | Buffer; headers?: Record<string, string> }): number;
+  serveStages(options: { port: number; backend: number; netThreads: number; blkThreads: number; accessKey: string; secret: string }, onIndexed: (job: StageJob) => void): void;
+  stageReply(id: number, status?: number): void;
   close(): void;
+}
+
+export interface StageJob {
+  id: number;
+  objectKey: string;
+  crc: number;
+  size: number;
+  body: Buffer;
+  locator: ExtentLocator;
 }
 
 const addon = loadAddon();
@@ -206,6 +227,17 @@ export class Store {
     },
   ): number {
     return this.inner.serve(host, port, onRequest);
+  }
+
+  serveStages(
+    options: { port: number; backend: number; netThreads: number; blkThreads: number; accessKey: string; secret: string },
+    onIndexed: (job: StageJob) => void,
+  ): void {
+    this.inner.serveStages(options, onIndexed);
+  }
+
+  stageReply(id: number, status?: number): void {
+    this.inner.stageReply(id, status);
   }
 
   close(): void {

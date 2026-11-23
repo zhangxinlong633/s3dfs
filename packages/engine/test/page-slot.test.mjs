@@ -27,7 +27,9 @@ test('a later object only rewrites its own recId slot', () => {
   store.put('a', Buffer.from('alpha'));
   const file = blockFile(dir);
   const slot0 = readAt(file, PAGE_HEADER, SLOT);
+  const crcBefore = readAt(file, 18, SLOT);
   expect(slot0.readUInt32LE(0)).toBeGreaterThan(0);
+  expect(crcBefore.readUInt32LE(0)).toBe(0);
 
   const poisonAt = PAGE_HEADER + 5 * SLOT;
   const poison = Buffer.from([0xab, 0xcd, 0xef, 0x11]);
@@ -38,11 +40,16 @@ test('a later object only rewrites its own recId slot', () => {
   store.put('b', Buffer.from('bravo'));
   const slot1 = readAt(file, PAGE_HEADER + SLOT, SLOT);
   const left = readAt(file, poisonAt, SLOT);
+  const crcAfter = readAt(file, 18, SLOT);
+  const timing = store.stats();
   store.close();
   rmSync(dir, { recursive: true, force: true });
 
   expect(slot1.readUInt32LE(0)).toBeGreaterThan(0);
   expect(left.equals(poison)).toBe(true);
+  expect(crcAfter.equals(crcBefore)).toBe(true);
+  expect(timing.slotWrites).toBeGreaterThanOrEqual(2);
+  expect(timing.bodyWrites).toBeGreaterThanOrEqual(1);
 });
 
 test('several writer threads keep separate block files', async () => {

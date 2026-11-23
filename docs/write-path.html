@@ -78,7 +78,7 @@
         <li>按对象 key 从存活节点里选副本，默认 3 份，优先不同故障域。</li>
         <li>本机那一份直接调用本进程里的 C 引擎，不再绕一圈 HTTP。</li>
         <li>其余副本 HTTP 到对端同一进程的 :9100。对端用 C 线程把字节追加进自己的 <code>.blk</code>。</li>
-        <li>写满 <code>S3DFS_WRITE_QUORUM</code> 再把数据位置写入索引。默认是 3 份里的 2 份。记录是节点和 <code>recId</code>。</li>
+        <li>默认写满当次副本数的多数，再把数据位置写入索引。记录是节点和 <code>recId</code>。<code>S3DFS_WRITE_QUORUM=1</code> 时只等本机磁盘上的那一份和它的数据位置。</li>
         <li>向客户端返回。还没写完的副本由这台 API 随后补上。</li>
       </ol>
     </section>
@@ -86,7 +86,7 @@
     <div class="split">
       <section class="box">
         <h3>本进程里的引擎</h3>
-        <p class="muted"><code>S3DFS_DATA_DIR</code> 由 API 打开。对象追加进约 1 GiB 的 <code>.blk</code>。打开时扫描 <code>.blk</code> 重建 <code>recId</code>。缓冲大约每秒写出，大约每 30 秒 fsync。</p>
+        <p class="muted"><code>S3DFS_DATA_DIR</code> 由 API 打开。默认 8 条写入线程，每条打开自己的一个 <code>.blk</code>，最多 32 个。每个对象先写出正文，再定位写 4 字节槽。打开时读页，不扫对象正文，也不核对页上的槽 CRC。大约每 30 秒 fsync。</p>
       </section>
       <section class="box">
         <h3>本进程里的索引</h3>
